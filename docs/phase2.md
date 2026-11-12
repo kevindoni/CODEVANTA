@@ -77,9 +77,42 @@ are created on construction, and the store works as a context manager.
 - Stored content is a fingerprint plus counts — not disassembly, xrefs, or CFG
   blocks.
 
+### `analyze` integration (`core/report.py`)
+
+`codevanta analyze` (and `build_report` in `core/report.py`) can embed the phase 2
+results in its JSON report under two additive top-level keys; every phase 1 key
+is untouched, and both sections are opt-in per engine exactly like `callgraph`.
+
+- **`xrefs`** — `--xrefs` / `include_xrefs=True` runs `find_xrefs` over all
+  executable sections with the default 4,000,000-byte scan budget: `count` /
+  `returned` / `truncated` plus `items`
+  (each with its own evidence), `scanned_sections`, `scanned_bytes`,
+  `scan_truncated` (scan-budget cut), `indirect_skipped` (calls whose target
+  could not be resolved statically), `warnings`, and scan-level evidence.
+  `--xref-limit` (default 2000, capped at 200000) bounds how many items are
+  embedded; `truncated` then flags item-level truncation the same way the
+  strings section does.
+- **`cfg`** — `--cfg` / `include_cfg=True` runs `build_cfg` at the entry point,
+  bounded by `REPORT_MAX_CFG_INSTRUCTIONS` (2000) and
+  `REPORT_MAX_CFG_BLOCKS` (500) — the analyzer defaults made explicit — and
+  serialized in the `FunctionCFG` shape (`function_address`, `block_count`,
+  `blocks` with successors and evidence, `truncated`, `warnings`).
+- **Tolerance:** binaries with no executable content (for example a
+  header-only ELF) still produce a report — `find_xrefs` reports its own
+  warnings, and a CFG that cannot be built degrades to the same key shape
+  with `block_count: 0` and a warning explaining why.
+- **Provenance** gains `find_xrefs` and `build_cfg` steps, one per requested
+  section. Without `--xrefs` / `--cfg` neither key nor step appears, so the
+  report is exactly the phase 1 payload; `callgraph` stays opt-in behind
+  `--callgraph`.
+
 ## CLI examples
 
 ```powershell
+# One JSON report with everything: phase 1 + xrefs + entry-point CFG
+codevanta analyze samples\elf64_text.bin --xrefs --cfg --output samples\report.json
+codevanta analyze samples\elf64_text.bin                    # phase 1 only
+
 # Cross-references for one binary (table, or --json for the raw result)
 codevanta xrefs C:\Windows\System32\notepad.exe --limit 40
 codevanta xrefs samples\elf64_text.bin --max-bytes 200000 --json
@@ -96,6 +129,10 @@ codevanta session show 4f9c1a7b2d3e
 
 Option notes:
 
+- `analyze`: `--xrefs` and `--cfg` (embed that section, both off by default),
+  `--xref-limit` (xrefs embedded in the report, default 2000, capped at
+  200000), `--callgraph` (add the call graph), `--json` (also echo the payload
+  on stdout when `--output` is used).
 - `xrefs`: `--limit` (rows shown, default 100), `--max-bytes` (decode budget,
   default 4,000,000), `--json`.
 - `cfg`: `--address`/`-a`, `--function`/`-f`, `--max-instructions` (default
@@ -147,8 +184,12 @@ embedded in code sections.
   schema migration yet.
 - **Single-user, local.** The SQLite file is a local artifact with no locking
   strategy beyond SQLite defaults and no concurrency model.
-- **Phase 2 tools are not exposed over MCP yet.** The MCP server still offers
-  the five phase 1 tools.
+- **MCP parity is partial.** The MCP server exposes the phase 1 tools plus
+  `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`,
+  `codevanta_session_save`, and `codevanta_session_list`, so the phase 2 engines
+  are reachable from an agent directly. `codevanta_analyze` still returns the
+  phase 1 payload (it passes no section flags to `build_report`), and analyst
+  annotations plus the session `show`/`notes` views are CLI-only.
 
 ## Next steps
 
@@ -174,4 +215,5 @@ ruff check src tests
 ```
 
 Phase 2 modules are covered by `tests/test_xrefs.py`, `tests/test_cfg.py`,
-`tests/test_session.py`, and `tests/test_cli_phase2.py`.
+`tests/test_session.py`, `tests/test_cli_phase2.py`, and
+`tests/test_report_phase2.py` (the `analyze` report integration).
