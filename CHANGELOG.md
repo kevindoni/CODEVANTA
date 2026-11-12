@@ -8,6 +8,14 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- Entropy triage (`codevanta.core.entropy` + `codevanta entropy`): per-section
+  Shannon entropy sampled from file bytes (capped per section, sample size
+  reported) with a packing heuristic — sections at or above the threshold
+  (default 7.2 bits/byte, `--threshold`) get a `packed_hint` labelled medium
+  confidence in evidence. Sections without file bytes (e.g. `S_ZEROFILL`,
+  `NOBITS`) carry `entropy: null` with a warning instead of a fabricated
+  value, and samples below the minimum floor suppress the packing judgment.
+  `--max-sample-bytes` bounds the read; `--json` emits the full report.
 - Big-endian UTF-16 string extraction (`codevanta.core.strings`): the UTF-16
   scan now follows the binary's endianness — big-endian targets (e.g. MIPS,
   s390x, PowerPC) yield `utf-16be` strings, little-endian targets keep
