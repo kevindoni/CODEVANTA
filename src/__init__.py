@@ -1,0 +1,1 @@
+"""CODEVANTA — Advanced Code Intelligence."""
