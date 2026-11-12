@@ -37,6 +37,14 @@ carrying that ``similarity`` (rounded to four decimals). Leftovers that are not
 paired keep their structural ``added``/``removed`` verdict, so semantic mode
 never hides a one-sided function; it can only turn a remove-plus-add pair into
 one change.
+A score decodes both sides with one instruction set, so the pass first requires
+both sides to target the same architecture: when the loader identified two
+different ones (``BinaryInfo.architecture``, the token it folds ELF ``e_machine``
+and PE ``Machine`` into), nothing is decoded or scored and a warning names both,
+because shapes from different instruction sets are not comparable. Two identical
+tokens behave exactly as described above, and an architecture the loader could
+not identify (``"unknown"``) never triggers the guard: it means "not determined",
+not "a different target".
 Because every score decodes both regions, the pass is bounded twice: at most
 :data:`MAX_SEMANTIC_PAIRS` candidate pairs are scored -- the pass is skipped,
 with a warning, when the leftover cross product is larger -- and one score
@@ -52,7 +60,8 @@ Matching rules, in order:
 2. **By name.** Candidates left over on both sides are matched by name, so a
    function that was relocated is reported as one ``changed`` entry (with the
    old and new address) instead of one removal plus one addition.
-3. **By content similarity** (only with ``semantic=True``). The candidates still
+3. **By content similarity** (only with ``semantic=True``, and only when both
+   sides report the same identified architecture). The candidates still
    left over on both sides are paired greedily, highest score first, while the
    score is at least ``threshold`` and neither side has been used yet. Each pair
    is reported as one ``changed`` entry carrying ``similarity``.
@@ -261,7 +270,8 @@ class BinaryDiff:
             content in deep mode, or structural plus shape similarity in semantic
             mode), the effective ``max_functions`` bound, and the deep-mode or
             semantic-mode bounds when that mode ran.
-        warnings: Non-fatal problems, including truncation notices.
+        warnings: Non-fatal problems, including truncation notices and a semantic
+            pass that was skipped (architecture mismatch or pair cap).
     """
 
     left_path: str
@@ -531,13 +541,48 @@ def _address_digests(
     return digests
 
 
+#: Value :class:`~codevanta.core.loader.BinaryLoader` reports when it could not
+#: map the file's machine type onto an architecture it knows. It means "not
+#: determined", so it never counts as a *different* target architecture.
+_UNKNOWN_ARCHITECTURE = "unknown"
+
+
+def _comparable_architecture(info: BinaryInfo) -> str:
+    """Return the architecture of ``info`` in a form two sides can be compared by.
+
+    :attr:`~codevanta.core.loader.BinaryInfo.architecture` is the field for this
+    job: the loader folds the ELF ``e_machine`` and the PE ``Machine`` header into
+    the same small set of canonical tokens (``"x86"``, ``"x86_64"``, ``"arm"``,
+    ``"aarch64"``, ``"ia64"``, ``"mips"``), so two sides target the same
+    instruction set exactly when those tokens match. Case and surrounding
+    whitespace are folded too, so metadata assembled by hand compares by token as
+    well.
+
+    An unidentified architecture is reported as ``""``: the loader's ``"unknown"``
+    placeholder says "not determined", not "a different target", so it must never
+    be the reason a pairing pass is refused. An empty result therefore means "no
+    architecture claim" and is compatible with any other value.
+
+    Args:
+        info: Metadata of one side of the comparison.
+
+    Returns:
+        The lower-cased architecture token, or ``""`` when it is unknown.
+    """
+    architecture = str(info.architecture or "").strip().lower()
+    if not architecture or architecture == _UNKNOWN_ARCHITECTURE:
+        return ""
+    return architecture
+
+
 @dataclass(frozen=True)
 class _SemanticRequest:
     """Inputs needed to pair leftover functions by shape similarity.
 
     Attributes:
         left_info: Metadata of the left-hand binary; its ``path`` is read for
-            the left-hand scores (read-only, never executed).
+            the left-hand scores and its ``architecture`` gates the pass
+            (read-only, never executed).
         right_info: Metadata of the right-hand binary, same contract.
         threshold: Smallest score that may pair two candidates.
         warnings: Warning sink shared with the enclosing diff, so every bound
@@ -566,9 +611,13 @@ def _semantic_pairs(
     deterministic and mutually exclusive: one candidate never appears in two
     deltas.
 
-    Work is bounded before it starts: the leftover cross product must fit in
-    :data:`MAX_SEMANTIC_PAIRS`, otherwise nothing is scored and a warning says
-    so. Each decode is bounded by :data:`SEMANTIC_MAX_INSTRUCTIONS` instructions.
+    Work is bounded before it starts: the pass refuses to run when the two sides
+    target different, identified architectures (see
+    :func:`_comparable_architecture`) -- one instruction set cannot describe the
+    other's shapes -- and when the leftover cross product does not fit in
+    :data:`MAX_SEMANTIC_PAIRS`; either way nothing is decoded or scored, and a
+    single warning explains the skip. Each decode is bounded by
+    :data:`SEMANTIC_MAX_INSTRUCTIONS` instructions.
     A leftover that cannot be decoded (unreadable file, address outside an
     executable section, undecodable architecture) is skipped rather than raised,
     so one bad candidate never loses the whole comparison.
@@ -588,6 +637,23 @@ def _semantic_pairs(
         share no token stay ``added``/``removed`` even with ``threshold=0.0``.
     """
     if not left_leftovers or not right_leftovers:
+        return []
+    # Architecture gate first: a cross-architecture score would compare shapes
+    # from two instruction sets, so it is noise dressed up as a likeness. Checking
+    # it before anything else also keeps the report to one explanation -- the
+    # warning below -- instead of stacking a pair-cap notice on top of it.
+    left_architecture = _comparable_architecture(request.left_info)
+    right_architecture = _comparable_architecture(request.right_info)
+    if (
+        left_architecture
+        and right_architecture
+        and left_architecture != right_architecture
+    ):
+        request.warnings.append(
+            "semantic matching skipped: the two sides target different architectures "
+            f"(left {left_architecture}, right {right_architecture}), so their instruction "
+            "shapes are not comparable; every leftover keeps its added/removed verdict"
+        )
         return []
     left_sorted = sorted(left_leftovers, key=_sort_key)
     right_sorted = sorted(right_leftovers, key=_sort_key)
@@ -928,7 +994,9 @@ def diff_infos(
             matching left unpaired when their normalized instruction shapes score
             at least ``threshold``. A pair becomes one ``"changed"`` delta
             carrying ``similarity``; every candidate that is not paired keeps its
-            ``"added"``/``"removed"`` verdict.
+            ``"added"``/``"removed"`` verdict. The pass is skipped, with a warning
+            naming both, when the two sides report different architectures, since
+            shapes from different instruction sets are not comparable.
         threshold: Smallest similarity score that may pair two leftovers, in
             ``[MIN_SEMANTIC_THRESHOLD, MAX_SEMANTIC_THRESHOLD]``. Validated in
             every mode, so an out-of-range value raises even with

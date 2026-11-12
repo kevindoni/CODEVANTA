@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Any
 
-from codevanta.analysis.binary_diff import diff_binaries
+from codevanta.analysis.binary_diff import (
+    DEFAULT_SEMANTIC_THRESHOLD,
+    MAX_SEMANTIC_THRESHOLD,
+    MIN_SEMANTIC_THRESHOLD,
+    diff_binaries,
+)
 from codevanta.analysis.callgraph import MAX_LIMIT as MAX_CALLGRAPH_LIMIT
 from codevanta.analysis.callgraph import build_call_graph
 from codevanta.analysis.cfg import build_cfg
@@ -298,6 +304,39 @@ def _check_bool(name: str, value: bool) -> bool:
     return value
 
 
+def _check_threshold(name: str, value: float) -> float:
+    """Return ``value`` as a float when it is a finite number in ``0.0 .. 1.0``.
+
+    Args:
+        name: Argument name used in the error message.
+        value: Caller-supplied similarity floor; booleans are rejected even
+            though ``bool`` is an ``int`` subclass, because ``True`` is not a
+            score, and ``NaN``/``inf`` are rejected because they can never be
+            compared meaningfully.
+
+    Returns:
+        ``value`` converted to ``float``, unchanged in magnitude.
+
+    Raises:
+        AnalysisError: If ``value`` is not a non-boolean real number, or if it
+            is non-finite or outside ``0.0 .. 1.0``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AnalysisError(
+            f"{name} must be a number between {MIN_SEMANTIC_THRESHOLD} and "
+            f"{MAX_SEMANTIC_THRESHOLD}, got {type(value).__name__}"
+        )
+    number = float(value)
+    if not math.isfinite(number) or not (
+        MIN_SEMANTIC_THRESHOLD <= number <= MAX_SEMANTIC_THRESHOLD
+    ):
+        raise AnalysisError(
+            f"{name} must be between {MIN_SEMANTIC_THRESHOLD} and "
+            f"{MAX_SEMANTIC_THRESHOLD}, got {value!r}"
+        )
+    return number
+
+
 def _check_address(address: int) -> int:
     """Return ``address`` when it is a non-negative plain integer, else raise.
 
@@ -322,6 +361,8 @@ def diff(
     right: str,
     max_functions: int = 5000,
     deep: bool = False,
+    semantic: bool = False,
+    threshold: float = DEFAULT_SEMANTIC_THRESHOLD,
 ) -> dict[str, Any]:
     """Compare two binaries structurally and report per-side deltas.
 
@@ -339,25 +380,44 @@ def diff(
             shape of address-matched functions and mark differing digests as
             ``changed``. Digests are shape fingerprints: equal is not byte
             equality and different is not a semantic difference.
+        semantic: When true, additionally score the functions that address and
+            name matching left unpaired. The best pairs whose normalized
+            instruction shapes overlap at or above ``threshold`` become one
+            ``changed`` entry carrying ``similarity``, so a moved function can
+            be reported as moved instead of removed-plus-added. A score is shape
+            evidence, not proof that the two functions are the same code.
+        threshold: Smallest similarity score in ``0.0 .. 1.0`` that may pair two
+            leftovers (default ``0.9``). It is validated in every mode, so an
+            out-of-range value raises even when ``semantic`` is false.
 
     Returns:
         The serialized comparison with ``left_path``, ``right_path``,
         ``identical``, the added/removed/changed function and section lists, the
-        import and export deltas, ``evidence``, and ``warnings``.
+        import and export deltas, ``evidence``, and ``warnings``. With
+        ``semantic`` true the evidence ``extra`` record also carries the
+        effective ``semantic_threshold``.
 
     Raises:
         AnalysisError: If either file is missing, ``max_functions`` is out of
-            range, or ``deep`` is not a boolean.
+            range, ``deep`` or ``semantic`` is not a boolean, or ``threshold``
+            is not a finite number within ``0.0 .. 1.0``.
     """
     left_path = _validate_path(left)
     right_path = _validate_path(right)
     limit = _check_bounded_int("max_functions", max_functions)
     deep_flag = _check_bool("deep", deep)
+    semantic_flag = _check_bool("semantic", semantic)
+    # Validate the floor even in structural mode so the argument contract does
+    # not depend on which mode was selected, and so a bad score cannot cost two
+    # full loads.
+    score_floor = _check_threshold("threshold", threshold)
     comparison = diff_binaries(
         left_path,
         right_path,
         max_functions=limit,
         deep=deep_flag,
+        semantic=semantic_flag,
+        threshold=score_floor,
     )
     return comparison.to_dict()
 

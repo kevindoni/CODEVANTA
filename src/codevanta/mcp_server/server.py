@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Annotated, Any
+
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import Field
+
+from codevanta.core.report import AnalysisError
 
 from . import tools
 
@@ -16,6 +22,16 @@ INSTRUCTIONS = (
     "high confidence; the entry point is a medium-confidence code candidate, not a "
     "proven function boundary. All addresses are absolute virtual addresses (VA)."
 )
+
+
+#: ``codevanta_diff`` flags are forwarded to :func:`codevanta.mcp_server.tools.diff`
+#: exactly as the client sent them. ``Any`` stops the MCP argument model from
+#: rewriting the JSON first (``deep=1`` became ``True``, ``threshold=true`` became
+#: ``1.0`` and ``threshold="0.9"`` became ``0.9``), so ``_check_bool`` and
+#: ``_check_threshold`` make the decision and name the offending argument, while
+#: ``Annotated`` keeps the published input schema advertising the documented type.
+RawBooleanFlag = Annotated[Any, Field(json_schema_extra={"type": "boolean"})]
+RawNumberFlag = Annotated[Any, Field(json_schema_extra={"type": "number"})]
 
 
 def build_server() -> MCPServer:
@@ -133,22 +149,44 @@ def build_server() -> MCPServer:
             "first, then by name after moving), sections, imports and exports. "
             "Nothing is executed. With deep=true, address-matched functions are "
             "also compared by a normalized-instruction fingerprint; equal "
-            "digests are shape equality, not byte equality. Check 'warnings' "
-            "before assuming the comparison is complete."
+            "digests are shape equality, not byte equality. With semantic=true "
+            "the functions that address and name matching left unpaired are "
+            "scored by instruction-shape overlap, and the best pairs reaching "
+            "threshold (0.0..1.0, default 0.9) are reported as one 'changed' "
+            "entry carrying 'similarity', so a moved function is no longer a "
+            "removal plus an addition; that score is shape evidence, not proof "
+            "of equivalence. The threshold is validated even when semantic is "
+            "false. Arguments are never coerced: deep and semantic must be real "
+            "booleans and threshold a real number, so deep=1, semantic=1, "
+            "threshold=true and threshold='0.9' are rejected and the error names "
+            "the offending argument. Check 'warnings' before assuming the "
+            "comparison is complete."
         )
     )
     def codevanta_diff(
         left: str,
         right: str,
         max_functions: int = 5000,
-        deep: bool = False,
+        deep: RawBooleanFlag = False,
+        semantic: RawBooleanFlag = False,
+        threshold: RawNumberFlag = 0.9,
     ) -> dict:
-        return tools.diff(
-            left,
-            right,
-            max_functions=max_functions,
-            deep=deep,
-        )
+        try:
+            return tools.diff(
+                left,
+                right,
+                max_functions=max_functions,
+                deep=deep,
+                semantic=semantic,
+                threshold=threshold,
+            )
+        except AnalysisError as exc:
+            # AnalysisError is an anticipated, caller-correctable failure, but the
+            # framework would collapse it into a generic "Error executing tool"
+            # crash message that hides which argument is wrong. Re-raising it as a
+            # ToolError keeps the text (e.g. "deep must be a boolean") in the
+            # is_error result the client receives.
+            raise ToolError(str(exc)) from exc
 
     @server.tool(
         description=(

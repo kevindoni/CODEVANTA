@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import struct
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from codevanta.analysis.binary_diff import (
     DEFAULT_SEMANTIC_THRESHOLD,
     MAX_MAX_FUNCTIONS,
     MAX_SEMANTIC_PAIRS,
+    BinaryDiff,
     FunctionDelta,
     diff_binaries,
     diff_infos,
@@ -339,21 +341,37 @@ def test_function_delta_to_dict_omits_absent_side() -> None:
 
 TEXT_VA = 0x401000
 
+#: ELF ``e_machine`` values the loader folds onto its architecture tokens.
+X86_64_MACHINE = 62
+X86_MACHINE = 3
+AARCH64_MACHINE = 183
+
 NOP_TEXT = bytes.fromhex("90")  # nop
 RET_TEXT = bytes.fromhex("c3")  # ret
 MOV_RET_42 = bytes.fromhex("b82a000000c3")  # mov eax, 0x2a; ret
 MOV_RET_99 = bytes.fromhex("b863000000c3")  # mov eax, 0x63; ret
 
 
-def _make_code_elf(path: Path, code: bytes, entry: int = TEXT_VA) -> Path:
-    """Write an ELF64 file whose executable ``.text`` holds ``code``."""
+def _make_code_elf(
+    path: Path,
+    code: bytes,
+    entry: int = TEXT_VA,
+    machine: int = X86_64_MACHINE,
+) -> Path:
+    """Write an ELF64 file whose executable ``.text`` holds ``code``.
+
+    ``machine`` is the ELF ``e_machine`` header value, so a fixture can claim a
+    different target architecture while keeping the very same layout (and, when
+    the bytes decode either way, the same instruction shapes) -- the loader reads
+    the architecture from that header alone.
+    """
     shstr = b"\x00.text\x00.shstrtab\x00"
     off_text = 0x40
     off_shstr = off_text + len(code)
     shoff = off_shstr + len(shstr)
     ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
     header = ident + struct.pack(
-        "<HHIQQQIHHHHHH", 2, 62, 1, entry, 0, shoff, 0, 64, 56, 0, 64, 3, 2
+        "<HHIQQQIHHHHHH", 2, machine, 1, entry, 0, shoff, 0, 64, 56, 0, 64, 3, 2
     )
     text_section = struct.pack(
         "<IIQQQQIIQQ", 1, 1, 6, entry, off_text, len(code), 0, 0, 16, 0
@@ -715,3 +733,218 @@ def test_diff_binaries_validates_threshold_before_loading(tmp_path: Path) -> Non
 
     with pytest.raises(AnalysisError, match="threshold"):
         diff_binaries(missing, missing, semantic=True, threshold=2.0)
+
+
+# ---- semantic mode: architecture guard -----------------------------------
+
+
+def _architecture_warnings(diff: BinaryDiff) -> list[str]:
+    """Return the semantic-mode warnings that report an architecture mismatch."""
+    return [warning for warning in diff.warnings if "different architectures" in warning]
+
+
+def test_semantic_skips_pairing_across_architectures(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    right = _make_code_elf(
+        tmp_path / "right.bin", MOV_RET_42, entry=0x401010, machine=AARCH64_MACHINE
+    )
+
+    structural = diff_binaries(left, right)
+    semantic = diff_binaries(left, right, semantic=True)
+
+    # Without semantic mode the move is a remove plus an add, as always.
+    assert structural.functions_changed == ()
+    assert structural.warnings == ()
+
+    # Pairing is refused, so the one-sided verdicts survive untouched ...
+    assert semantic.functions_changed == ()
+    assert [delta.address for delta in semantic.functions_removed] == [0x401000]
+    assert [delta.address for delta in semantic.functions_added] == [0x401010]
+    # ... the mode itself is still recorded as requested ...
+    assert semantic.evidence.extra["semantic"] is True
+    # ... and exactly one warning explains the skip, naming both targets.
+    assert len(semantic.warnings) == 1
+    (warning,) = _architecture_warnings(semantic)
+    assert "(left x86_64, right aarch64)" in warning
+    assert "not comparable" in warning
+
+
+def test_architecture_guard_skips_a_pair_that_would_otherwise_score_one(
+    tmp_path: Path,
+) -> None:
+    # ``x86`` and ``x86_64`` decode these bytes to the same shapes, so the control
+    # below pairs at 1.0: the refused pairing is the guard's doing, not the
+    # threshold's.
+    left = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    control = _make_code_elf(tmp_path / "control.bin", MOV_RET_42, entry=0x401010)
+    other_arch = _make_code_elf(
+        tmp_path / "other.bin", MOV_RET_42, entry=0x401010, machine=X86_MACHINE
+    )
+
+    paired = diff_binaries(left, control, semantic=True)
+    skipped = diff_binaries(left, other_arch, semantic=True)
+
+    assert [delta.similarity for delta in paired.functions_changed] == [pytest.approx(1.0)]
+    assert paired.warnings == ()
+
+    assert skipped.functions_changed == ()
+    (warning,) = _architecture_warnings(skipped)
+    assert "(left x86_64, right x86)" in warning
+
+
+def test_architecture_guard_skips_before_any_decode(tmp_path: Path) -> None:
+    diff = diff_infos(
+        _make_info(path=tmp_path / "missing.bin", architecture="x86_64"),
+        _make_info(path=tmp_path / "missing2.bin", architecture="aarch64"),
+        [_candidate(TEXT_VA)],
+        [_candidate(TEXT_VA + 0x10)],
+        semantic=True,
+    )
+
+    assert diff.functions_changed == ()
+    assert [delta.address for delta in diff.functions_removed] == [TEXT_VA]
+    assert [delta.address for delta in diff.functions_added] == [TEXT_VA + 0x10]
+    assert len(diff.warnings) == 1
+    # No file was read: nothing reports an unscorable pair, only the mismatch.
+    assert not any("could not be scored" in warning for warning in diff.warnings)
+    (warning,) = _architecture_warnings(diff)
+    assert "(left x86_64, right aarch64)" in warning
+
+
+
+def test_architecture_guard_takes_precedence_over_the_pair_cap() -> None:
+    left_functions = [_candidate(0x401000 + 0x10 * index) for index in range(65)]
+    right_functions = [_candidate(0x500000 + 0x10 * index) for index in range(65)]
+
+    diff = diff_infos(
+        _make_info(architecture="x86_64"),
+        _make_info(architecture="arm"),
+        left_functions,
+        right_functions,
+        semantic=True,
+    )
+
+    assert diff.functions_changed == ()
+    assert len(diff.functions_removed) == 65
+    assert len(diff.functions_added) == 65
+    # The mismatch is the single reason reported; the pair cap never came into it.
+    assert len(diff.warnings) == 1
+    (warning,) = _architecture_warnings(diff)
+    assert "(left x86_64, right arm)" in warning
+    assert str(MAX_SEMANTIC_PAIRS) not in warning
+
+
+def test_architecture_guard_stays_quiet_when_there_is_nothing_to_pair() -> None:
+    # Both sides carry the same single address, so nothing is left over and the
+    # pass could not have paired anything: no warning is owed.
+    diff = diff_infos(
+        _make_info(architecture="x86_64"),
+        _make_info(architecture="aarch64"),
+        [_candidate(TEXT_VA)],
+        [_candidate(TEXT_VA)],
+        semantic=True,
+    )
+
+    assert diff.identical is True
+    assert diff.warnings == ()
+
+
+def test_same_architecture_still_pairs_and_warns_nothing(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    right = _make_code_elf(tmp_path / "right.bin", MOV_RET_42, entry=0x401010)
+
+    diff = diff_binaries(left, right, semantic=True)
+
+    assert len(diff.functions_changed) == 1
+    assert diff.functions_changed[0].similarity == pytest.approx(1.0)
+    assert diff.functions_added == ()
+    assert diff.functions_removed == ()
+    assert diff.warnings == ()
+
+
+def test_architecture_token_comparison_ignores_case(tmp_path: Path) -> None:
+    # The loader folds ELF and PE machine types onto one lower-case token, so the
+    # guard must not fire on a differently spelled label of the same target.
+    left_path = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    right_path = _make_code_elf(tmp_path / "right.bin", MOV_RET_42, entry=0x401010)
+    loader = BinaryLoader()
+    left_info = replace(loader.load(left_path), architecture="X86_64")
+    right_info = replace(loader.load(right_path), architecture="x86_64")
+
+    diff = diff_infos(
+        left_info,
+        right_info,
+        [_candidate(0x401000)],
+        [_candidate(0x401010)],
+        semantic=True,
+    )
+
+    assert [delta.similarity for delta in diff.functions_changed] == [pytest.approx(1.0)]
+    assert diff.warnings == ()
+
+
+def test_architecture_token_comparison_ignores_padding(tmp_path: Path) -> None:
+    # Surrounding whitespace also names the same target, so the guard stays quiet;
+    # the padded label is instead rejected by the decoder, which is its own
+    # complaint and not a claim that the architectures differ.
+    left_path = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    right_path = _make_code_elf(tmp_path / "right.bin", MOV_RET_42, entry=0x401010)
+    loader = BinaryLoader()
+    left_info = replace(loader.load(left_path), architecture=" x86_64 ")
+    right_info = replace(loader.load(right_path), architecture="x86_64")
+
+    diff = diff_infos(
+        left_info,
+        right_info,
+        [_candidate(0x401000)],
+        [_candidate(0x401010)],
+        semantic=True,
+    )
+
+    assert _architecture_warnings(diff) == []
+    assert diff.functions_changed == ()
+
+
+
+@pytest.mark.parametrize(
+    ("left_architecture", "right_architecture"),
+    [("unknown", "unknown"), ("unknown", "x86_64"), ("x86_64", "unknown")],
+)
+def test_unidentified_architecture_is_not_a_mismatch(
+    tmp_path: Path, left_architecture: str, right_architecture: str
+) -> None:
+    # "unknown" means "not determined", not "a different target", so the pass still
+    # runs and reports the side it cannot decode instead of a false mismatch.
+    left_path = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    right_path = _make_code_elf(tmp_path / "right.bin", MOV_RET_42, entry=0x401010)
+    loader = BinaryLoader()
+    left_info = replace(loader.load(left_path), architecture=left_architecture)
+    right_info = replace(loader.load(right_path), architecture=right_architecture)
+
+    diff = diff_infos(
+        left_info,
+        right_info,
+        [_candidate(0x401000)],
+        [_candidate(0x401010)],
+        semantic=True,
+    )
+
+    assert _architecture_warnings(diff) == []
+    assert any("could not be scored" in warning for warning in diff.warnings)
+    assert [delta.address for delta in diff.functions_removed] == [0x401000]
+    assert [delta.address for delta in diff.functions_added] == [0x401010]
+
+
+def test_structural_mode_never_reports_an_architecture_mismatch(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    right = _make_code_elf(
+        tmp_path / "right.bin", MOV_RET_42, entry=0x401010, machine=AARCH64_MACHINE
+    )
+
+    diff = diff_binaries(left, right)
+
+    assert diff.warnings == ()
+    assert "semantic" not in diff.evidence.extra
+    assert [delta.address for delta in diff.functions_removed] == [0x401000]
+    assert [delta.address for delta in diff.functions_added] == [0x401010]
+

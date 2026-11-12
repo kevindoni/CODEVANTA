@@ -150,16 +150,33 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   Only one kind of hint at an offset gives `True`/`False`; no hint gives `None`,
   and a contradiction gives `None` plus a `SignednessConflictWarning` naming the
   offset. `None` means *no evidence*, never "safe", and the key is omitted from
-  the JSON rather than emitted as `null`.
+  the JSON rather than emitted as `null`. `suggest_structs` merges up to
+  `MAX_MERGED_WINDOWS` (16) windows of the same binary into one suggestion: one
+  field per offset, counters summed, the widest per-window width kept with a
+  `WidthConflictWarning` when the windows disagree, signedness folded with the
+  single-window rule except that a contradiction seen *inside* one window survives
+  to the merge (`None` plus a `SignednessConflictWarning`), and
+  `alignment`/`array_groups` recomputed from the merged fields. Addresses must be
+  unique; a *partial* overlap is allowed but announced with
+  `WindowOverlapWarning`, because the shared instructions are then counted by both
+  windows and the summed counters are upper bounds. `truncated` is the OR of the
+  merge cap and every window's own 64-offset cap, and `window_truncated` names the
+  windows that hit theirs. Duplicate, empty, non-integer, negative, or over-limit
+  addresses are rejected with `AnalysisError`, and the merge is bounded by
+  `max_windows * max_instructions` decoded instructions. The CLI reaches it by
+  repeating `--address`.
 - **MCP tools** — `codevanta_similarity` joins `codevanta_struct`,
   `codevanta_diff`, `codevanta_jump_table`, `codevanta_function_hash`,
   `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`,
   `codevanta_session_save`, and `codevanta_session_list`, alongside the five
-  phase 1 tools (fifteen in total).
-- **CLI:** `codevanta struct` (with `--address`/`--function`,
-  `--max-instructions`, `--max-fields`, `--include-stack`, `--json`, and a
-  footer reporting `alignment:` plus one line per array candidate or
-  `arrays: none`, closing with a `signed:` line),
+  phase 1 tools (fifteen in total). `codevanta_diff` takes `max_functions`,
+  `deep`, `semantic`, and `threshold`, so the phase 2j pairing pass is reachable
+  from an agent without a separate `codevanta_similarity` call.
+- **CLI:** `codevanta struct` (with a repeatable `--address`/`-a` — more than one
+  value merges the windows and adds a `windows:` footer line — plus `--function`,
+  `--max-instructions`, `--max-fields`, `--include-stack`, `--json`, and a footer
+  reporting `alignment:` plus one line per array candidate or `arrays: none`,
+  closing with a `signed:` line),
   `codevanta xrefs`, `codevanta cfg` (with
   `--traversal linear|recursive`, default `linear`, and `--resolve-indirect` for
   recursive traversals), `codevanta jump-table` (with
@@ -178,7 +195,9 @@ from `call` / `call_import` / `call_indirect` only, no following calls into
 callees, no cross-function analysis, a structural (metadata-only) binary diff
 plus an opt-in shape-fingerprint comparison of address-matched functions, an
 opt-in shape-similarity pairing of the leftovers, struct fields as per-offset
-hypotheses from `[reg]`/`[reg ± disp]` operands only, and no debugger yet. The
+hypotheses from `[reg]`/`[reg ± disp]` operands only, struct evidence merged
+across at most 16 windows of one binary through the `suggest_structs` API, and no
+debugger yet. The
 phase 2g switches are `jump-table --mode absolute|relative
 --base ADDR` (plus the same `mode`/`base_address` arguments on
 `resolve_jump_table`), the new `function_fingerprint` API, and `diff --deep`
@@ -191,13 +210,23 @@ suggestion, the `function_similarity`/`normalized_tokens` API, and the
 binary diff (`semantic=True`, `threshold` defaulting to `0.9`), the
 `codevanta_similarity` MCP tool (fifteen tools), and the `signed` mnemonic hint on
 struct fields, reachable as `diff --semantic --threshold` and as the
-`codevanta struct` footer `signed:` line. `codevanta_diff` still has no
-`semantic` argument, so MCP pairing goes through `codevanta_similarity`.
+`codevanta struct` footer `signed:` line. Phase 2k adds the `deep` / `semantic` /
+`threshold` arguments to the `codevanta_diff` MCP tool (fifteen tools, no new
+registration), the semantic pass's cross-architecture guard — the pass is skipped
+with a warning naming both `BinaryInfo.architecture` tokens, which are compared
+after trimming whitespace and lower-casing only, so a hand-built `AMD64` does not
+match `x86_64`, headers the loader cannot map (PE `MIPS`, ELF IA-64/RISC-V/PowerPC/
+s390) come out `unknown`, two `unknown` sides bypass the guard, and a diff with no
+leftover on one side emits no warning at all — and the `suggest_structs`
+merged-window API over up to `MAX_MERGED_WINDOWS` (16) addresses of one binary,
+reachable as `codevanta struct -a A -a B` — one field per offset, widest width
+winning, with a `windows:` footer line.
 See [docs/phase2.md](docs/phase2.md), [docs/phase2b.md](docs/phase2b.md),
 [docs/phase2c.md](docs/phase2c.md), [docs/phase2d.md](docs/phase2d.md),
 [docs/phase2e.md](docs/phase2e.md), [docs/phase2f.md](docs/phase2f.md),
 [docs/phase2g.md](docs/phase2g.md), [docs/phase2h.md](docs/phase2h.md),
-[docs/phase2i.md](docs/phase2i.md), and [docs/phase2j.md](docs/phase2j.md) for
+[docs/phase2i.md](docs/phase2i.md), [docs/phase2j.md](docs/phase2j.md), and
+[docs/phase2k.md](docs/phase2k.md) for
 scope, confidence semantics, and limitations.
 
 ## Installation
@@ -294,8 +323,10 @@ hex `--address` and a `--entries` slot budget; `codevanta diff` exits `0`
 whether or not the binaries differ, and `2` on load or input errors;
 `codevanta struct` defaults to the entry point, starts at `--address` or
 `--function` when given, reports each field's offset, width, read and write
-counts, and adds a footer naming the base registers the sweep saw, the inferred
-`alignment:` (`unknown` when none could be derived), one
+counts, and adds a footer naming the base registers the sweep saw — a single
+window re-sweeps itself to find them, while a merged run does not decode anything
+twice and therefore prints `base registers: not recorded by the merge` — the
+inferred `alignment:` (`unknown` when none could be derived), one
 `array at 0x..: N x W-byte, stride S` line per array candidate (or
 `arrays: none`), plus one `warning:` line per limitation (`--json` for the full
 document, including `alignment` and `array_groups`). Sessions
@@ -411,6 +442,7 @@ plus smoke-tests the wheel on 3.13.
 - [Phase 2h — struct-field suggestions, MCP parity, Python 3.14 CI](docs/phase2h.md)
 - [Phase 2i — alignment/array hints, function similarity, struct over MCP](docs/phase2i.md)
 - [Phase 2j — semantic diff pairing, similarity over MCP, signedness hints](docs/phase2j.md)
+- [Phase 2k — diff options over MCP, cross-architecture guard, merged struct windows](docs/phase2k.md)
 
 ## Roadmap
 
