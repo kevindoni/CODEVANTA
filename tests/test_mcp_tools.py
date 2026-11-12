@@ -53,21 +53,25 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
     assert report["disassembly"]["instruction_count"] == 3
 
 
-def test_server_lists_ten_tools() -> None:
+def test_server_lists_thirteen_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
     assert names == [
         "codevanta_analyze",
         "codevanta_callgraph",
         "codevanta_cfg",
+        "codevanta_diff",
         "codevanta_disasm",
+        "codevanta_function_hash",
         "codevanta_functions",
         "codevanta_info",
+        "codevanta_jump_table",
         "codevanta_session_list",
         "codevanta_session_save",
         "codevanta_strings",
         "codevanta_xrefs",
     ]
+    assert len(names) == 13
 
 
 def _payload(result: object) -> dict:
@@ -311,3 +315,225 @@ def test_session_list_rejects_bad_limit(tmp_path: Path) -> None:
         tools.session_list(db=db_path, limit=0)
     with pytest.raises(SessionError, match="limit"):
         tools.session_list(db=db_path, limit=tools.MAX_SESSION_LIMIT + 1)
+
+
+DATA_ADDRESS = 0x402000
+
+
+def _write_elf64_with_table(
+    path: Path,
+    table: bytes,
+    *,
+    code: bytes = b"\x90\x90\xc3",
+) -> Path:
+    """Write a minimal ELF64 executable with ``.text`` code and a ``.rodata`` table.
+
+    Args:
+        path: Destination file.
+        table: Raw bytes placed at :data:`DATA_ADDRESS` in a non-executable
+            ``.rodata`` section (``SHF_ALLOC`` only).
+        code: Bytes of the executable ``.text`` section at :data:`TEXT_ADDRESS`.
+
+    Returns:
+        ``path``, written to disk.
+    """
+    shstrtab = b"\x00.text\x00.rodata\x00.shstrtab\x00"
+    text_offset = 0x40
+    rodata_offset = text_offset + len(code)
+    shstrtab_offset = rodata_offset + len(table)
+    shoff = (shstrtab_offset + len(shstrtab) + 7) & ~7
+    ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
+    header = ident + struct.pack(
+        "<HHIQQQIHHHHHH",
+        2,              # e_type = ET_EXEC
+        62,             # e_machine = EM_X86_64
+        1,              # e_version
+        TEXT_ADDRESS,   # e_entry
+        0,              # e_phoff
+        shoff,          # e_shoff
+        0,              # e_flags
+        64,             # e_ehsize
+        56,             # e_phentsize
+        0,              # e_phnum
+        64,             # e_shentsize
+        4,              # e_shnum: null, .text, .rodata, .shstrtab
+        3,              # e_shstrndx
+    )
+    text_section = struct.pack(
+        "<IIQQQQIIQQ",
+        1,              # sh_name -> ".text"
+        1,              # sh_type = SHT_PROGBITS
+        6,              # sh_flags = SHF_ALLOC | SHF_EXECINSTR
+        TEXT_ADDRESS,   # sh_addr
+        text_offset,    # sh_offset
+        len(code),      # sh_size
+        0,
+        0,
+        16,             # sh_addralign
+        0,
+    )
+    rodata_section = struct.pack(
+        "<IIQQQQIIQQ",
+        7,              # sh_name -> ".rodata"
+        1,              # sh_type = SHT_PROGBITS
+        2,              # sh_flags = SHF_ALLOC (not executable)
+        DATA_ADDRESS,   # sh_addr
+        rodata_offset,  # sh_offset
+        len(table),     # sh_size
+        0,
+        0,
+        8,
+        0,
+    )
+    shstrtab_section = struct.pack(
+        "<IIQQQQIIQQ",
+        15,                 # sh_name -> ".shstrtab"
+        3,                  # sh_type = SHT_STRTAB
+        0,
+        0,
+        shstrtab_offset,    # sh_offset
+        len(shstrtab),      # sh_size
+        0,
+        0,
+        1,
+        0,
+    )
+    blob = bytearray(shoff + 4 * 64)
+    blob[0:64] = header
+    blob[text_offset : text_offset + len(code)] = code
+    blob[rodata_offset : rodata_offset + len(table)] = table
+    blob[shstrtab_offset : shstrtab_offset + len(shstrtab)] = shstrtab
+    blob[shoff + 64 : shoff + 128] = text_section
+    blob[shoff + 128 : shoff + 192] = rodata_section
+    blob[shoff + 192 : shoff + 256] = shstrtab_section
+    path.write_bytes(bytes(blob))
+    return path
+
+
+def test_diff_reports_moved_entry_point(tmp_path: Path) -> None:
+    left = _write_elf64(tmp_path / "left.bin", bytes.fromhex("90c3"))
+    right = _write_elf64(
+        tmp_path / "right.bin",
+        bytes.fromhex("90c3"),
+        text_address=TEXT_ADDRESS + 0x20,
+    )
+
+    payload = tools.diff(str(left), str(right))
+
+    assert payload["identical"] is False
+    assert payload["left_path"].endswith("left.bin")
+    assert payload["right_path"].endswith("right.bin")
+    assert [delta["address"] for delta in payload["functions_removed"]] == [
+        "0x401000"
+    ]
+    assert [delta["address"] for delta in payload["functions_added"]] == [
+        "0x401020"
+    ]
+    assert payload["functions_changed"] == []
+    assert payload["sections_added"] == []
+    assert payload["sections_removed"] == []
+    assert payload["evidence"]["source"] == "binary_diff.structural"
+    assert json.loads(json.dumps(payload)) == payload
+    assert tools.diff(str(left), str(left), deep=True)["identical"] is True
+
+    for kwargs in (
+        {"max_functions": 0},
+        {"max_functions": True},
+        {"max_functions": tools.MAX_TOOL_LIMIT + 1},
+    ):
+        with pytest.raises(AnalysisError, match="max_functions"):
+            tools.diff(str(left), str(right), **kwargs)
+    with pytest.raises(AnalysisError, match="deep"):
+        tools.diff(str(left), str(right), deep="yes")
+    with pytest.raises(AnalysisError, match="file not found"):
+        tools.diff(str(tmp_path / "missing.bin"), str(right))
+
+
+def test_jump_table_decodes_absolute_and_relative_tables(tmp_path: Path) -> None:
+    absolute = _write_elf64_with_table(
+        tmp_path / "absolute.bin",
+        struct.pack("<QQ", TEXT_ADDRESS, TEXT_ADDRESS + 2) + bytes(8),
+    )
+    relative = _write_elf64_with_table(
+        tmp_path / "relative.bin",
+        struct.pack("<ii", 0, 2),
+    )
+
+    payload = tools.jump_table(str(absolute), DATA_ADDRESS)
+
+    assert payload["table_address"] == "0x402000"
+    assert payload["entry_count"] == 2
+    assert payload["pointer_size"] == 8
+    assert payload["truncated"] is False
+    assert [entry["target"] for entry in payload["entries"]] == [
+        "0x401000",
+        "0x401002",
+    ]
+    assert payload["evidence"]["source"] == "jump_table.pointer_array"
+    assert json.loads(json.dumps(payload)) == payload
+
+    offsets = tools.jump_table(
+        str(relative),
+        DATA_ADDRESS,
+        mode="Relative",
+        base=TEXT_ADDRESS,
+    )
+
+    assert offsets["pointer_size"] == 4
+    assert [entry["target"] for entry in offsets["entries"]] == [
+        "0x401000",
+        "0x401002",
+    ]
+    assert offsets["evidence"]["source"] == "jump_table.relative_offsets"
+
+    with pytest.raises(AnalysisError, match="base"):
+        tools.jump_table(str(relative), DATA_ADDRESS, mode="relative")
+    with pytest.raises(AnalysisError, match="mode"):
+        tools.jump_table(str(absolute), DATA_ADDRESS, mode="sideways")
+    with pytest.raises(AnalysisError, match="address"):
+        tools.jump_table(str(absolute), True)
+    with pytest.raises(AnalysisError, match="address"):
+        tools.jump_table(str(absolute), -1)
+    for entries in (0, True, tools.MAX_TOOL_LIMIT + 1, tools.MAX_JUMP_TABLE_ENTRIES + 1):
+        with pytest.raises(AnalysisError, match="entries"):
+            tools.jump_table(str(absolute), DATA_ADDRESS, entries=entries)
+    with pytest.raises(AnalysisError, match="executable_only"):
+        tools.jump_table(str(absolute), DATA_ADDRESS, executable_only="yes")
+    with pytest.raises(AnalysisError, match="file not found"):
+        tools.jump_table(str(tmp_path / "missing.bin"), DATA_ADDRESS)
+
+
+def test_function_hash_matches_shape_not_bytes(tmp_path: Path) -> None:
+    imm42 = _write_elf64(tmp_path / "imm42.bin", bytes.fromhex("b82a000000c3"))
+    imm99 = _write_elf64(tmp_path / "imm99.bin", bytes.fromhex("b863000000c3"))
+    narrow = _write_elf64(tmp_path / "narrow.bin", bytes.fromhex("90c3"))
+
+    first = tools.function_hash(str(imm42), TEXT_ADDRESS)
+    second = tools.function_hash(str(imm99), TEXT_ADDRESS)
+    other = tools.function_hash(str(narrow), TEXT_ADDRESS, max_instructions=10)
+
+    assert first["address"] == "0x401000"
+    assert first["algorithm"] == "sha256"
+    assert len(first["digest"]) == 64
+    assert first["instruction_count"] == 2
+    assert first["truncated"] is False
+    assert first["evidence"]["source"] == "function_hash.normalized"
+    assert first["digest"] == second["digest"]
+    assert first["digest"] != other["digest"]
+    assert json.loads(json.dumps(first)) == first
+
+    with pytest.raises(AnalysisError, match="not inside an executable section"):
+        tools.function_hash(str(imm42), 0)
+    with pytest.raises(AnalysisError, match="address"):
+        tools.function_hash(str(imm42), True)
+    with pytest.raises(AnalysisError, match="address"):
+        tools.function_hash(str(imm42), -1)
+    for max_instructions in (0, True, tools.MAX_TOOL_LIMIT + 1):
+        with pytest.raises(AnalysisError, match="max_instructions"):
+            tools.function_hash(
+                str(imm42),
+                TEXT_ADDRESS,
+                max_instructions=max_instructions,
+            )
+    with pytest.raises(AnalysisError, match="file not found"):
+        tools.function_hash(str(tmp_path / "missing.bin"), TEXT_ADDRESS)

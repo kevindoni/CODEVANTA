@@ -77,5 +77,5 @@ both files to the GitHub release. Update `CHANGELOG.md` before tagging.
 | `ci.yml` | push to `main`, pull requests, manual | lint + tests on 3.11/3.13, wheel build and clean-venv smoke test |
 | `release.yml` | tag `v*` | build, PyPI trusted publish, GitHub release assets |
 
-Python 3.14 is intentionally not in the CI matrix yet: it depends on published
-`lief` wheels for 3.14. Add it to `ci.yml` once those are available.
+Python 3.11, 3.13, and 3.14 are in the CI matrix. Older interpreters are
+supported by `requires-python = ">=3.10"` but not exercised by CI.

@@ -253,6 +253,58 @@ All notable changes to CODEVANTA are documented here. The format follows
   zero-offset rule, the shared stop rules, fingerprint normalization, digests,
   bounds and caveats, deep-diff behaviour and bounds, the `--mode`/`--base` and
   `--deep` CLI reference, confidence, limits, and next steps.
+- Struct-field suggestions (`codevanta.analysis.type_recovery`):
+  `suggest_struct(path, info, start, max_instructions=2000, max_fields=64,
+  include_stack=False)` disassembles a bounded window and reads the memory
+  operands of every decoded instruction. Only `[reg]`, `[reg + 0xNN]` and
+  `[reg - 0xNN]` are understood — a decimal displacement is accepted like a hex
+  one — while an index register, a scale or a segment prefix is skipped rather
+  than guessed, and `lea`, `nop` and `prefetch*` are skipped because they do not
+  access memory. Widths come from the `byte`/`word`/`dword`/`qword` keyword
+  (1/2/4/8), falling back to the pointer width of the binary. Direction is a
+  write when the memory operand is first and a read otherwise, except
+  `cmp`/`cmps`/`cmpsb`/`cmpsw`/`cmpsd`/`cmpsq`/`test`, which are always reads.
+  Accesses aggregate per offset into `SuggestedField` records (dominant width,
+  ties to the wider access; read/write totals across widths; ascending offsets),
+  stack registers (`sp`/`esp`/`rsp`/`bp`/`ebp`/`rbp`) are dropped unless
+  `include_stack=True`, and `max_fields` sets `truncated` with lower offsets
+  winning. Every record is `medium` confidence
+  (`type_recovery.memory_operand`/`operand_scan`,
+  `type_recovery.suggestion`/`operand_aggregation`) and states that fields are
+  heuristic from operand shapes, not verified types.
+- MCP tools: `codevanta_diff` (structural binary diff with optional `deep`
+  fingerprinting, `max_functions` default 5000), `codevanta_jump_table`
+  (absolute by default, `mode="relative"` requires `base`, `entries` default 256
+  and values above 4096 are rejected), and `codevanta_function_hash` (normalized-shape SHA-256
+  with `max_instructions` default 2000) bring the server to thirteen tools.
+  Arguments are validated the same way as the CLI (limits `1 .. 20000`,
+  non-negative addresses, booleans rejected for flags) and analysis failures
+  raise `AnalysisError`; struct suggestions are not exposed over MCP yet.
+- CLI: `codevanta struct PATH` with `--address`/`-a`, `--function`/`-f`,
+  `--max-instructions`, `--max-fields`, `--include-stack`, and `--json`. The
+  start address resolves as address, then function name, then entry point. The
+  table lists `Offset`, `Width`, `Reads`, and `Writes` per suggested field with a
+  footer for the base registers the sweep saw, the field and instruction counts,
+  the applied field cap, and the truncation flag, followed by one `warning:` line
+  when the cap was reached or no field was decoded (the latter also points at
+  `--include-stack`). Base registers come from a second bounded pass over the
+  same window, so they are the registers in use, not a per-field attribution.
+  `--json` prints the suggestion's `to_dict()`, and load or input errors (missing
+  file, invalid address or limits, unknown function, non-executable address)
+  exit `2`.
+- CI: the test matrix in `.github/workflows/ci.yml` is now `"3.11"`, `"3.13"`,
+  and `"3.14"` (`fail-fast: false`), with the wheel build and clean-venv smoke
+  test still on 3.13. Python 3.14 was previously held back because it needed
+  published `lief` wheels; `lief` now ships `cp314` wheels (`lief 1.0.0`), so the
+  `lief>=0.14` requirement resolves to a 3.14-capable release.
+  `requires-python` stays `>=3.10`, so 3.10 and 3.12 remain supported without
+  being exercised by CI, and `docs/repository-settings.md` was updated to match.
+- Documentation: `docs/phase2h.md` covers the operand shapes that are and are not
+  recovered, the stack-register rule, width and direction rules, per-offset
+  aggregation (including that offsets from different base registers share one
+  bucket), the `medium` evidence labels, bounds and determinism, the thirteen
+  MCP tools, the `codevanta struct` CLI reference, the new CI matrix, confidence,
+  limitations, and next steps.
 
 ### Notes
 
@@ -269,8 +321,14 @@ All notable changes to CODEVANTA are documented here. The format follows
   equivalence claim. The phase 2g switches are `jump-table --mode
   absolute|relative --base ADDR`, the new `function_fingerprint` API, and
   `diff --deep`; the CFG's indirect resolution still uses the absolute layout.
+  Phase 2h adds heuristic struct-field suggestions (`suggest_struct` and
+  `codevanta struct`), which report an offset, an access width, and read/write
+  counts only: there is no type name, no alignment or padding inference, and no
+  cross-function merging, and offsets reached through different base registers
+  share one bucket. Struct suggestions are not exposed over MCP yet.
   See `docs/phase2.md`, `docs/phase2b.md`, `docs/phase2c.md`,
-  `docs/phase2d.md`, `docs/phase2e.md`, `docs/phase2f.md`, and `docs/phase2g.md`.
+  `docs/phase2d.md`, `docs/phase2e.md`, `docs/phase2f.md`, `docs/phase2g.md`, and
+  `docs/phase2h.md`.
 - Node boundaries and caller attribution are heuristics, not proven function
   extents. Sessions and annotations live in one local SQLite file with no schema
   migrations yet.

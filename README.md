@@ -112,10 +112,25 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   analysis run (fingerprint, format, arch, entry point, function/string counts)
   plus per-address analyst annotations (`annotate`, `annotations`,
   `remove_annotation`; one replaceable note per address).
-- **MCP tools** — `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`,
-  `codevanta_session_save`, `codevanta_session_list`, alongside the five phase 1
-  tools (ten in total).
-- **CLI:** `codevanta xrefs`, `codevanta cfg` (with
+- **Struct-field suggestions** (`analysis/type_recovery.py`) — `suggest_struct`
+  reads the memory operands of a bounded window and reports one
+  `SuggestedField` per displacement. Only `[reg]`, `[reg + 0xNN]` and
+  `[reg - 0xNN]` are understood (index/scale and segment forms are skipped),
+  width comes from the `byte`/`word`/`dword`/`qword` keyword or else the
+  pointer width, direction comes from operand position with `cmp`/`test` always
+  reads, stack registers are skipped unless `include_stack=True`, and each
+  offset keeps its dominant width plus total read/write counts. Every record is
+  `medium` confidence and explicitly heuristic: no type names, no alignment or
+  padding inference, and offsets are bucketed per displacement so different
+  base registers share one bucket.
+- **MCP tools** — `codevanta_diff`, `codevanta_jump_table`, and
+  `codevanta_function_hash` join `codevanta_xrefs`, `codevanta_cfg`,
+  `codevanta_callgraph`, `codevanta_session_save`, and
+  `codevanta_session_list`, alongside the five phase 1 tools (thirteen in
+  total).
+- **CLI:** `codevanta struct` (with `--address`/`--function`,
+  `--max-instructions`, `--max-fields`, `--include-stack`, `--json`),
+  `codevanta xrefs`, `codevanta cfg` (with
   `--traversal linear|recursive`, default `linear`, and `--resolve-indirect` for
   recursive traversals), `codevanta jump-table` (with
   `--mode absolute|relative` and `--base ADDR` for signed-offset tables),
@@ -130,16 +145,20 @@ pointer arrays or signed 32-bit offset tables with an analyst-supplied base
 (`--mode relative --base`) — never register/indexed dispatch, call graph edges
 from `call` / `call_import` / `call_indirect` only, no following calls into
 callees, no cross-function analysis, a structural (metadata-only) binary diff
-plus an opt-in shape-fingerprint comparison of address-matched functions, and no
+plus an opt-in shape-fingerprint comparison of address-matched functions, struct
+fields as per-offset hypotheses from `[reg]`/`[reg ± disp]` operands only, and no
 debugger yet. The phase 2g switches are `jump-table --mode absolute|relative
 --base ADDR` (plus the same `mode`/`base_address` arguments on
 `resolve_jump_table`), the new `function_fingerprint` API, and `diff --deep`
 (`deep=True`); the CFG's indirect resolution still uses the absolute layout.
+Phase 2h adds `codevanta struct` (and the `suggest_struct` API) plus the
+`codevanta_diff`, `codevanta_jump_table`, and `codevanta_function_hash` MCP
+tools.
 See [docs/phase2.md](docs/phase2.md), [docs/phase2b.md](docs/phase2b.md),
 [docs/phase2c.md](docs/phase2c.md), [docs/phase2d.md](docs/phase2d.md),
-[docs/phase2e.md](docs/phase2e.md), [docs/phase2f.md](docs/phase2f.md), and
-[docs/phase2g.md](docs/phase2g.md) for scope, confidence semantics, and
-limitations.
+[docs/phase2e.md](docs/phase2e.md), [docs/phase2f.md](docs/phase2f.md),
+[docs/phase2g.md](docs/phase2g.md), and [docs/phase2h.md](docs/phase2h.md) for
+scope, confidence semantics, and limitations.
 
 ## Installation
 
@@ -185,6 +204,8 @@ codevanta session list --limit 10
 codevanta session show 4f9c1a7b2d3e
 codevanta session annotate 4f9c1a7b2d3e 0x401000 "decrypts config with XOR 0x5a"
 codevanta session notes 4f9c1a7b2d3e
+codevanta struct    C:\Windows\System32\notepad.exe --address 0x140001000
+codevanta struct    samples\handle.bin --function process --include-stack --json
 ```
 
 All addresses in reports are absolute virtual addresses (VA). Function
@@ -195,9 +216,11 @@ Phase 2 results carry their own evidence: xrefs are `certain` (the target is
 read directly from the decoded operand), CFG blocks are `medium` (block
 boundaries come from mnemonic heuristics), jump-table entries are `medium` (a
 pointer array found by shape is not proof a dispatcher indexes it), the
-structural diff is `medium` (metadata only, never bytes or behavior), and the
-call graph is `medium` (calls are decoded, but caller attribution is a
-nearest-candidate heuristic). `codevanta callgraph` defaults to `--format json`
+structural diff is `medium` (metadata only, never bytes or behavior), the call
+graph is `medium` (calls are decoded, but caller attribution is a
+nearest-candidate heuristic), and struct fields are `medium` (an operand proves
+an access, not a type, alignment, or layout). `codevanta callgraph` defaults to
+`--format json`
 and can emit `dot`, `graphml`, or `html` (one self-contained file with an inline
 SVG view that pans, zooms, searches, and filters by kind without any CDN, opened
 straight from disk); `codevanta cfg` defaults to the entry point and to
@@ -205,9 +228,13 @@ straight from disk); `codevanta cfg` defaults to the entry point and to
 evidence source `cfg.recursive_traversal`, and `--resolve-indirect` (recursive
 only) adds jump-table successors; `codevanta jump-table` takes a decimal or `0x`
 hex `--address` and a `--entries` slot budget; `codevanta diff` exits `0`
-whether or not the binaries differ, and `2` on load or input errors. Sessions default
-to `$env:CODEVANTA_DB` or `~/.codevanta/sessions.db`, and `session annotate`
-accepts decimal or `0x` hex addresses.
+whether or not the binaries differ, and `2` on load or input errors;
+`codevanta struct` defaults to the entry point, starts at `--address` or
+`--function` when given, reports each field's offset, width, read and write
+counts, and adds a footer naming the base registers the sweep saw plus one
+`warning:` line per limitation (`--json` for the full document). Sessions
+default to `$env:CODEVANTA_DB` or `~/.codevanta/sessions.db`, and
+`session annotate` accepts decimal or `0x` hex addresses.
 
 Calls through a pointer slot report the **slot** address, not the callee: the
 pointer is read at run time, so the code behind it is unknown here. A slot that
@@ -239,16 +266,26 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools (ten): `codevanta_info`, `codevanta_functions`,
+MCP tools (thirteen): `codevanta_info`, `codevanta_functions`,
 `codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
-`codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`,
-`codevanta_session_save`, `codevanta_session_list`.
+`codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
+`codevanta_jump_table`, `codevanta_function_hash`, `codevanta_session_save`,
+`codevanta_session_list`.
 
 `codevanta_callgraph` takes the same bounded limits as the CLI
 (`limit_functions`, `limit_edges`, defaulting to 1000 and 5000) and returns nodes,
 edges, `truncated`, `warnings`, and evidence. Import targets arrive as `import`
 nodes labelled from the import table; unresolved callees stay `external`.
 `codevanta_analyze` remains the phase 1 report and has no call-graph flag.
+
+`codevanta_diff` compares two binaries structurally (`max_functions` default
+5000, `deep=False`) and reports `warnings` when a cap truncated the comparison.
+`codevanta_jump_table` defaults to `mode="absolute"` and requires `base` when
+`mode="relative"`; `entries` defaults to 256 and values above 4096 are rejected.
+`codevanta_function_hash` returns a SHA-256 over the normalized instruction
+shape (numeric literals masked) with a `truncated` flag — equal digests are not
+byte equality, and different digests are not a semantic difference. Struct
+suggestions are not exposed over MCP yet.
 
 Prompt you can paste into a coding agent:
 
@@ -264,7 +301,7 @@ src/codevanta/
 ├── ir/          # backend-neutral instruction model + adapter registry
 ├── mcp_server/  # MCP tools and stdio server for coding agents
 ├── setup/       # client config planning, apply, verify (claude/cursor/cline/vscode)
-├── analysis/    # cross-references, call graph, CFG (linear sweep + recursive traversal), jump tables (absolute + relative), function fingerprints, structural/deep diff, graph/HTML export (phase 2)
+├── analysis/    # cross-references, call graph, CFG (linear sweep + recursive traversal), jump tables (absolute + relative), function fingerprints, structural/deep diff, struct-field suggestions, graph/HTML export (phase 2)
 ├── api/         # HTTP API (phase 2+)
 ├── cli/         # Typer command line surface
 ├── storage/     # SQLite session storage and annotations (phase 2)
@@ -281,6 +318,9 @@ python -m pytest
 ruff check src tests
 ```
 
+CI runs the same lint and test job on Python 3.11, 3.13, and 3.14, and builds
+plus smoke-tests the wheel on 3.13.
+
 ## Documentation
 
 - [Project specification](PROJECT_SPEC.md)
@@ -292,6 +332,7 @@ ruff check src tests
 - [Phase 2e — recursive CFG traversal](docs/phase2e.md)
 - [Phase 2f — jump tables, CFG indirect resolution, interactive viewer, structural diff](docs/phase2f.md)
 - [Phase 2g — relative jump tables, function fingerprints, deep diff](docs/phase2g.md)
+- [Phase 2h — struct-field suggestions, MCP parity, Python 3.14 CI](docs/phase2h.md)
 
 ## Roadmap
 
