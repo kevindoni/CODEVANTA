@@ -13,8 +13,6 @@ import http.client
 import json
 import struct
 import threading
-import urllib.error
-import urllib.request
 from collections.abc import Iterator
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -126,29 +124,35 @@ def gui_server() -> Iterator[ThreadingHTTPServer]:
         _stop(server, thread)
 
 
-def _url(server: ThreadingHTTPServer, path: str) -> str:
-    """Return the absolute URL of ``path`` on ``server``."""
+def _fetch(
+    server: ThreadingHTTPServer, path: str, method: str = "GET"
+) -> tuple[int, str, bytes]:
+    """Issue ``method path`` against the in-process ``server`` via http.client.
+
+    The server is addressed as a plain socket (like the Host-header tests
+    below already do): no URL is built or fetched, and every status —
+    including error statuses — comes back without raising.
+    """
     host, port = server.server_address[0], server.server_address[1]
-    return f"http://{host}:{port}{path}"
+    connection = http.client.HTTPConnection(host or "127.0.0.1", port, timeout=30)
+    try:
+        connection.request(method, path)
+        response = connection.getresponse()
+        return response.status, response.headers.get("Content-Type", ""), response.read()
+    finally:
+        connection.close()
 
 
 def _get(server: ThreadingHTTPServer, path: str) -> tuple[int, dict]:
     """GET ``path`` and return ``(status, payload)``, including error statuses."""
-    try:
-        with urllib.request.urlopen(_url(server, path), timeout=30) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8"))
+    status, _, body = _fetch(server, path)
+    return status, json.loads(body.decode("utf-8"))
 
 
 def _get_text(server: ThreadingHTTPServer, path: str) -> tuple[int, str, str]:
     """GET ``path`` and return ``(status, content_type, body)`` as text."""
-    with urllib.request.urlopen(_url(server, path), timeout=30) as response:
-        return (
-            response.status,
-            response.headers.get("Content-Type", ""),
-            response.read().decode("utf-8"),
-        )
+    status, content_type, body = _fetch(server, path)
+    return status, content_type, body.decode("utf-8")
 
 
 def _raw_get(
@@ -524,14 +528,10 @@ def test_invalid_traversal_is_a_400(
 
 def test_non_get_methods_are_405(gui_server: ThreadingHTTPServer) -> None:
     for method in ("POST", "PUT", "DELETE", "HEAD"):
-        request = urllib.request.Request(_url(gui_server, "/api/health"), method=method)
-        if method == "POST":
-            request.data = b""
-        with pytest.raises(urllib.error.HTTPError) as excinfo:
-            urllib.request.urlopen(request, timeout=30)
-        assert excinfo.value.code == 405
+        status, _, body = _fetch(gui_server, "/api/health", method=method)
+        assert status == 405
         if method != "HEAD":
-            payload = json.loads(excinfo.value.read().decode("utf-8"))
+            payload = json.loads(body.decode("utf-8"))
             assert payload["error"] == "only GET is supported"
 
 
