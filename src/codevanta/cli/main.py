@@ -63,10 +63,14 @@ from codevanta.analysis.type_recovery import (
     DEFAULT_MAX_INSTRUCTIONS as STRUCT_MAX_INSTRUCTIONS,
 )
 from codevanta.analysis.type_recovery import (
+    MAX_MERGED_WINDOWS as STRUCT_MAX_WINDOWS,
+)
+from codevanta.analysis.type_recovery import (
     ArrayGroup,
     StructSuggestion,
     parse_memory_operands,
     suggest_struct,
+    suggest_structs,
 )
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.disassembler import DisassemblyError
@@ -861,7 +865,7 @@ def _struct_base_registers(
     max_instructions: int,
     include_stack: bool,
 ) -> tuple[str, ...]:
-    """Return the base registers the struct sweep saw, sorted and de-duplicated.
+    """Return the base registers a *single* struct window saw, sorted and unique.
 
     :func:`codevanta.analysis.type_recovery.suggest_struct` aggregates accesses
     per offset and therefore drops the base register of each access, while the
@@ -870,6 +874,11 @@ def _struct_base_registers(
     production parser (:func:`parse_memory_operands`), so both passes agree on
     which operands count. A failure here never fails the command: the suggestion
     is already computed, so the footer simply reports no base register.
+
+    Only the single-window path pays for this second decode -- one extra window,
+    so the single-address output stays exactly as it was. A merge must not
+    multiply that cost by its window count and reads the registers out of the
+    evidence instead (:func:`_struct_evidence_base_registers`).
     """
     pointer_width = _STRUCT_POINTER_WIDTHS.get(info.bitness, 8)
     try:
@@ -885,14 +894,65 @@ def _struct_base_registers(
     return tuple(sorted(registers))
 
 
-def _struct_warnings(result: StructSuggestion) -> list[str]:
-    """Return the CLI-level warnings for one struct suggestion."""
+#: Evidence key a suggestion would carry the base registers it saw under.
+_STRUCT_BASE_REGISTER_KEY = "base_registers"
+
+
+def _struct_evidence_base_registers(result: StructSuggestion) -> tuple[str, ...]:
+    """Return the base registers the sweep behind ``result`` recorded itself.
+
+    A merge aggregates accesses per offset across windows, so the base register
+    of each access is not a field of its own. Re-sweeping every window just for
+    the footer would decode up to ``max_windows * max_instructions``
+    instructions a second time, on top of the budget the merge is bounded by, so
+    the union is read out of the evidence the merge already produced instead --
+    from the merged suggestion and from every merged field, because either level
+    can carry it. The values are de-duplicated and sorted, which keeps the footer
+    independent of the order the windows were passed in.
+
+    The phase 2k analysis layer records no base register in that evidence, so
+    this returns none today and the footer says so rather than paying for a
+    second decode. Carrying the registers out of the sweep is an analysis-layer
+    change; until it lands, nothing here decodes a window again.
+    """
+    registers: set[str] = set()
+    evidence_records = [result.evidence, *(field.evidence for field in result.fields)]
+    for evidence in evidence_records:
+        recorded = evidence.extra.get(_STRUCT_BASE_REGISTER_KEY)
+        if not isinstance(recorded, (list, tuple, set, frozenset)):
+            continue
+        registers.update(name for name in recorded if isinstance(name, str))
+    return tuple(sorted(registers))
+
+
+def _struct_window_text(windows: tuple[int, ...]) -> str:
+    """Render merged windows as ``2 (0x401000, 0x401004)``."""
+    addresses = ", ".join(f"0x{start:x}" for start in windows)
+    return f"{len(windows)} ({addresses})"
+
+
+def _struct_warnings(result: StructSuggestion, *, merged: bool = False) -> list[str]:
+    """Return the CLI-level warnings for one struct suggestion.
+
+    ``merged`` selects the field-cap hint. A single window can keep the dropped
+    offsets by raising ``--max-fields``, but the same command exits 2 on a
+    non-default ``--max-fields`` next to a merge, so a merge must not be told to
+    raise a flag it rejects: it is told the cap the merged sweep applies instead
+    and that the windows have to be split to see the remaining offsets.
+    """
     warnings: list[str] = []
     if result.truncated:
-        warnings.append(
-            f"field cap of {result.max_fields} reached; raise --max-fields for the "
-            "remaining offsets"
-        )
+        if merged:
+            warnings.append(
+                f"field cap reached: the merged sweep keeps at most {STRUCT_MAX_FIELDS} "
+                "offsets, so split the windows into separate runs to see the remaining "
+                "offsets"
+            )
+        else:
+            warnings.append(
+                f"field cap of {result.max_fields} reached; raise --max-fields for the "
+                "remaining offsets"
+            )
     if not result.fields:
         hint = (
             ""
@@ -953,12 +1013,34 @@ def _print_struct_layout(result: StructSuggestion) -> None:
     console.print(f"[dim]signed: {escape(_struct_signed_text(result))}[/]")
 
 
+def _struct_register_footer(base_registers: tuple[str, ...], *, merged: bool) -> str:
+    """Render the ``base registers:`` footer value of a struct run.
+
+    A single window derives its registers from its own decode, so the only empty
+    case is a window without a field-shaped operand and ``-`` states that. A
+    merge reads the union from the evidence the sweep already produced; when that
+    evidence carries none, ``-`` would claim the windows never used a base
+    register, so the footer says the merge did not record them instead of
+    decoding every window a second time to find out.
+    """
+    if base_registers:
+        return ", ".join(base_registers)
+    return "not recorded by the merge" if merged else "-"
+
+
 def _print_struct_suggestion(
     result: StructSuggestion,
     *,
     base_registers: tuple[str, ...],
+    windows: tuple[int, ...] | None = None,
 ) -> None:
-    """Print one :class:`StructSuggestion` as an offset table plus a footer."""
+    """Print one :class:`StructSuggestion` as an offset table plus a footer.
+
+    ``windows`` is only passed by the merged (repeated ``--address``) path, where
+    it adds one ``windows:`` footer line naming every merged address and selects
+    the merge wording of the field-cap hint. The single-window output stays
+    unchanged because both only apply when ``windows`` is given.
+    """
     table = Table(title=escape(f"Struct at 0x{result.address:x}"))
     table.add_column("Offset", justify="right")
     table.add_column("Width", justify="right")
@@ -972,15 +1054,18 @@ def _print_struct_suggestion(
             str(field.write_count),
         )
     console.print(table)
-    registers = ", ".join(base_registers) or "-"
+    merged = windows is not None
+    registers = _struct_register_footer(base_registers, merged=merged)
     console.print(f"[dim]base registers: {escape(registers)} - fields: {result.field_count}[/]")
     console.print(
         f"[dim]instructions: {result.instruction_count}"
         f" - max fields: {result.max_fields}"
         f" - truncated: {'yes' if result.truncated else 'no'}[/]"
     )
+    if windows is not None:
+        console.print(f"[dim]windows: {escape(_struct_window_text(windows))}[/]")
     _print_struct_layout(result)
-    for warning in _struct_warnings(result):
+    for warning in _struct_warnings(result, merged=merged):
         console.print(f"[yellow]warning:[/] {escape(warning)}")
 
 
@@ -988,11 +1073,14 @@ def _print_struct_suggestion(
 def struct(
     path: Path,
     address: Annotated[
-        str | None,
+        list[str] | None,
         typer.Option(
             "--address",
             "-a",
-            help="Virtual address of the first instruction (decimal or 0x hex)",
+            help=(
+                "Virtual address of the first instruction (decimal or 0x hex); repeat "
+                f"up to {STRUCT_MAX_WINDOWS} times to merge the windows"
+            ),
         ),
     ] = None,
     function: Annotated[
@@ -1028,6 +1116,18 @@ def struct(
     aggregated per offset: the dominant access width, the read count and the
     write count. Only file bytes are read; nothing is mapped or executed.
 
+    ``--address`` is repeatable: one address is the single-window sweep above,
+    while two or more addresses are merged by ``suggest_structs`` (type
+    recovery) into one field per offset -- counters summed, widest width
+    winning, earliest access kept -- and the ``alignment``/``array_groups``/
+    ``truncated`` facts are recomputed across windows. A merge accepts at most
+    ``MAX_MERGED_WINDOWS`` (16) windows, sorts the addresses before decoding,
+    and rejects duplicated ones, so the output is the same for any order of the
+    same address set. ``--function`` names one start, so it is rejected (exit 2)
+    next to *any* ``--address`` -- one address would silently win over it --
+    and ``--max-fields`` is rejected next to a merge, which always keeps its own
+    ``DEFAULT_MAX_FIELDS`` (64) cap.
+
     Fields are a heuristic about how the code reaches memory through one base
     register, not verified types: signedness, purpose and lifetime stay unknown.
     ``\\[rsp]``/``\\[rbp]``-based operands usually describe stack slots, so they
@@ -1036,32 +1136,67 @@ def struct(
 
     ``--json`` emits ``StructSuggestion.to_dict()`` unchanged, which already
     carries the derived ``alignment``, ``array_groups`` and per-field ``signed``
-    hint. The table adds a footer naming the base registers seen, the field and
+    hint, plus the merged ``window_count``/``windows`` in the evidence ``extra``.
+    The table adds a footer naming the base registers seen, the field and
     instruction counts, the truncation flag, the inferred ``alignment``
     (``unknown`` when fewer than two distinct non-zero offsets were seen), one
     ``array at 0x..`` line per array candidate -- ``arrays: none`` when no run
     was found -- and one ``signed:`` line listing the offsets whose mnemonics
     hinted a signed or unsigned access (``none`` when nothing hinted), followed
-    by one ``warning:`` line per limitation. Load and input errors -- unreadable
-    file, bad address, unknown function, address outside an executable section --
-    exit 2.
+    by one ``warning:`` line per limitation. A merged run adds one
+    ``windows: N (0x.., 0x..)`` line naming the merged windows, and reads its
+    base registers out of the evidence the merge already produced instead of
+    decoding every window again -- that evidence records none today, so the
+    footer says so. A truncated merge is told to split the windows, because the
+    merged sweep always keeps at most its own field cap. Load and input
+    errors -- unreadable file, bad address, unknown function, address outside an
+    executable section, duplicated address, too many windows, conflicting
+    options -- exit 2.
     """
-    start_address = None if address is None else _parse_address(address)
+    starts = tuple(_parse_address(text) for text in address or ())
+    if starts and function is not None:
+        _fail(
+            "--function names one start; give either --function or --address, not both",
+            2,
+        )
+    if len(starts) > 1 and max_fields != STRUCT_MAX_FIELDS:
+        _fail(
+            "--max-fields applies to a single --address; the merged sweep keeps "
+            f"at most {STRUCT_MAX_FIELDS} fields",
+            2,
+        )
     loaded = _load(path)
     try:
-        start = resolve_target(loaded, start_address, function)
-        result = suggest_struct(
-            path,
-            loaded,
-            start,
-            max_instructions=max_instructions,
-            max_fields=max_fields,
-            include_stack=include_stack,
-        )
+        if len(starts) > 1:
+            result = suggest_structs(
+                path,
+                loaded,
+                starts,
+                max_instructions=max_instructions,
+                include_stack=include_stack,
+            )
+        else:
+            start = resolve_target(loaded, starts[0] if starts else None, function)
+            result = suggest_struct(
+                path,
+                loaded,
+                start,
+                max_instructions=max_instructions,
+                max_fields=max_fields,
+                include_stack=include_stack,
+            )
     except AnalysisError as exc:
         _fail(str(exc), 2)
     if json_output:
         console.print_json(json.dumps(result.to_dict()))
+        return
+    if len(starts) > 1:
+        windows = tuple(sorted(starts))
+        _print_struct_suggestion(
+            result,
+            base_registers=_struct_evidence_base_registers(result),
+            windows=windows,
+        )
         return
     _print_struct_suggestion(
         result,

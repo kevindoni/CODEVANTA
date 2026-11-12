@@ -48,6 +48,35 @@ Two cheap layout hints are derived from those fields:
 Both hints are computed from the fields that are actually reported, i.e. after
 the ``max_fields`` cap, so a group never refers to a field that was dropped.
 
+:func:`suggest_structs` merges several windows -- one per address of the same
+binary -- into a single :class:`StructSuggestion`. Each address is decoded
+exactly once with the same budget, and the per-window fields are folded
+together:
+
+* There is one merged field per offset. Its read/write counters are the sums
+  over the windows that saw the offset, and its ``first_access`` is the earliest
+  access any window recorded.
+* Equal per-window widths are kept as they are. When the windows disagree the
+  widest width wins and a :class:`WidthConflictWarning` names the offset and the
+  widths: a window that only ever saw a ``dword`` is not evidence *against* the
+  ``qword`` another window saw.
+* Signedness is folded with the rule used inside one window -- consistent hints
+  survive, no hint stays unknown, and a contradiction becomes ``None`` plus one
+  :class:`SignednessConflictWarning`. A contradiction *inside* a window has
+  already warned during that window's own aggregation; the merge does not warn
+  about it a second time, because it only sees the resolved per-window hints.
+* ``alignment``, ``array_groups`` and ``truncated`` are recomputed from the
+  merged fields, so a run that only becomes visible across windows is still
+  found.
+
+The merged work is bounded too: at most ``max_windows`` addresses are accepted
+(:data:`MAX_MERGED_WINDOWS`), duplicate addresses are rejected instead of being
+merged twice, and every window costs at most one decode of ``max_instructions``
+instructions. The merged field set stays capped at :data:`DEFAULT_MAX_FIELDS`
+distinct offsets, which is lossless: each window is capped there as well and the
+cap always keeps the *lowest* offsets, so an offset a window dropped cannot
+belong to the lowest merged offsets either.
+
 Everything here is a *heuristic*: a struct field recovered from operand shapes
 is a hypothesis about how a function treats memory around one base register. It
 is not a verified type, and it says nothing about a field's purpose or lifetime.
@@ -94,8 +123,10 @@ __all__ = [
     "DEFAULT_MAX_INSTRUCTIONS",
     "MAX_MAX_FIELDS",
     "MAX_MAX_INSTRUCTIONS",
+    "MAX_MERGED_WINDOWS",
     "MIN_MAX_FIELDS",
     "MIN_MAX_INSTRUCTIONS",
+    "MIN_MERGED_WINDOWS",
     "READ",
     "SignednessConflictWarning",
     "STACK_REGISTERS",
@@ -103,8 +134,11 @@ __all__ = [
     "FieldAccess",
     "StructSuggestion",
     "SuggestedField",
+    "WidthConflictWarning",
+    "WindowOverlapWarning",
     "parse_memory_operands",
     "suggest_struct",
+    "suggest_structs",
 ]
 
 #: Default instruction budget for one suggestion.
@@ -124,6 +158,13 @@ MIN_MAX_FIELDS = 1
 
 #: Largest accepted ``max_fields``; larger requests are rejected.
 MAX_MAX_FIELDS = 512
+
+#: Default *and* largest number of windows :func:`suggest_structs` merges. Each
+#: window costs one bounded decode, so this is the knob that keeps a merge cheap.
+MAX_MERGED_WINDOWS = 16
+
+#: Smallest accepted ``max_windows``; smaller requests are rejected.
+MIN_MERGED_WINDOWS = 1
 
 #: Direction label for a memory operand that is only read.
 READ = "read"
@@ -192,6 +233,10 @@ _SUGGESTION_EVIDENCE_SOURCE = "type_recovery.suggestion"
 _SUGGESTION_EVIDENCE_METHOD = "operand_aggregation"
 _ARRAY_EVIDENCE_SOURCE = "type_recovery.array_run"
 _ARRAY_EVIDENCE_METHOD = "stride_run_detection"
+_MERGED_FIELD_EVIDENCE_SOURCE = "type_recovery.merged_field"
+_MERGED_FIELD_EVIDENCE_METHOD = "window_merge"
+_MERGED_SUGGESTION_EVIDENCE_SOURCE = "type_recovery.merged_suggestion"
+_MERGED_SUGGESTION_EVIDENCE_METHOD = "window_merge"
 
 #: Smallest number of equally spaced, equally wide fields that is reported as an
 #: :class:`ArrayGroup`. Two fields are only a coincidence; three is the minimum
@@ -207,6 +252,27 @@ class SignednessConflictWarning(UserWarning):
     and this warning says which offset lost its hint. It is a
     :class:`UserWarning`, so callers that do not care about signedness can
     ignore it; callers that do can filter on it.
+    """
+
+
+class WindowOverlapWarning(UserWarning):
+    """Emitted when two merged windows decode the same instruction bytes.
+
+    A partial overlap is not rejected the way a duplicate address is -- looking
+    further into the same function is a legitimate second window -- but the shared
+    instructions are then counted by both windows, so the per-offset counters are
+    per-window sums and can exceed the number of distinct accesses.
+    """
+
+
+class WidthConflictWarning(UserWarning):
+    """Emitted when merged windows disagree about one field's dominant width.
+
+    A wider access is never contradicted by a narrower one -- a window that only
+    saw ``dword ptr [rdi + 0x10]`` does not prove the field is 4 bytes wide -- so
+    the merged field keeps the **widest** per-window width while this warning
+    records the offset together with every width that was seen. It is a
+    :class:`UserWarning`, so it stays silent unless somebody listens.
     """
 
 
@@ -342,6 +408,8 @@ class StructSuggestion:
         fields: Suggested fields sorted by ascending offset (at most
             ``max_fields`` entries).
         instruction_count: Number of decoded instructions the sweep considered.
+        memory_access_count: Number of memory accesses the sweep recorded after
+            the stack and instruction-pointer filters.
         max_fields: Field cap that was applied.
         truncated: True when distinct offsets were dropped by ``max_fields``.
             Instruction-budget exhaustion is not reported here.
@@ -362,6 +430,7 @@ class StructSuggestion:
     evidence: Evidence
     alignment: int | None = None
     array_groups: tuple[ArrayGroup, ...] = ()
+    memory_access_count: int = 0
 
     @property
     def field_count(self) -> int:
@@ -512,14 +581,16 @@ def parse_memory_operands(
     return tuple(accesses)
 
 
-def _resolve_signedness(offset: int, observed: Collection[bool]) -> bool | None:
+def _resolve_signedness(
+    offset: int, observed: Collection[bool], *, stacklevel: int = 4
+) -> bool | None:
     """Collapse the signedness hints of one offset, warning on a contradiction.
 
     One kind of hint means the offset is taken to be signed (or unsigned), no
     hint means it stays unknown, and a mix is reported as unknown *and*
     announced through :class:`SignednessConflictWarning` -- a contradictory
     offset is not the same thing as an unclassified one, even though both end up
-    as ``None``.
+    as ``None``. ``stacklevel`` only moves the warning's reported location.
     """
     if len(observed) == 1:
         return next(iter(observed))
@@ -528,7 +599,7 @@ def _resolve_signedness(offset: int, observed: Collection[bool]) -> bool | None:
             f"offset 0x{offset:x} is accessed both as signed and as unsigned; "
             "reporting its signedness as unknown",
             SignednessConflictWarning,
-            stacklevel=4,
+            stacklevel=stacklevel,
         )
     return None
 
@@ -586,6 +657,7 @@ def _aggregate(accesses: Iterable[tuple[FieldAccess, bool | None]]) -> list[Sugg
                         "read_count": reads,
                         "write_count": writes,
                         "signed": signed,
+                        "signed_conflict": len(hints.get(offset, ())) > 1,
                     },
                 ),
                 signed=signed,
@@ -678,6 +750,147 @@ def _array_groups(fields: Sequence[SuggestedField]) -> tuple[ArrayGroup, ...]:
             # No run here: retry from the next field, a shorter run may start there.
             start += 1
     return tuple(groups)
+
+
+def _merged_width(offset: int, widths: Sequence[int]) -> int:
+    """Widest of the per-window widths, warning when the windows disagree.
+
+    A wide access is stronger evidence than a narrow one -- seeing a ``qword``
+    proves at least eight bytes, seeing a ``dword`` elsewhere proves nothing
+    against it -- so the widest width is kept. The disagreement is still
+    reported, because it says how much of the field the code was seen touching.
+    """
+    widest = max(widths)
+    distinct = sorted(set(widths))
+    if len(distinct) > 1:
+        rendered = ", ".join(f"{width}-byte" for width in distinct)
+        warnings.warn(
+            f"offset 0x{offset:x} is accessed with different widths ({rendered}); "
+            f"keeping the widest, {widest} byte(s)",
+            WidthConflictWarning,
+            stacklevel=5,
+        )
+    return widest
+
+
+def _merge_field(offset: int, parts: Sequence[SuggestedField]) -> SuggestedField:
+    """Fold the per-window fields of one offset into a single merged field.
+
+    ``parts`` holds one field per window that saw ``offset``, in ascending
+    window-address order. Counters are summed, the widest width wins (see
+    :func:`_merged_width`), the earliest access is kept, and signedness is folded
+    with the same rule as inside one window (:func:`_resolve_signedness`).
+    """
+    width = _merged_width(offset, [part.width for part in parts])
+    reads = sum(part.read_count for part in parts)
+    writes = sum(part.write_count for part in parts)
+    hints = {part.signed for part in parts if part.signed is not None}
+    window_conflict = any(
+        bool(part.evidence.extra.get("signed_conflict")) for part in parts
+    )
+    if window_conflict:
+        # A window whose own accesses contradicted each other must not lose that
+        # contradiction to a window that only ever hinted one way.
+        if hints:
+            warnings.warn(
+                f"offset 0x{offset:x} was accessed as signed and unsigned inside one "
+                "window, so no merged signedness hint is kept",
+                SignednessConflictWarning,
+                stacklevel=5,
+            )
+        signed = None
+    else:
+        signed = _resolve_signedness(offset, hints, stacklevel=5)
+    first = min(
+        (part.first_access for part in parts if part.first_access is not None),
+        default=None,
+    )
+    widths = sorted({part.width for part in parts})
+    rendered = ", ".join(str(width_seen) for width_seen in widths)
+    return SuggestedField(
+        offset=offset,
+        width=width,
+        read_count=reads,
+        write_count=writes,
+        first_access=first,
+        evidence=Evidence(
+            source=_MERGED_FIELD_EVIDENCE_SOURCE,
+            method=_MERGED_FIELD_EVIDENCE_METHOD,
+            confidence=Confidence.MEDIUM,
+            address=first,
+            detail=(
+                f"offset 0x{offset:x}: {width}-byte field merged from "
+                f"{len(parts)} window(s) reporting width(s) {rendered}, "
+                f"{reads} read(s), {writes} write(s), "
+                f"signedness {_signedness_text(signed)}; "
+                "field is heuristic, not a verified type"
+            ),
+            extra={
+                "offset": offset,
+                "width": width,
+                "widths": widths,
+                "read_count": reads,
+                "write_count": writes,
+                "signed": signed,
+                "signed_conflict": window_conflict or len(hints) > 1,
+                "window_count": len(parts),
+            },
+        ),
+        signed=signed,
+    )
+
+
+def _merge_window_fields(
+    windows: Sequence[tuple[int, StructSuggestion]],
+) -> tuple[tuple[SuggestedField, ...], bool]:
+    """Fold every window's fields into one field per offset.
+
+    Windows must already be in ascending address order. Offsets are visited in
+    ascending order, so the warnings raised by :func:`_merge_field` -- and the
+    merged fields themselves -- are identical for the same set of addresses
+    regardless of the order the caller passed them in.
+
+    Returns:
+        Tuple of the merged fields (sorted by ascending offset, capped at
+        :data:`DEFAULT_MAX_FIELDS`) and whether offsets were dropped by the cap.
+    """
+    per_offset: dict[int, list[SuggestedField]] = {}
+    for _address, suggestion in windows:
+        for field in suggestion.fields:
+            per_offset.setdefault(field.offset, []).append(field)
+    merged = [_merge_field(offset, per_offset[offset]) for offset in sorted(per_offset)]
+    return tuple(merged[:DEFAULT_MAX_FIELDS]), len(merged) > DEFAULT_MAX_FIELDS
+
+
+def _validate_window_addresses(addresses: object, limit: int) -> tuple[int, ...]:
+    """Validate merged window addresses and return them in ascending order.
+
+    Every address is checked for type and sign, duplicates are rejected (a second
+    decode of the same address would only double-count its evidence), and the
+    number of windows is capped at ``limit`` so the total decode work stays
+    bounded by ``limit * max_instructions`` instructions. Sorting makes the merge
+    -- including the warnings it raises -- independent of the caller's order.
+    """
+    if isinstance(addresses, (str, bytes, bytearray)) or not isinstance(
+        addresses, Collection
+    ):
+        raise AnalysisError(f"addresses must be a collection of integers, got {addresses!r}")
+    targets: list[int] = []
+    seen: set[int] = set()
+    for address in addresses:
+        if isinstance(address, bool) or not isinstance(address, int):
+            raise AnalysisError(f"address must be an integer, got {address!r}")
+        if address < 0:
+            raise AnalysisError(f"address must be non-negative, got {address}")
+        if address in seen:
+            raise AnalysisError(f"window address 0x{address:x} appears more than once")
+        seen.add(address)
+        targets.append(address)
+    if not targets:
+        raise AnalysisError("addresses must contain at least one window address")
+    if len(targets) > limit:
+        raise AnalysisError(f"too many window addresses (limit {limit}), got {len(targets)}")
+    return tuple(sorted(targets))
 
 
 def _require_int(name: str, value: object, minimum: int, maximum: int) -> int:
@@ -808,6 +1021,7 @@ def suggest_struct(
             "include_stack": include_stack,
             "alignment": alignment,
             "array_group_count": len(array_groups),
+            "decoded_bytes": result.consumed_bytes,
         },
     )
     return StructSuggestion(
@@ -820,4 +1034,181 @@ def suggest_struct(
         evidence=evidence,
         alignment=alignment,
         array_groups=array_groups,
+        memory_access_count=len(accesses),
     )
+
+
+def _warn_on_overlapping_windows(
+    windows: Sequence[tuple[int, StructSuggestion]],
+) -> None:
+    """Warn once for every window that starts inside its predecessor's decode.
+
+    Duplicate addresses are rejected outright, because a second decode of the same
+    address only double counts. A partial overlap is a legitimate way to look
+    further into one function, so it is announced instead of refused: the shared
+    instructions are counted by both windows.
+    """
+    previous_start: int | None = None
+    previous_end: int | None = None
+    for start, suggestion in windows:
+        if previous_end is not None and start < previous_end:
+            warnings.warn(
+                f"window 0x{start:x} overlaps window 0x{previous_start:x}: the shared "
+                "instructions are counted by both windows, so per-offset counters are "
+                "per-window sums and may exceed the number of distinct accesses",
+                WindowOverlapWarning,
+                stacklevel=5,
+            )
+        decoded = int(suggestion.evidence.extra.get("decoded_bytes") or 0)
+        previous_start = start
+        previous_end = start + decoded if decoded else None
+
+
+def suggest_structs(
+    path: str | Path,
+    info: BinaryInfo,
+    addresses: Collection[int],
+    max_instructions: int = DEFAULT_MAX_INSTRUCTIONS,
+    include_stack: bool = False,
+    max_windows: int = MAX_MERGED_WINDOWS,
+) -> StructSuggestion:
+    """Merge the struct evidence of several windows into one suggestion.
+
+    Every address is inspected with exactly one :func:`suggest_struct` call --
+    same budget, same stack policy -- and the per-window fields are then folded
+    into one field per offset: counters are summed, the widest per-window width
+    wins, the earliest access is kept, and signedness is combined with the
+    single-window rule. ``alignment``, ``array_groups`` and ``truncated`` are
+    recomputed from the merged fields, so a layout that only becomes visible
+    across windows is still reported.
+
+    Args:
+        path: Binary file the bytes are read from.
+        info: Loaded metadata used for address mapping, section bounds, the
+            decoder and the pointer width.
+        addresses: Window start addresses inside the same binary. Each must be
+            inside an executable section; duplicates are rejected instead of
+            being counted twice.
+        max_instructions: Per-window instruction budget
+            (``MIN_MAX_INSTRUCTIONS`` .. ``MAX_MAX_INSTRUCTIONS``). Every window
+            is decoded once with this budget, never more.
+        include_stack: When true, ``[rsp]``/``[rbp]``-relative operands are kept.
+        max_windows: Ceiling on the number of merged windows
+            (``MIN_MERGED_WINDOWS`` .. :data:`MAX_MERGED_WINDOWS`).
+
+    Returns:
+        A :class:`StructSuggestion` whose ``address`` is the **lowest** merged
+        address, whose ``instruction_count`` is the total over all windows, and
+        whose fields are sorted by ascending offset and capped at
+        :data:`DEFAULT_MAX_FIELDS`. ``max_fields`` reports that cap. The evidence
+        lists the window count and every merged address in ``extra``.
+
+    Raises:
+        AnalysisError: When ``addresses`` is not a non-empty collection of
+            non-negative integers, when an address appears twice, when more than
+            ``max_windows`` addresses are given, when ``max_instructions`` or
+            ``max_windows`` is out of range, when ``include_stack`` is not a
+            bool, or when any single window fails the :func:`suggest_struct`
+            checks (not executable, no bytes, undecodable).
+
+    Warns:
+        WidthConflictWarning: Once per offset whose per-window dominant widths
+            differ; the merged field keeps the widest one.
+        SignednessConflictWarning: Once per offset whose surviving per-window
+            hints disagree, including an offset that contradicted itself inside one
+            window while another window hinted only one way.
+        WindowOverlapWarning: Once per window that starts inside its predecessor's
+            decoded range; the shared instructions are then counted by both
+            windows.
+
+    Note:
+        Work is bounded four ways: at most ``max_windows`` windows
+        (:data:`MAX_MERGED_WINDOWS`), at most one decode of ``max_instructions``
+        instructions per window, at most :data:`DEFAULT_MAX_FIELDS` reported
+        offsets per window, and therefore at most ``max_windows *
+        max_instructions`` decoded instructions in total. Addresses are sorted
+        before the merge, so the result -- including the order of warnings -- is
+        identical for any permutation of the same address set. A window that hit
+        its own field cap cannot contribute the offsets it dropped, so the merged
+        ``truncated`` is the OR of the merge cap and every window cap, and
+        ``window_truncated`` names the windows that hit theirs. The result is still
+        a heuristic, never a verified type.
+    """
+    instruction_budget = _require_int(
+        "max_instructions", max_instructions, MIN_MAX_INSTRUCTIONS, MAX_MAX_INSTRUCTIONS
+    )
+    window_budget = _require_int(
+        "max_windows", max_windows, MIN_MERGED_WINDOWS, MAX_MERGED_WINDOWS
+    )
+    if not isinstance(include_stack, bool):
+        raise AnalysisError(f"include_stack must be a boolean, got {include_stack!r}")
+    targets = _validate_window_addresses(addresses, window_budget)
+
+    windows = [
+        (
+            start,
+            suggest_struct(
+                path,
+                info,
+                start,
+                max_instructions=instruction_budget,
+                max_fields=DEFAULT_MAX_FIELDS,
+                include_stack=include_stack,
+            ),
+        )
+        for start in targets
+    ]
+    fields, merged_truncated = _merge_window_fields(windows)
+    alignment = _alignment(fields)
+    array_groups = _array_groups(fields)
+    _warn_on_overlapping_windows(windows)
+    instruction_count = sum(suggestion.instruction_count for _start, suggestion in windows)
+    access_count = sum(suggestion.memory_access_count for _start, suggestion in windows)
+    capped_windows = [start for start, suggestion in windows if suggestion.truncated]
+    truncated = merged_truncated or bool(capped_windows)
+    primary = targets[0]
+
+    evidence = Evidence(
+        source=_MERGED_SUGGESTION_EVIDENCE_SOURCE,
+        method=_MERGED_SUGGESTION_EVIDENCE_METHOD,
+        confidence=Confidence.MEDIUM,
+        address=primary,
+        detail=(
+            f"{len(fields)} merged field(s) from {len(windows)} window(s) "
+            f"({', '.join(f'0x{start:x}' for start in targets)}) over "
+            f"{instruction_count} instruction(s)"
+            + (f", alignment {alignment}" if alignment is not None else "")
+            + f", {len(array_groups)} array candidate(s)"
+            + (" (field cap reached)" if truncated else "")
+            + "; one field per offset with the widest width winning, fields are "
+            "heuristic from operand shapes, not verified types"
+        ),
+        extra={
+            "window_count": len(windows),
+            "windows": [f"0x{start:x}" for start in targets],
+            "max_windows": window_budget,
+            "max_instructions": instruction_budget,
+            "max_fields": DEFAULT_MAX_FIELDS,
+            "instruction_count": instruction_count,
+            "memory_access_count": access_count,
+            "field_count": len(fields),
+            "truncated": truncated,
+            "window_truncated": [f"0x{start:x}" for start in capped_windows],
+            "include_stack": include_stack,
+            "alignment": alignment,
+            "array_group_count": len(array_groups),
+        },
+    )
+    return StructSuggestion(
+        address=primary,
+        fields=fields,
+        instruction_count=instruction_count,
+        max_fields=DEFAULT_MAX_FIELDS,
+        truncated=truncated,
+        include_stack=include_stack,
+        evidence=evidence,
+        alignment=alignment,
+        array_groups=array_groups,
+    )
+
+

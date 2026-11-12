@@ -412,6 +412,107 @@ All notable changes to CODEVANTA are documented here. The format follows
   signedness sets and their `None`/conflict semantics, the `diff --semantic` /
   `--threshold` switches and the `struct` `signed:` footer, limitations, and next
   steps.
+- MCP `codevanta_diff` (`codevanta.mcp_server.tools` / `server`): gains
+  `deep=False`, `semantic=False`, and `threshold=DEFAULT_SEMANTIC_THRESHOLD`
+  (0.9) next to `max_functions`, so the phase 2j pairing pass is reachable from an
+  agent in one call instead of a `codevanta_similarity` call per address pair.
+  `threshold` is a finite number in `0.0 .. 1.0` and is validated in every mode —
+  a boolean, a non-numeric value, `NaN`, `inf`, or an out-of-range value raises
+  `AnalysisError` even with `semantic=False`, and only the two paths are checked
+  first, so a bad value never costs a binary load. `deep`/`semantic` must be real
+  booleans. The returned payload is unchanged except that semantic mode adds
+  `semantic`, `semantic_threshold`, `semantic_instructions`, and
+  `max_semantic_pairs` to the comparison evidence `extra` and `similarity` to each
+  paired `changed` entry. No tool was added or removed: the server stays at
+  fifteen tools.
+- Cross-architecture guard (`codevanta.analysis.binary_diff`): the semantic pass
+  now requires both sides to describe the same instruction set. `_semantic_pairs`
+  compares `BinaryInfo.architecture` through the new `_comparable_architecture`
+  helper, which **trims surrounding whitespace and lower-cases the token only** and
+  maps the loader's literal `"unknown"` placeholder (`_UNKNOWN_ARCHITECTURE`) to an
+  empty token, so "not determined" is never treated as "a different target". There
+  is no alias table: a hand-built `"AMD64"` becomes `"amd64"` and a hand-built
+  `"x86-64"` stays `"x86-64"`, so both count as *different* from `"x86_64"` and
+  skip the pass. The token itself comes from the loader's per-format substring
+  helper, which does not cover every machine value: PE `MIPS`/`R4000` and ELF
+  `IA_64`/RISC-V/PowerPC/s390 headers all fall through to `"unknown"` (the PE
+  helper has no MIPS branch, the ELF helper no IA-64 branch), and since `unknown`
+  means "no claim", two `unknown` sides bypass the guard and are scored as if they
+  shared an instruction set. Two different identified tokens skip the pass
+  entirely with one warning naming both sides
+  (`semantic matching skipped: the two sides target different architectures (left
+  x86, right x86_64), ... every leftover keeps its added/removed verdict`); nothing
+  is decoded or scored, address and name matching plus every structural delta and
+  `deep=True` are untouched, and the gate runs before the `MAX_SEMANTIC_PAIRS`
+  ceiling so one explanation is reported instead of two. It runs *after* the
+  "nothing left to pair" early return, so a cross-architecture diff with an empty
+  leftover on one side emits no warning at all.
+- Merged struct windows (`codevanta.analysis.type_recovery`): `suggest_structs`
+  folds several windows of one binary into one `StructSuggestion`. Each address is
+  decoded once with the shared `max_instructions` budget and `include_stack`
+  policy, and the per-window fields are merged into one field per offset — read
+  and write counters summed, `first_access` the earliest any window recorded,
+  width the **widest** per-window width with a `WidthConflictWarning` naming the
+  offset and every width seen when the windows disagree, and signedness folded
+  with the single-window rule — except that a contradiction seen *inside* one
+  window is not lost to a window that only hinted one way: each per-window field
+  records `signed_conflict` in its evidence, the merge checks it, and such an
+  offset keeps `signed=None` with a `SignednessConflictWarning` raised by the merge
+  too (whenever at least one window left a hint to compare against).
+  `alignment`, `array_groups`, and `truncated` are recomputed from the merged
+  fields, so a stride or alignment that only becomes visible across windows is
+  still reported; `truncated` is the **OR** of the merge cap and every window's own
+  `DEFAULT_MAX_FIELDS` cap, because a window that hit its own cap could not
+  contribute the offsets it dropped, and `window_truncated` lists the addresses of
+  the windows that hit theirs. Work is bounded by `max_windows`
+  (`MIN_MERGED_WINDOWS` 1 .. `MAX_MERGED_WINDOWS` 16, default 16), one decode per
+  window, `DEFAULT_MAX_FIELDS` per window, and `DEFAULT_MAX_FIELDS` merged offsets
+  — at most `max_windows * max_instructions` decoded instructions. Addresses must
+  be a non-empty collection of non-negative integers; duplicates
+  (`window address 0x... appears more than once`), empty lists, non-integer
+  entries, negative values, and over-limit counts raise `AnalysisError` before
+  anything is decoded. A *partial* overlap is allowed instead of rejected — looking
+  further into the same function is a legitimate second window — and announced with
+  `WindowOverlapWarning`, which notes that the shared instructions are then counted
+  by both windows, so the summed per-offset counters and `memory_access_count` are
+  upper bounds rather than totals. Addresses are sorted, so the result and the
+  warning order are identical for any permutation, `address` is the lowest merged
+  address, `instruction_count` is the sum over windows, `max_fields` is always
+  `DEFAULT_MAX_FIELDS`, and the merge is identifiable from
+  `type_recovery.merged_suggestion` / `type_recovery.merged_field` evidence
+  (`window_merge` method) carrying `window_count`, `windows`, `max_windows`,
+  `max_instructions`, `memory_access_count`, `window_truncated`, and per-field
+  `widths`/`signed_conflict`.
+- CLI: `codevanta struct --address` / `-a` is repeatable. One address keeps the
+  phase 2i/2j single-window output, zero addresses keep the entry-point /
+  `--function` behaviour, and two or more addresses are merged through
+  `suggest_structs` — bounded by `STRUCT_MAX_WINDOWS` (`MAX_MERGED_WINDOWS`, 16),
+  sorted before decoding, so the output is identical for any order of the same
+  address set. A merged run prints the usual table plus one
+  `windows: N (0x.., 0x..)` footer line between the `instructions`/`max fields`/
+  `truncated` line and `alignment:`. Its `base registers:` value is **not** a
+  second sweep: the merge does not decode a window twice, the CLI reads the
+  registers out of the evidence the merge already produced
+  (`_struct_evidence_base_registers`), and because the phase 2k analysis layer
+  records no `base_registers` key there the footer prints
+  `base registers: not recorded by the merge` instead of a list (a single window
+  still re-sweeps itself through `_struct_base_registers` and does name them). A
+  truncated merge is told to split the windows — `field cap reached: the merged
+  sweep keeps at most 64 offsets, so split the windows into separate runs to see
+  the remaining offsets` — because the same command exits 2 on a non-default
+  `--max-fields` next to a merge, so its hint must not send the user to a rejected
+  flag. Because `--function` and `--max-fields` describe one window, more than one
+  `--address` together with either a `--function` or a non-default `--max-fields`
+  exits 2 with an explicit message instead of ignoring the option; duplicated
+  addresses, more than 16 addresses, and addresses outside an executable section
+  also exit 2 through the analysis layer's `AnalysisError`. `--json` stays
+  `StructSuggestion.to_dict()`, with `window_count`/`windows` in the evidence
+  `extra`.
+- Documentation: `docs/phase2k.md` covers the new `codevanta_diff` arguments and
+  their validation, the architecture guard's token rules and warning, the
+  `suggest_structs` merge rules, address validation, bounds and evidence keys, the
+  repeatable `struct --address` switch with its `windows:` footer and exit-2
+  combinations, limitations, and next steps.
 
 ### Notes
 
@@ -430,8 +531,10 @@ All notable changes to CODEVANTA are documented here. The format follows
   `diff --deep`; the CFG's indirect resolution still uses the absolute layout.
   Phase 2h adds heuristic struct-field suggestions (`suggest_struct` and
   `codevanta struct`), which report an offset, an access width, and read/write
-  counts only: there is no type name and no cross-function merging, and offsets
-  reached through different base registers share one bucket. Phase 2i adds
+  counts only: there is no type name, and offsets
+  reached through different base registers share one bucket (cross-window merging
+  arrives in phase 2k as `suggest_structs`, and even then stays inside one
+  binary). Phase 2i adds
   `alignment` (the gcd of the reported non-zero offsets, `None` when fewer than
   two exist) and `array_groups` (maximal runs of at least three equally wide,
   equally spaced fields) to those suggestions — both are `medium` heuristics over
@@ -442,11 +545,16 @@ All notable changes to CODEVANTA are documented here. The format follows
   capped at 4096 leftover pairs), the `codevanta_similarity` MCP tool (fifteen
   tools), and the `signed` mnemonic hint on struct fields, reachable as
   `diff --semantic --threshold` and as the `codevanta struct` footer `signed:`
-  line. `codevanta_diff` still takes no `semantic` argument, so MCP pairing goes
-  through `codevanta_similarity`.
+  line. Phase 2k adds `deep`/`semantic`/`threshold` to the `codevanta_diff` MCP
+  tool (still fifteen tools), the semantic pass's cross-architecture guard, and
+  the `suggest_structs` merged-window API over up to `MAX_MERGED_WINDOWS` (16)
+  addresses of one binary — one field per offset, widest width winning with a
+  `WidthConflictWarning`, layout hints recomputed, reachable from the CLI by
+  repeating `--address` — while `codevanta_struct` still takes a single address.
   See `docs/phase2.md`, `docs/phase2b.md`, `docs/phase2c.md`,
   `docs/phase2d.md`, `docs/phase2e.md`, `docs/phase2f.md`, `docs/phase2g.md`,
-  `docs/phase2h.md`, `docs/phase2i.md`, and `docs/phase2j.md`.
+  `docs/phase2h.md`, `docs/phase2i.md`, `docs/phase2j.md`, and
+  `docs/phase2k.md`.
 - Node boundaries and caller attribution are heuristics, not proven function
   extents. Sessions and annotations live in one local SQLite file with no schema
   migrations yet.

@@ -8,7 +8,9 @@ import struct
 from pathlib import Path
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
+from codevanta.analysis.binary_diff import DEFAULT_SEMANTIC_THRESHOLD
 from codevanta.analysis.type_recovery import MAX_MAX_FIELDS, MAX_MAX_INSTRUCTIONS
 from codevanta.core.report import AnalysisError
 from codevanta.mcp_server import tools
@@ -450,6 +452,204 @@ def test_diff_reports_moved_entry_point(tmp_path: Path) -> None:
         tools.diff(str(left), str(right), deep="yes")
     with pytest.raises(AnalysisError, match="file not found"):
         tools.diff(str(tmp_path / "missing.bin"), str(right))
+
+
+def test_diff_semantic_pairs_a_moved_function(tmp_path: Path) -> None:
+    """semantic=true turns a remove-plus-add pair into one changed entry."""
+    left = _write_elf64(tmp_path / "left.bin", bytes.fromhex("b82a000000c3"))
+    right = _write_elf64(
+        tmp_path / "right.bin",
+        bytes.fromhex("b82a000000c3"),
+        text_address=TEXT_ADDRESS + 0x10,
+    )
+
+    structural = tools.diff(str(left), str(right))
+    assert structural["functions_changed"] == []
+    assert [delta["address"] for delta in structural["functions_removed"]] == [
+        "0x401000"
+    ]
+    assert [delta["address"] for delta in structural["functions_added"]] == [
+        "0x401010"
+    ]
+    assert "semantic" not in structural["evidence"]["extra"]
+
+    payload = tools.diff(str(left), str(right), semantic=True)
+
+    assert payload["identical"] is False
+    assert payload["functions_added"] == []
+    assert payload["functions_removed"] == []
+    assert len(payload["functions_changed"]) == 1
+    delta = payload["functions_changed"][0]
+    assert delta["address"] == "0x401010"
+    assert delta["left"]["address"] == "0x401000"
+    assert delta["right"]["address"] == "0x401010"
+    assert delta["similarity"] == pytest.approx(1.0)
+    assert payload["evidence"]["extra"]["semantic"] is True
+    assert (
+        payload["evidence"]["extra"]["semantic_threshold"]
+        == DEFAULT_SEMANTIC_THRESHOLD
+    )
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_diff_semantic_threshold_gates_pairing(tmp_path: Path) -> None:
+    """A score under the floor leaves the structural add/remove verdict intact."""
+    left = _write_elf64(tmp_path / "left.bin", bytes.fromhex("90c3"))
+    right = _write_elf64(
+        tmp_path / "right.bin",
+        bytes.fromhex("9090c3"),
+        text_address=TEXT_ADDRESS + 0x10,
+    )
+
+    # The shapes overlap at 2/3, which the default 0.9 floor refuses.
+    strict = tools.diff(str(left), str(right), semantic=True)
+    assert strict["functions_changed"] == []
+    assert [delta["address"] for delta in strict["functions_removed"]] == [
+        "0x401000"
+    ]
+    assert [delta["address"] for delta in strict["functions_added"]] == ["0x401010"]
+
+    # Lowering the floor authorises the same pair, and the reported score is the
+    # rounded value that cleared it.
+    loose = tools.diff(str(left), str(right), semantic=True, threshold=0.5)
+    assert loose["functions_added"] == []
+    assert loose["functions_removed"] == []
+    assert len(loose["functions_changed"]) == 1
+    assert 0.5 <= loose["functions_changed"][0]["similarity"] < 1.0
+    assert loose["evidence"]["extra"]["semantic_threshold"] == 0.5
+
+
+def test_diff_validates_semantic_and_threshold(tmp_path: Path) -> None:
+    left = _write_elf64(tmp_path / "left.bin", bytes.fromhex("90c3"))
+    right = _write_elf64(
+        tmp_path / "right.bin",
+        bytes.fromhex("90c3"),
+        text_address=TEXT_ADDRESS + 0x10,
+    )
+
+    for kwargs in ({"semantic": "yes"}, {"semantic": 1}, {"semantic": None}):
+        with pytest.raises(AnalysisError, match="semantic"):
+            tools.diff(str(left), str(right), **kwargs)  # type: ignore[arg-type]
+    for kwargs in (
+        {"threshold": 1.01},
+        {"threshold": -0.01},
+        {"threshold": 2},
+        {"threshold": float("nan")},
+        {"threshold": float("inf")},
+        {"threshold": True},
+        {"threshold": "0.9"},
+        {"threshold": None},
+    ):
+        with pytest.raises(AnalysisError, match="threshold"):
+            tools.diff(str(left), str(right), **kwargs)  # type: ignore[arg-type]
+
+    # The floor is validated even when semantic mode is off, and both interval
+    # endpoints are accepted.
+    with pytest.raises(AnalysisError, match="threshold"):
+        tools.diff(str(left), str(right), threshold=2.0)
+    for edge in (0.0, 1.0):
+        payload = tools.diff(
+            str(left), str(right), semantic=True, threshold=edge
+        )
+        assert payload["evidence"]["extra"]["semantic_threshold"] == edge
+
+
+def test_server_diff_schema_exposes_deep_semantic_threshold() -> None:
+    listed = asyncio.run(build_server().list_tools())
+    schema = next(
+        tool for tool in listed if tool.name == "codevanta_diff"
+    ).input_schema
+    properties = schema["properties"]
+    assert properties["deep"]["type"] == "boolean"
+    assert properties["deep"]["default"] is False
+    assert properties["semantic"]["type"] == "boolean"
+    assert properties["semantic"]["default"] is False
+    assert properties["threshold"]["type"] == "number"
+    assert properties["threshold"]["default"] == DEFAULT_SEMANTIC_THRESHOLD
+    assert schema["required"] == ["left", "right"]
+
+
+def test_server_call_tool_diff_accepts_semantic_and_threshold(
+    tmp_path: Path,
+) -> None:
+    left = _write_elf64(tmp_path / "left.bin", bytes.fromhex("b82a000000c3"))
+    right = _write_elf64(
+        tmp_path / "right.bin",
+        bytes.fromhex("b82a000000c3"),
+        text_address=TEXT_ADDRESS + 0x10,
+    )
+
+    result = asyncio.run(
+        build_server().call_tool(
+            "codevanta_diff",
+            {
+                "left": str(left),
+                "right": str(right),
+                "deep": True,
+                "semantic": True,
+                "threshold": 0.5,
+            },
+        )
+    )
+    payload = _payload(result)
+    assert payload["functions_added"] == []
+    assert payload["functions_removed"] == []
+    assert payload["functions_changed"][0]["similarity"] == pytest.approx(1.0)
+    assert payload["evidence"]["extra"]["semantic_threshold"] == 0.5
+    assert payload["evidence"]["extra"]["deep"] is True
+
+
+def test_server_call_tool_diff_rejects_coerced_flag_values(
+    tmp_path: Path,
+) -> None:
+    """The wrapper may not rewrite a flag: tools.diff has to see the raw value.
+
+    ``deep=1``, ``semantic=1``, ``threshold=True`` and ``threshold="0.9"`` are
+    documented as errors, so the MCP layer must not turn them into ``True`` /
+    ``1.0`` / ``0.9`` first. ``call_tool`` raises the framework's ``ToolError``
+    for an anticipated failure and the server turns exactly that text into
+    ``is_error=True`` content, so the error still names the argument.
+    """
+    left = _write_elf64(tmp_path / "left.bin", bytes.fromhex("90c3"))
+    right = _write_elf64(
+        tmp_path / "right.bin",
+        bytes.fromhex("9090c3"),
+        text_address=TEXT_ADDRESS + 0x10,
+    )
+    base = {"left": str(left), "right": str(right)}
+    server = build_server()
+
+    for arguments, expected in (
+        ({"deep": 1}, "deep must be a boolean"),
+        ({"deep": "true"}, "deep must be a boolean"),
+        ({"semantic": 1}, "semantic must be a boolean"),
+        ({"semantic": 0}, "semantic must be a boolean"),
+        ({"threshold": True}, "threshold must be a number"),
+        ({"threshold": False}, "threshold must be a number"),
+        ({"threshold": "0.9"}, "threshold must be a number"),
+    ):
+        with pytest.raises(ToolError, match=expected) as excinfo:
+            asyncio.run(server.call_tool("codevanta_diff", base | arguments))
+        assert "codevanta_diff" in str(excinfo.value)
+
+    # The floor is checked in every mode, so a coerced boolean is refused even
+    # with semantic off rather than becoming a silent 1.0 floor.
+    with pytest.raises(ToolError, match="threshold must be a number"):
+        asyncio.run(
+            server.call_tool(
+                "codevanta_diff", base | {"semantic": False, "threshold": True}
+            )
+        )
+
+    # Real booleans and a real number still work, and an integer literal is a
+    # number rather than a coercion, so it keeps the behaviour of tools.diff.
+    same = asyncio.run(
+        server.call_tool(
+            "codevanta_diff",
+            {"left": str(left), "right": str(left), "deep": True, "threshold": 1},
+        )
+    )
+    assert _payload(same)["identical"] is True
 
 
 def test_jump_table_decodes_absolute_and_relative_tables(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import struct
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from codevanta.analysis.type_recovery import (
     DEFAULT_MAX_FIELDS,
     MAX_MAX_FIELDS,
     MAX_MAX_INSTRUCTIONS,
+    MAX_MERGED_WINDOWS,
     READ,
     STACK_REGISTERS,
     WRITE,
@@ -25,8 +27,11 @@ from codevanta.analysis.type_recovery import (
     FieldAccess,
     SignednessConflictWarning,
     StructSuggestion,
+    WidthConflictWarning,
+    WindowOverlapWarning,
     parse_memory_operands,
     suggest_struct,
+    suggest_structs,
 )
 from codevanta.core.loader import BinaryInfo, BinaryLoader
 from codevanta.core.report import AnalysisError
@@ -125,6 +130,9 @@ MUL_RDI_18 = bytes.fromhex("48f76718")
 #: ``cqo`` -- a signedness mnemonic with only implicit operands, no memory access.
 CQO = bytes.fromhex("4899")
 
+#: ``mov ecx, dword ptr [rdi + 0x10]`` -- read of field 0x10 (4 bytes wide).
+MOV_ECX_RDI_10 = bytes.fromhex("8b4f10")
+
 #: One offset read as a signed *and* as an unsigned value: a contradiction.
 MIXED_SIGNEDNESS = MOVSX_RAX_RDI_10 + MOVZX_EAX_RDI_10 + RET
 
@@ -179,6 +187,31 @@ def _suggest(path: Path, code: bytes, **kwargs: object) -> StructSuggestion:
     binary = _make_elf64(path, code)
     info = _load(binary)
     return suggest_struct(binary, info, TEXT_VA, **kwargs)  # type: ignore[arg-type]
+
+
+#: Instruction budget used for merged-window fixtures. Every window is one memory
+#: access plus ``ret``, i.e. exactly two instructions, so a two-instruction sweep
+#: can never decode into the next window's bytes.
+WINDOW_INSTRUCTIONS = 2
+
+
+def _suggest_windows(
+    path: Path, windows: Sequence[bytes], **kwargs: object
+) -> StructSuggestion:
+    """Place ``windows`` back to back in ``.text`` and merge one suggestion each.
+
+    Each window is one memory access followed by ``ret``; the default budget of
+    :data:`WINDOW_INSTRUCTIONS` keeps every sweep inside its own window.
+    """
+    binary = _make_elf64(path, b"".join(windows))
+    info = _load(binary)
+    addresses: list[int] = []
+    cursor = TEXT_VA
+    for window in windows:
+        addresses.append(cursor)
+        cursor += len(window)
+    kwargs.setdefault("max_instructions", WINDOW_INSTRUCTIONS)
+    return suggest_structs(binary, info, addresses, **kwargs)  # type: ignore[arg-type]
 
 
 def _instruction(mnemonic: str, operands: str, address: int = TEXT_VA) -> IRInstruction:
@@ -587,4 +620,247 @@ def test_signed_hint_covers_imul(tmp_path: Path) -> None:
 
     assert [(f.offset, f.signed) for f in result.fields] == [(0x20, True)]
 
+
+
+# ---- Merged window suggestions ----------------------------------------------
+
+
+def test_merged_widths_keep_the_widest_and_warn(tmp_path: Path) -> None:
+    with pytest.warns(WidthConflictWarning) as record:
+        result = _suggest_windows(
+            tmp_path / "merged_widths.bin",
+            [MOV_ECX_RDI_10 + RET, MOV_RAX_RDI_10 + RET],
+        )
+
+    assert [(f.offset, f.width, f.read_count) for f in result.fields] == [(0x10, 8, 2)]
+    assert len(record) == 1
+    message = str(record[0].message)
+    assert "0x10" in message
+    assert "4-byte" in message and "8-byte" in message
+
+
+def test_same_width_windows_merge_silently(
+    tmp_path: Path, recwarn: pytest.WarningsRecorder
+) -> None:
+    result = _suggest_windows(
+        tmp_path / "merged_same_width.bin",
+        [MOV_RAX_RDI_10 + RET, MOV_RAX_RDI_10 + RET],
+    )
+
+    assert [(f.offset, f.width, f.read_count, f.write_count) for f in result.fields] == [
+        (0x10, 8, 2, 0)
+    ]
+    conflicts = [
+        warning
+        for warning in recwarn.list
+        if isinstance(warning.message, (SignednessConflictWarning, WidthConflictWarning))
+    ]
+    assert conflicts == []
+
+
+def test_signed_and_unsigned_windows_conflict(tmp_path: Path) -> None:
+    with pytest.warns(SignednessConflictWarning) as record:
+        result = _suggest_windows(
+            tmp_path / "merged_signedness.bin",
+            [MOVSX_RAX_RDI_10 + RET, MOVZX_EAX_RDI_10 + RET],
+        )
+
+    # Both windows agree on 2 bytes, so only the hint is in dispute.
+    assert [(f.offset, f.width, f.signed) for f in result.fields] == [(0x10, 2, None)]
+    assert len(record) == 1
+    assert "0x10" in str(record[0].message)
+
+
+def test_alignment_is_recomputed_from_the_merged_offsets(tmp_path: Path) -> None:
+    single = _suggest(tmp_path / "merged_alignment_window.bin", MOV_RAX_RDI_10 + RET)
+    merged = _suggest_windows(
+        tmp_path / "merged_alignment.bin",
+        [MOV_RAX_RDI_10 + RET, MOV_EAX_RDI_14 + RET],
+    )
+
+    # Neither window sees two offsets, but the merge does.
+    assert single.alignment is None
+    assert [f.offset for f in merged.fields] == [0x10, 0x14]
+    assert merged.alignment == 4
+
+
+def test_array_groups_are_recomputed_from_the_merged_fields(tmp_path: Path) -> None:
+    merged = _suggest_windows(
+        tmp_path / "merged_array.bin",
+        [MOV_RAX_RDI_10 + RET, MOV_RDI_18_RBX + RET, MOV_RCX_RDI_20 + RET],
+    )
+
+    assert [f.offset for f in merged.fields] == [0x10, 0x18, 0x20]
+    assert [
+        (group.offset, group.stride, group.count, group.width)
+        for group in merged.array_groups
+    ] == [(0x10, 8, 3, 8)]
+    assert merged.alignment == 8
+
+
+
+
+def test_merged_evidence_lists_every_window(tmp_path: Path) -> None:
+    first_code = MOV_RAX_RDI_10 + RET
+    binary = _make_elf64(tmp_path / "merged_evidence.bin", first_code + MOV_EAX_RDI_14 + RET)
+    info = _load(binary)
+    second = TEXT_VA + len(first_code)
+
+    result = suggest_structs(
+        binary, info, [second, TEXT_VA], max_instructions=WINDOW_INSTRUCTIONS
+    )
+    extra = result.evidence.extra
+
+    assert result.evidence.source == "type_recovery.merged_suggestion"
+    assert result.evidence.confidence is Confidence.MEDIUM
+    assert "heuristic" in (result.evidence.detail or "")
+    # The lowest address is the identity of the merge, whatever the caller order.
+    assert result.address == TEXT_VA
+    assert result.evidence.address == TEXT_VA
+    assert extra["window_count"] == 2
+    assert extra["windows"] == [f"0x{TEXT_VA:x}", f"0x{second:x}"]
+    assert extra["instruction_count"] == result.instruction_count == 4
+    assert extra["memory_access_count"] == 2
+    assert extra["max_windows"] == MAX_MERGED_WINDOWS
+    assert extra["max_fields"] == result.max_fields == DEFAULT_MAX_FIELDS
+    assert extra["alignment"] == result.alignment
+
+
+def test_merged_suggestion_is_order_independent_and_json_serializable(
+    tmp_path: Path,
+) -> None:
+    first_code = MOV_RAX_RDI_10 + RET
+    binary = _make_elf64(tmp_path / "merged_order.bin", first_code + MOV_EAX_RDI_14 + RET)
+    info = _load(binary)
+    second = TEXT_VA + len(first_code)
+
+    forward = suggest_structs(binary, info, [TEXT_VA, second], max_instructions=2)
+    backward = suggest_structs(binary, info, [second, TEXT_VA], max_instructions=2)
+
+    assert forward == backward
+    payload = forward.to_dict()
+    assert payload["address"] == f"0x{TEXT_VA:x}"
+    assert json.loads(json.dumps(payload))["evidence"]["extra"]["window_count"] == 2
+    assert [field["offset"] for field in payload["fields"]] == ["0x10", "0x14"]
+
+
+def test_single_window_merge_keeps_the_per_window_fields(tmp_path: Path) -> None:
+    binary = _make_elf64(tmp_path / "merged_single.bin", THREE_FIELDS)
+    info = _load(binary)
+
+    merged = suggest_structs(binary, info, [TEXT_VA])
+    single = suggest_struct(binary, info, TEXT_VA)
+
+    assert [
+        (f.offset, f.width, f.read_count, f.write_count, f.signed) for f in merged.fields
+    ] == [(f.offset, f.width, f.read_count, f.write_count, f.signed) for f in single.fields]
+    assert merged.alignment == single.alignment
+    assert merged.array_groups == single.array_groups
+    assert merged.evidence.extra["window_count"] == 1
+
+
+def test_merged_field_evidence_names_the_merge(tmp_path: Path) -> None:
+    with pytest.warns(WidthConflictWarning):
+        result = _suggest_windows(
+            tmp_path / "merged_field_evidence.bin",
+            [MOV_ECX_RDI_10 + RET, MOV_RAX_RDI_10 + RET],
+        )
+
+    field = result.fields[0]
+    assert field.evidence.source == "type_recovery.merged_field"
+    assert field.evidence.confidence is Confidence.MEDIUM
+    assert field.evidence.extra["window_count"] == 2
+    assert field.evidence.extra["widths"] == [4, 8]
+    assert "heuristic" in (field.evidence.detail or "")
+    assert field.first_access == TEXT_VA
+
+
+def test_duplicate_window_addresses_raise(tmp_path: Path) -> None:
+    binary = _make_elf64(tmp_path / "merged_duplicate.bin", MOV_RAX_RDI_10 + RET)
+    info = _load(binary)
+
+    with pytest.raises(AnalysisError, match="more than once"):
+        suggest_structs(binary, info, [TEXT_VA, TEXT_VA])
+
+
+def test_empty_window_addresses_raise(tmp_path: Path) -> None:
+    binary = _make_elf64(tmp_path / "merged_empty.bin", MOV_RAX_RDI_10 + RET)
+    info = _load(binary)
+
+    with pytest.raises(AnalysisError, match="at least one"):
+        suggest_structs(binary, info, [])
+
+
+def test_invalid_window_address_entry_raises(tmp_path: Path) -> None:
+    binary = _make_elf64(tmp_path / "merged_bad_entry.bin", MOV_RAX_RDI_10 + RET)
+    info = _load(binary)
+
+    with pytest.raises(AnalysisError, match="address must be an integer"):
+        suggest_structs(binary, info, [TEXT_VA, "0x401004"])  # type: ignore[list-item]
+    with pytest.raises(AnalysisError, match="non-negative"):
+        suggest_structs(binary, info, [-1])
+
+
+def test_window_count_is_bounded(tmp_path: Path) -> None:
+    binary = _make_elf64(tmp_path / "merged_bounds.bin", MOV_RAX_RDI_10 + RET)
+    info = _load(binary)
+    too_many = list(range(TEXT_VA, TEXT_VA + MAX_MERGED_WINDOWS + 1))
+
+    with pytest.raises(AnalysisError, match="too many window addresses"):
+        suggest_structs(binary, info, too_many)
+    with pytest.raises(AnalysisError, match="too many window addresses"):
+        suggest_structs(binary, info, [TEXT_VA, TEXT_VA + 5], max_windows=1)
+    with pytest.raises(AnalysisError, match="max_windows must be"):
+        suggest_structs(binary, info, [TEXT_VA], max_windows=0)
+    with pytest.raises(AnalysisError, match="max_windows too large"):
+        suggest_structs(binary, info, [TEXT_VA], max_windows=MAX_MERGED_WINDOWS + 1)
+
+
+def test_merged_signedness_conflict_inside_one_window_survives_the_merge(
+    tmp_path: Path,
+) -> None:
+    # Window A contradicts itself at 0x10; window B only hints signed. The merge
+    # must not let B's single hint hide A's contradiction.
+    with pytest.warns(SignednessConflictWarning):
+        result = _suggest_windows(
+            tmp_path / "conflict.bin",
+            [MOVSX_RAX_RDI_10 + MOVZX_EAX_RDI_10 + RET, MOVSX_RAX_RDI_10 + RET],
+            max_instructions=3,
+        )
+
+    field = next(field for field in result.fields if field.offset == 0x10)
+    assert field.signed is None
+    assert field.evidence.extra["signed_conflict"] is True
+
+
+def test_merged_truncated_reports_a_window_that_hit_its_cap(tmp_path: Path) -> None:
+    # 70 distinct offsets exceed the 64-offset cap, so the window drops six of them
+    # and the merged suggestion must say so instead of reporting a lossless merge.
+    code = bytearray()
+    for index in range(1, 71):
+        offset = 0x10 * index
+        if offset <= 0x7F:
+            code += bytes.fromhex("488b47") + bytes([offset])
+        else:
+            code += bytes.fromhex("488b87") + offset.to_bytes(4, "little")
+    code += RET
+    binary = _make_elf64(tmp_path / "capped.bin", bytes(code))
+    info = _load(binary)
+
+    with pytest.warns(WindowOverlapWarning):
+        merged = suggest_structs(binary, info, [TEXT_VA, TEXT_VA + len(code) - 1])
+
+    assert merged.truncated is True
+    assert merged.evidence.extra["window_truncated"] == [hex(TEXT_VA)]
+
+
+def test_merged_windows_warn_when_their_decodes_overlap(tmp_path: Path) -> None:
+    code = MOV_RCX_RDI_20 + MOV_RCX_RDI_20 + RET
+    binary = _make_elf64(tmp_path / "overlap.bin", code)
+    info = _load(binary)
+
+    with pytest.warns(WindowOverlapWarning):
+        result = suggest_structs(binary, info, [TEXT_VA, TEXT_VA + 4])
+
+    assert result.field_count >= 1
 
