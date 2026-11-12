@@ -69,3 +69,18 @@ def test_candidates_are_sorted_by_address() -> None:
     )
     addresses = [c.address for c in discover_functions(info)]
     assert addresses == sorted(addresses)
+
+
+def test_macho_symbol_candidates_use_macho_sources() -> None:
+    info = _make_info(
+        format="MachO",
+        symbols=[SymbolInfo(name="_sample_main", address=0x401100, is_function=True)],
+        exports=[ExportInfo(name="_exported", address=0x401200)],
+    )
+    candidates = discover_functions(info)
+    symbol_match = next(c for c in candidates if c.address == 0x401100)
+    assert symbol_match.source == "macho.symbol_table"
+    assert symbol_match.confidence.value == "medium"
+    export_match = next(c for c in candidates if c.address == 0x401200)
+    assert export_match.source == "macho.exported_symbols"
+    assert export_match.confidence.value == "high"

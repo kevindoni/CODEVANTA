@@ -33,7 +33,7 @@ IR layer     Evidence layer
 
 | Module | Responsibility |
 |--------|----------------|
-| `src/codevanta/core/loader.py` | Parse PE/ELF via LIEF; normalize metadata into `BinaryInfo` |
+| `src/codevanta/core/loader.py` | Parse PE/ELF/Mach-O via LIEF; normalize metadata into `BinaryInfo` |
 | `src/codevanta/core/disassembler.py` | Decode machine code with Capstone into `IRInstruction` |
 | `src/codevanta/core/strings.py` | Extract ASCII/UTF-16LE strings with offset → VA mapping |
 | `src/codevanta/core/functions.py` | Discover function candidates with provenance |

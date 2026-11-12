@@ -51,3 +51,22 @@ def test_analyze_writes_consistent_json(elf64_path: Path, tmp_path: Path) -> Non
     assert payload["provenance"]["tool"] == "codevanta"
     assert isinstance(payload["functions"], list)
     assert "strings" in payload
+
+
+def test_info_on_macho(macho64_text_path: Path) -> None:
+    result = runner.invoke(app, ["info", str(macho64_text_path)])
+    assert result.exit_code == 0, result.stdout
+    assert "CODEVANTA" in result.stdout
+
+
+def test_functions_on_macho(macho64_text_path: Path) -> None:
+    result = runner.invoke(app, ["functions", str(macho64_text_path)])
+    assert result.exit_code == 0, result.stdout
+    assert "_sample_main" in result.stdout
+
+
+def test_disasm_entry_point_on_macho(macho64_text_path: Path) -> None:
+    result = runner.invoke(app, ["disasm", str(macho64_text_path), "--count", "3"])
+    assert result.exit_code == 0, result.stdout
+    assert "Disassembly at" in result.stdout
+    assert "push rbp" in result.stdout

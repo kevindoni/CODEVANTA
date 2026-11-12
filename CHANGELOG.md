@@ -8,6 +8,15 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- Mach-O loader support (`codevanta.core.loader`): Mach-O 32/64 binaries now
+  load with format, architecture (x86_64, aarch64, x86, arm, ppc), bitness,
+  endianness, image base, entry point, sections, imports (undefined symbols),
+  exports (dyld export information), and symbol-table entries — every finding
+  carrying evidence. Mach-O symbol entries do not encode kind, so
+  `is_function` is derived from executable-section membership, stated in the
+  evidence detail, and function candidates from the Mach-O symbol table are
+  reported at `medium` confidence. Sections without file bytes (e.g.
+  `S_ZEROFILL`) map to no file offset, keeping VA/offset translation honest.
 - Cross-reference scanner (`codevanta.analysis.xrefs`): `call`, `jump`, and
   `branch` references recovered from direct branch operands in executable
   sections. Targets that are only reachable through registers or memory are
