@@ -6,6 +6,19 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Dashboard redesign (`codevanta gui`): the layout was rewritten around a
+  sticky top bar with trust badges (read-only, local), a hero path input with
+  Enter-to-run, a labeled options panel, a full-width seven-action toolbar,
+  and a result card with a sticky-header table, colored confidence badges
+  (certain/high green, medium amber, low red), a "HTTP 200 · N of M rows"
+  status chip, auto-scroll to results, and raw JSON tucked into a collapsible
+  disclosure. Typography now pairs a system sans for UI with monospace
+  reserved for data; surfaces are layered (page, card, inset inputs) with a
+  single teal accent. Still a fully self-contained page: no CDN, no fonts, no
+  external URL, and results remain `textContent`-only.
+
 ### Added
 
 - MCP: `codevanta_entropy` exposes the entropy triage over MCP (same bounded
