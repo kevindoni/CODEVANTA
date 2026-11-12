@@ -5,12 +5,27 @@ snapshots together with their discovered function candidates and reports what
 was added, removed or changed. :func:`diff_binaries` is the convenience entry
 point that loads both files first.
 
-The comparison is deliberately *structural*: it only reads metadata the loader
-already extracted (sections, imports, exports) plus the candidate list produced
-by :func:`~codevanta.core.functions.discover_functions`. No target file is
-executed and no instruction bytes are compared, so a ``changed`` entry means
+The comparison is deliberately *structural* by default: it only reads metadata
+the loader already extracted (sections, imports, exports) plus the candidate list
+produced by :func:`~codevanta.core.functions.discover_functions`. No target file
+is executed and no instruction bytes are compared, so a ``changed`` entry means
 "the observed metadata differs", never "the machine code differs". Every delta
 carries that caveat in its evidence record at ``Confidence.MEDIUM``.
+
+``deep=True`` adds a *content* signal on top of that metadata, without changing
+any structural rule. For every function that matches by address, the normalized
+instruction stream of both sides is fingerprinted with
+:func:`~codevanta.analysis.function_hash.function_fingerprint`; when the digests
+differ the entry becomes ``changed`` (with both digests and a content note), and
+when they match although the metadata changed, the note says so. Fingerprints are
+shape based -- numeric literals are masked to ``#`` -- so an equal digest is not
+byte equality and a different digest is not a semantic difference. Deep mode
+still only reads file bytes, never executes them, and is bounded by
+``max_functions`` per side, :data:`DEEP_MAX_INSTRUCTIONS` instructions per
+fingerprint, and :data:`MAX_DEEP_FINGERPRINTS` fingerprinted pairs per side;
+every bound that cuts work short is reported through ``warnings``. Functions
+matched by name after moving, and one-sided functions, are fingerprinted by
+neither side of deep mode and keep their structural verdict.
 
 Matching rules, in order:
 
@@ -36,18 +51,25 @@ same inputs always produce the same output.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from codevanta.analysis.function_hash import (
+    DEFAULT_MAX_INSTRUCTIONS,
+    function_fingerprint,
+)
 from codevanta.core.functions import FunctionCandidate, discover_functions
 from codevanta.core.loader import BinaryInfo, BinaryLoader
+from codevanta.core.report import AnalysisError
 from codevanta.evidence.confidence import Confidence
 from codevanta.evidence.models import Evidence
 
 __all__ = [
     "DEFAULT_MAX_FUNCTIONS",
+    "DEEP_MAX_INSTRUCTIONS",
+    "MAX_DEEP_FINGERPRINTS",
     "MAX_MAX_FUNCTIONS",
     "MIN_MAX_FUNCTIONS",
     "BinaryDiff",
@@ -65,8 +87,20 @@ MIN_MAX_FUNCTIONS = 1
 #: Largest accepted ``max_functions``; larger requests are clamped down.
 MAX_MAX_FUNCTIONS = 20_000
 
-#: ``"added"`` and ``"removed"`` are one-sided; ``"changed"`` covers both a
-#: metadata edit at the same address and a relocation matched by name.
+#: Largest number of address-matched pairs fingerprinted per side in deep mode.
+#: Deep mode decodes real instructions, so it needs its own, tighter bound than
+#: :data:`DEFAULT_MAX_FUNCTIONS`; pairs above the ceiling keep their structural
+#: verdict and are reported through ``warnings``.
+MAX_DEEP_FINGERPRINTS = 1_000
+
+#: Instruction ceiling for one deep-mode fingerprint. Equal to
+#: :data:`~codevanta.analysis.function_hash.DEFAULT_MAX_INSTRUCTIONS`, so a
+#: fingerprint taken during a diff matches one taken on its own.
+DEEP_MAX_INSTRUCTIONS = DEFAULT_MAX_INSTRUCTIONS
+
+#: ``"added"`` and ``"removed"`` are one-sided; ``"changed"`` covers a metadata
+#: edit at the same address, a differing content fingerprint at the same address
+#: (deep mode), and a relocation matched by name.
 ChangeKind = Literal["added", "removed", "changed"]
 
 _EVIDENCE_SOURCE = "binary_diff.structural"
@@ -74,6 +108,11 @@ _EVIDENCE_METHOD = "metadata_compare"
 _CAVEAT = (
     "structural metadata only: no instruction bytes were read, compared or executed, "
     "so this is not a semantic equivalence claim"
+)
+_CONTENT_CAVEAT = (
+    "structural metadata plus normalized instruction shapes: numeric literals were masked to "
+    "'#', so equal digests are not byte equality and different digests are not a semantic "
+    "difference; nothing was executed"
 )
 
 
@@ -92,8 +131,13 @@ class FunctionDelta:
             ``"added"`` entry.
         right: Metadata snapshot of the right-hand candidate, or ``None`` for a
             ``"removed"`` entry.
-        evidence: Why this delta is claimed, including the structural caveat
-            and the specific reason (metadata edit or relocation).
+        evidence: Why this delta is claimed, including the applicable caveat and
+            the specific reason (metadata edit, differing fingerprint, or
+            relocation).
+        left_digest: Normalized-content fingerprint of the left-hand function,
+            set only by deep mode and only when the pair was fingerprinted.
+        right_digest: Same for the right-hand function. ``left_digest`` and
+            ``right_digest`` are always both set or both ``None``.
     """
 
     address: int
@@ -102,6 +146,8 @@ class FunctionDelta:
     left: dict[str, Any] | None
     right: dict[str, Any] | None
     evidence: Evidence
+    left_digest: str | None = None
+    right_digest: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"address": f"0x{self.address:x}", "change": self.change}
@@ -111,6 +157,10 @@ class FunctionDelta:
             data["left"] = dict(self.left)
         if self.right is not None:
             data["right"] = dict(self.right)
+        if self.left_digest is not None:
+            data["left_digest"] = self.left_digest
+        if self.right_digest is not None:
+            data["right_digest"] = self.right_digest
         data["evidence"] = self.evidence.to_dict()
         return data
 
@@ -127,8 +177,9 @@ class BinaryDiff:
             implied.
         functions_added: Candidates present only on the right.
         functions_removed: Candidates present only on the left.
-        functions_changed: Candidates matched by address with different
-            metadata, or matched by name after moving.
+        functions_changed: Candidates matched by address with different metadata
+            or -- in deep mode -- a different normalized content fingerprint, or
+            matched by name after moving.
         sections_added: Section names present only on the right.
         sections_removed: Section names present only on the left.
         imports_added: Imports present only on the right, as ``"lib!name"`` when
@@ -137,7 +188,9 @@ class BinaryDiff:
         exports_added: Export names present only on the right.
         exports_removed: Export names present only on the left.
         evidence: Evidence describing the comparison as a whole, with the
-            structural caveat and the effective ``max_functions`` bound.
+            applicable caveat (structural, or structural plus normalized
+            content in deep mode), the effective ``max_functions`` bound, and the
+            deep-mode bounds when deep mode ran.
         warnings: Non-fatal problems, including truncation notices.
     """
 
@@ -221,7 +274,7 @@ def _clamp_limit(requested: int, warnings: list[str]) -> int:
     Returns:
         The effective comparison limit.
     """
-    if not isinstance(requested, int):
+    if isinstance(requested, bool) or not isinstance(requested, int):
         warnings.append(
             f"max_functions={requested!r} is not an integer; using {DEFAULT_MAX_FUNCTIONS}"
         )
@@ -292,6 +345,10 @@ def _delta(
     left: FunctionCandidate | None,
     right: FunctionCandidate | None,
     detail: str,
+    *,
+    caveat: str = _CAVEAT,
+    left_digest: str | None = None,
+    right_digest: str | None = None,
 ) -> FunctionDelta:
     """Assemble one :class:`FunctionDelta` with its caveated evidence record."""
     primary = right if right is not None else left
@@ -306,41 +363,147 @@ def _delta(
             method=_EVIDENCE_METHOD,
             confidence=Confidence.MEDIUM,
             address=address,
-            detail=f"{_CAVEAT}; {detail}",
+            detail=f"{caveat}; {detail}",
         ),
+        left_digest=left_digest,
+        right_digest=right_digest,
     )
+
+
+def _address_digests(
+    info: BinaryInfo,
+    candidates: Sequence[FunctionCandidate],
+    addresses: set[int],
+    side: str,
+    warnings: list[str],
+) -> dict[int, str]:
+    """Fingerprint ``candidates`` whose address is in ``addresses``.
+
+    Bounded by construction: ``candidates`` is already truncated to
+    ``max_functions`` and ``addresses`` is capped by the caller. Every failure is
+    counted rather than raised, so one unreadable function never loses the whole
+    comparison; the caller keeps the structural verdict for it.
+
+    Args:
+        info: Metadata of the side being fingerprinted.
+        candidates: Bounded candidates of that side.
+        addresses: Addresses that were matched on both sides.
+        side: ``"left"`` or ``"right"``, used in warnings.
+        warnings: Warning sink for truncation and failure summaries.
+
+    Returns:
+        Mapping of address to normalized-content digest, covering the candidates
+        that could be fingerprinted.
+    """
+    digests: dict[int, str] = {}
+    truncated = 0
+    first_error: str | None = None
+    failed = 0
+    for candidate in candidates:
+        if candidate.address not in addresses:
+            continue
+        try:
+            fingerprint = function_fingerprint(
+                info.path,
+                info,
+                candidate.address,
+                max_instructions=DEEP_MAX_INSTRUCTIONS,
+            )
+        except (AnalysisError, OSError) as exc:
+            failed += 1
+            if first_error is None:
+                first_error = str(exc)
+            continue
+        digests[candidate.address] = fingerprint.digest
+        if fingerprint.truncated:
+            truncated += 1
+    if truncated:
+        warnings.append(
+            f"{side} side: {truncated} fingerprint(s) stopped at "
+            f"DEEP_MAX_INSTRUCTIONS={DEEP_MAX_INSTRUCTIONS}; the content comparison covers "
+            "only the decoded prefix of those functions"
+        )
+    if failed:
+        warnings.append(
+            f"{side} side: {failed} function(s) could not be fingerprinted and were "
+            f"compared structurally only (first error: {first_error})"
+        )
+    return digests
 
 
 def _diff_functions(
     left: Sequence[FunctionCandidate],
     right: Sequence[FunctionCandidate],
+    left_digests: Mapping[int, str] | None = None,
+    right_digests: Mapping[int, str] | None = None,
 ) -> tuple[tuple[FunctionDelta, ...], tuple[FunctionDelta, ...], tuple[FunctionDelta, ...]]:
     """Diff two bounded candidate lists.
+
+    Args:
+        left: Bounded, sorted left-hand candidates.
+        right: Bounded, sorted right-hand candidates.
+        left_digests: Optional address-to-digest map for the left side (deep
+            mode). Addresses missing from the map keep their structural verdict.
+        right_digests: Same for the right side.
 
     Returns:
         ``(added, removed, changed)`` tuples, each sorted by address.
     """
     left_by_address = _first_by_address(left)
     right_by_address = _first_by_address(right)
+    left_digests = left_digests or {}
+    right_digests = right_digests or {}
 
     added: list[FunctionDelta] = []
     removed: list[FunctionDelta] = []
     changed: list[FunctionDelta] = []
 
-    # Pass 1: same address means the same function; compare its metadata.
+    # Pass 1: same address means the same function; compare its metadata and, in
+    # deep mode, its normalized content.
     for address in sorted(set(left_by_address) & set(right_by_address)):
         left_candidate = left_by_address[address]
         right_candidate = right_by_address[address]
         differences = _metadata_differences(left_candidate, right_candidate)
-        if not differences:
+        left_digest = left_digests.get(address)
+        right_digest = right_digests.get(address)
+        if left_digest is not None and right_digest is not None:
+            delta_left_digest, delta_right_digest = left_digest, right_digest
+        else:
+            # Attach a digest pair only when both sides were fingerprinted, so a
+            # delta never carries a misleading half pair.
+            delta_left_digest, delta_right_digest = None, None
+        content_changed = (
+            delta_left_digest is not None
+            and delta_right_digest is not None
+            and delta_left_digest != delta_right_digest
+        )
+        if not differences and not content_changed:
             continue
+
+        notes: list[str] = []
+        if differences:
+            notes.append(
+                f"metadata changed at the same address 0x{address:x}: {', '.join(differences)}"
+            )
+        if content_changed:
+            notes.append(
+                f"content changed at 0x{address:x}: normalized fingerprints differ "
+                f"(left {left_digest}, right {right_digest})"
+            )
+        elif differences and left_digest is not None and right_digest is not None:
+            notes.append(
+                "normalized fingerprints match, so this is a metadata-only change"
+            )
         changed.append(
             _delta(
                 "changed",
                 address,
                 left_candidate,
                 right_candidate,
-                f"metadata changed at the same address 0x{address:x}: {', '.join(differences)}",
+                "; ".join(notes),
+                caveat=_CONTENT_CAVEAT if delta_left_digest is not None else _CAVEAT,
+                left_digest=delta_left_digest,
+                right_digest=delta_right_digest,
             )
         )
 
@@ -437,11 +600,15 @@ def diff_infos(
     left_functions: Sequence[FunctionCandidate],
     right_functions: Sequence[FunctionCandidate],
     max_functions: int = DEFAULT_MAX_FUNCTIONS,
+    deep: bool = False,
 ) -> BinaryDiff:
     """Compare two loaded binaries and their function candidates.
 
-    Pure: nothing is read from disk or executed, and the input sequences are
-    never mutated.
+    Structural and pure by default: with ``deep=False`` nothing is read from disk
+    or executed, and the input sequences are never mutated. With ``deep=True`` the
+    function bytes of both sides are read (never executed) to fingerprint the
+    address-matched functions; see the module docstring for what that adds and
+    what it does not.
 
     Args:
         left_info: Metadata of the left-hand (baseline) binary.
@@ -452,6 +619,9 @@ def diff_infos(
             ``[MIN_MAX_FUNCTIONS, MAX_MAX_FUNCTIONS]`` are clamped and recorded
             in ``warnings``; candidates above the ceiling are dropped (lowest
             addresses are kept) with a truncation warning.
+        deep: When true, also fingerprint address-matched functions and report a
+            differing normalized fingerprint as ``"changed"`` with both digests
+            and a content note.
 
     Returns:
         A :class:`BinaryDiff` whose ``identical`` flag is ``True`` only when no
@@ -462,8 +632,25 @@ def diff_infos(
     left_bounded = _bounded(left_functions, limit, "left", warnings)
     right_bounded = _bounded(right_functions, limit, "right", warnings)
 
+    left_digests: dict[int, str] = {}
+    right_digests: dict[int, str] = {}
+    if deep:
+        matched = {candidate.address for candidate in left_bounded} & {
+            candidate.address for candidate in right_bounded
+        }
+        if len(matched) > MAX_DEEP_FINGERPRINTS:
+            warnings.append(
+                f"{len(matched)} address-matched function(s) exceed "
+                f"MAX_DEEP_FINGERPRINTS={MAX_DEEP_FINGERPRINTS}; only the "
+                f"{MAX_DEEP_FINGERPRINTS} lowest addresses were fingerprinted and the rest "
+                "were compared structurally"
+            )
+            matched = set(sorted(matched)[:MAX_DEEP_FINGERPRINTS])
+        left_digests = _address_digests(left_info, left_bounded, matched, "left", warnings)
+        right_digests = _address_digests(right_info, right_bounded, matched, "right", warnings)
+
     functions_added, functions_removed, functions_changed = _diff_functions(
-        left_bounded, right_bounded
+        left_bounded, right_bounded, left_digests, right_digests
     )
 
     left_sections = _section_names(left_info)
@@ -495,6 +682,11 @@ def diff_infos(
         )
     )
 
+    extra: dict[str, Any] = {"max_functions": limit}
+    if deep:
+        extra["deep"] = True
+        extra["deep_instructions"] = DEEP_MAX_INSTRUCTIONS
+        extra["max_deep_fingerprints"] = MAX_DEEP_FINGERPRINTS
     return BinaryDiff(
         left_path=str(left_info.path),
         right_path=str(right_info.path),
@@ -512,8 +704,8 @@ def diff_infos(
             source=_EVIDENCE_SOURCE,
             method=_EVIDENCE_METHOD,
             confidence=Confidence.MEDIUM,
-            detail=_CAVEAT,
-            extra={"max_functions": limit},
+            detail=_CONTENT_CAVEAT if deep else _CAVEAT,
+            extra=extra,
         ),
         warnings=tuple(warnings),
     )
@@ -523,6 +715,7 @@ def diff_binaries(
     left_path: str | Path,
     right_path: str | Path,
     max_functions: int = DEFAULT_MAX_FUNCTIONS,
+    deep: bool = False,
 ) -> BinaryDiff:
     """Load two binaries with LIEF and return their structural difference.
 
@@ -533,6 +726,9 @@ def diff_binaries(
         left_path: Path of the left-hand (baseline) binary.
         right_path: Path of the right-hand (candidate) binary.
         max_functions: Per-side ceiling on compared function candidates; see
+            :func:`diff_infos`.
+        deep: When true, also compare the normalized content of address-matched
+            functions (their bytes are read, never executed); see
             :func:`diff_infos`.
 
     Returns:
@@ -547,4 +743,5 @@ def diff_binaries(
         discover_functions(left_info),
         discover_functions(right_info),
         max_functions=max_functions,
+        deep=deep,
     )

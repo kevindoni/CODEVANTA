@@ -70,15 +70,29 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   traversal by `max_jump_tables` and `max_table_entries`.
 - **Jump tables** (`analysis/jump_tables.py`) — `resolve_jump_table` decodes a
   bounded array of absolute pointers (4 or 8 bytes, binary endianness) into
-  `JumpTableEntry` records with evidence. The scan stops at the first zero
-  pointer, out-of-window target, unmapped target, or non-executable target and
-  reports why; results are `medium` confidence because a pointer array found by
-  shape is evidence of a dispatch table, not proof of one.
+  `JumpTableEntry` records with evidence. `mode="relative"` with an explicit
+  `base_address` instead reads signed 32-bit offsets and resolves
+  `target = base + offset`, which is the shape of position-independent switch
+  tables; a zero offset is a valid entry pointing at the base, not a terminator.
+  Both modes stop at the first out-of-window target, unmapped target, or
+  (with `executable_only`) non-executable target and report why, and both are
+  `medium` confidence because a slot array found by shape is evidence of a
+  dispatch table, not proof of one.
+- **Function fingerprints** (`analysis/function_hash.py`) —
+  `function_fingerprint` takes one bounded linear sweep from an address and
+  returns a SHA-256 digest over the *normalized* instruction stream: mnemonics
+  are kept, every numeric literal is masked to `#`, and whitespace is collapsed.
+  It is `medium` confidence and explicitly not semantic equivalence — equal
+  digests are not byte equality, and masked branch targets make different
+  callees look alike.
 - **Structural binary diff** (`analysis/binary_diff.py`) — `diff_binaries`
   compares two binaries as metadata only: functions matched by address then name,
   sections/exports by name, imports by `(library, name)`. Deltas are `added`,
   `removed`, or `changed`, and the whole comparison is `medium` confidence
-  because no bytes and no semantics are compared.
+  because no bytes and no semantics are compared. `deep=True` adds a content
+  signal for address-matched functions only: when their fingerprints differ the
+  entry becomes `changed` with both digests, while every structural rule, and
+  structural-only mode, stays unchanged.
 - **Call graph** (`analysis/callgraph.py`) — `call`, `call_import`, and
   `call_indirect` cross-references aggregated into nodes and edges. Import slots
   become `import` nodes labelled from the import table; unresolved callees stay
@@ -103,21 +117,29 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   tools (ten in total).
 - **CLI:** `codevanta xrefs`, `codevanta cfg` (with
   `--traversal linear|recursive`, default `linear`, and `--resolve-indirect` for
-  recursive traversals), `codevanta jump-table`, `codevanta diff`,
+  recursive traversals), `codevanta jump-table` (with
+  `--mode absolute|relative` and `--base ADDR` for signed-offset tables),
+  `codevanta diff` (with `--deep` for the normalized-shape comparison),
   `codevanta callgraph`, `codevanta analyze --callgraph`, plus the
   `session save|list|show|annotate|notes` subcommands.
 
 Phase 2 is deliberately narrow: linear sweep by default with an additional
 bounded recursive traversal for CFGs, direct branch targets plus
-absolute/RIP-relative pointer slots only, jump tables only as absolute 4/8-byte
-pointer arrays reached from a `jmp` memory operand (no register/indexed
-dispatch), call graph edges from `call` / `call_import` / `call_indirect` only,
-no following calls into callees, no cross-function analysis, a structural
-(metadata-only) binary diff with no byte-level comparison, and no debugger yet.
+absolute/RIP-relative pointer slots only, jump tables as absolute 4/8-byte
+pointer arrays or signed 32-bit offset tables with an analyst-supplied base
+(`--mode relative --base`) — never register/indexed dispatch, call graph edges
+from `call` / `call_import` / `call_indirect` only, no following calls into
+callees, no cross-function analysis, a structural (metadata-only) binary diff
+plus an opt-in shape-fingerprint comparison of address-matched functions, and no
+debugger yet. The phase 2g switches are `jump-table --mode absolute|relative
+--base ADDR` (plus the same `mode`/`base_address` arguments on
+`resolve_jump_table`), the new `function_fingerprint` API, and `diff --deep`
+(`deep=True`); the CFG's indirect resolution still uses the absolute layout.
 See [docs/phase2.md](docs/phase2.md), [docs/phase2b.md](docs/phase2b.md),
 [docs/phase2c.md](docs/phase2c.md), [docs/phase2d.md](docs/phase2d.md),
-[docs/phase2e.md](docs/phase2e.md), and [docs/phase2f.md](docs/phase2f.md) for
-scope, confidence semantics, and limitations.
+[docs/phase2e.md](docs/phase2e.md), [docs/phase2f.md](docs/phase2f.md), and
+[docs/phase2g.md](docs/phase2g.md) for scope, confidence semantics, and
+limitations.
 
 ## Installation
 
@@ -242,7 +264,7 @@ src/codevanta/
 ├── ir/          # backend-neutral instruction model + adapter registry
 ├── mcp_server/  # MCP tools and stdio server for coding agents
 ├── setup/       # client config planning, apply, verify (claude/cursor/cline/vscode)
-├── analysis/    # cross-references, call graph, CFG (linear sweep + recursive traversal), jump tables, structural diff, graph/HTML export (phase 2)
+├── analysis/    # cross-references, call graph, CFG (linear sweep + recursive traversal), jump tables (absolute + relative), function fingerprints, structural/deep diff, graph/HTML export (phase 2)
 ├── api/         # HTTP API (phase 2+)
 ├── cli/         # Typer command line surface
 ├── storage/     # SQLite session storage and annotations (phase 2)
@@ -269,6 +291,7 @@ ruff check src tests
 - [Phase 2d — offline HTML/SVG graph viewer](docs/phase2d.md)
 - [Phase 2e — recursive CFG traversal](docs/phase2e.md)
 - [Phase 2f — jump tables, CFG indirect resolution, interactive viewer, structural diff](docs/phase2f.md)
+- [Phase 2g — relative jump tables, function fingerprints, deep diff](docs/phase2g.md)
 
 ## Roadmap
 

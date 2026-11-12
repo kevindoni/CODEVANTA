@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 
 from codevanta.analysis.binary_diff import (
@@ -15,6 +16,7 @@ from codevanta.analysis.binary_diff import (
 from codevanta.core.functions import FunctionCandidate
 from codevanta.core.loader import (
     BinaryInfo,
+    BinaryLoader,
     ExportInfo,
     ImportInfo,
     SectionInfo,
@@ -326,3 +328,157 @@ def test_function_delta_to_dict_omits_absent_side() -> None:
     assert payload["name"] == "gone"
     assert "right" not in payload
     assert payload["left"]["address"] == "0x401000"
+
+
+# ---- deep (content) mode -------------------------------------------------
+
+TEXT_VA = 0x401000
+
+NOP_TEXT = bytes.fromhex("90")  # nop
+RET_TEXT = bytes.fromhex("c3")  # ret
+MOV_RET_42 = bytes.fromhex("b82a000000c3")  # mov eax, 0x2a; ret
+MOV_RET_99 = bytes.fromhex("b863000000c3")  # mov eax, 0x63; ret
+
+
+def _make_code_elf(path: Path, code: bytes, entry: int = TEXT_VA) -> Path:
+    """Write an ELF64 file whose executable ``.text`` holds ``code``."""
+    shstr = b"\x00.text\x00.shstrtab\x00"
+    off_text = 0x40
+    off_shstr = off_text + len(code)
+    shoff = off_shstr + len(shstr)
+    ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
+    header = ident + struct.pack(
+        "<HHIQQQIHHHHHH", 2, 62, 1, entry, 0, shoff, 0, 64, 56, 0, 64, 3, 2
+    )
+    text_section = struct.pack(
+        "<IIQQQQIIQQ", 1, 1, 6, entry, off_text, len(code), 0, 0, 16, 0
+    )
+    str_section = struct.pack(
+        "<IIQQQQIIQQ", 7, 3, 0, 0, off_shstr, len(shstr), 0, 0, 1, 0
+    )
+    blob = bytearray(shoff)
+    blob[0:64] = header
+    blob[off_text:off_text + len(code)] = code
+    blob[off_shstr:off_shstr + len(shstr)] = shstr
+    blob += bytes(64) + text_section + str_section
+    path.write_bytes(blob)
+    return path
+
+
+def test_deep_identical_code_produces_no_delta(tmp_path: Path) -> None:
+    binary = _make_code_elf(tmp_path / "same.bin", MOV_RET_42)
+
+    diff = diff_binaries(binary, binary, deep=True)
+
+    assert diff.identical is True
+    assert diff.functions_changed == ()
+    assert diff.warnings == ()
+    assert diff.evidence.extra["deep"] is True
+
+
+def test_deep_nop_versus_ret_at_the_same_address_is_changed(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "nop.bin", NOP_TEXT)
+    right = _make_code_elf(tmp_path / "ret.bin", RET_TEXT)
+
+    diff = diff_binaries(left, right, deep=True)
+
+    assert diff.identical is False
+    assert len(diff.functions_changed) == 1
+    delta = diff.functions_changed[0]
+    assert delta.address == TEXT_VA
+    assert delta.change == "changed"
+    assert delta.left_digest is not None
+    assert delta.right_digest is not None
+    assert delta.left_digest != delta.right_digest
+    assert "content changed" in (delta.evidence.detail or "")
+    assert delta.left_digest in (delta.evidence.detail or "")
+    assert "structural" in (delta.evidence.detail or "")
+    assert "#" in (delta.evidence.detail or "")
+
+
+def test_deep_false_keeps_the_structural_verdict(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "nop.bin", NOP_TEXT)
+    right = _make_code_elf(tmp_path / "ret.bin", RET_TEXT)
+
+    diff = diff_binaries(left, right)
+
+    assert diff.identical is True
+    assert diff.functions_changed == ()
+    assert diff.evidence.detail is not None
+    assert "no instruction bytes were read" in diff.evidence.detail
+    assert "deep" not in diff.evidence.extra
+
+
+def test_deep_ignores_differing_immediates(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "left.bin", MOV_RET_42)
+    right = _make_code_elf(tmp_path / "right.bin", MOV_RET_99)
+
+    diff = diff_binaries(left, right, deep=True)
+
+    assert diff.identical is True
+    assert diff.functions_changed == ()
+
+
+def test_deep_reports_content_and_metadata_in_one_delta(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "left.bin", NOP_TEXT)
+    right = _make_code_elf(tmp_path / "right.bin", RET_TEXT)
+
+    loader = BinaryLoader()
+    left_info = loader.load(left)
+    right_info = loader.load(right)
+
+    diff = diff_infos(
+        left_info,
+        right_info,
+        [_candidate(TEXT_VA, "left_name", size=1)],
+        [_candidate(TEXT_VA, "right_name", size=2)],
+        deep=True,
+    )
+
+    assert len(diff.functions_changed) == 1
+    delta = diff.functions_changed[0]
+    assert "metadata changed" in (delta.evidence.detail or "")
+    assert "content changed" in (delta.evidence.detail or "")
+    payload = delta.to_dict()
+    assert payload["left_digest"] != payload["right_digest"]
+
+
+def test_deep_serialises_digests_only_when_set(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "nop.bin", NOP_TEXT)
+    right = _make_code_elf(tmp_path / "ret.bin", RET_TEXT)
+
+    deep = diff_binaries(left, right, deep=True).to_dict()
+    structural = diff_infos(_make_info(), _make_info(), [_candidate(TEXT_VA)], [])
+
+    assert deep["functions_changed"][0]["left_digest"]
+    assert deep["functions_changed"][0]["right_digest"]
+    assert "left_digest" not in structural.functions_removed[0].to_dict()
+    assert json.dumps(deep)  # must not raise
+
+
+def test_deep_warns_when_a_side_cannot_be_fingerprinted(tmp_path: Path) -> None:
+    # The metadata points at files that do not exist, so deep mode must degrade
+    # to the structural verdict instead of raising.
+    diff = diff_infos(
+        _make_info(path=tmp_path / "missing.bin"),
+        _make_info(path=tmp_path / "missing2.bin"),
+        [_candidate(TEXT_VA)],
+        [_candidate(TEXT_VA)],
+        deep=True,
+    )
+
+    assert diff.identical is True
+    assert diff.functions_changed == ()
+    assert any("could not be fingerprinted" in warning for warning in diff.warnings)
+
+
+def test_deep_warns_about_truncated_fingerprints(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "left.bin", NOP_TEXT * 2_100)
+    right = _make_code_elf(tmp_path / "right.bin", NOP_TEXT * 2_000 + RET_TEXT)
+
+    diff = diff_binaries(left, right, deep=True)
+
+    # Both fingerprints stop at the budget, so only the shared prefix is compared.
+    assert diff.identical is True
+    assert any("DEEP_MAX_INSTRUCTIONS" in warning for warning in diff.warnings)
+
