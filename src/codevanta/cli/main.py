@@ -13,6 +13,10 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
+from codevanta.analysis.binary_diff import (
+    DEFAULT_MAX_FUNCTIONS as DIFF_MAX_FUNCTIONS,
+)
+from codevanta.analysis.binary_diff import BinaryDiff, diff_binaries
 from codevanta.analysis.callgraph import (
     DEFAULT_MAX_EDGES,
     DEFAULT_MAX_FUNCTIONS,
@@ -32,6 +36,10 @@ from codevanta.analysis.graph_export import (
     to_graphml,
 )
 from codevanta.analysis.html_view import to_html
+from codevanta.analysis.jump_tables import (
+    DEFAULT_MAX_ENTRIES as JUMP_TABLE_MAX_ENTRIES,
+)
+from codevanta.analysis.jump_tables import JumpTableResult, resolve_jump_table
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
@@ -354,6 +362,16 @@ def cfg(
             ),
         ),
     ] = "linear",
+    resolve_indirect: Annotated[
+        bool,
+        typer.Option(
+            "--resolve-indirect",
+            help=(
+                "Resolve indirect jumps through pointer jump tables (recursive "
+                "traversal only)"
+            ),
+        ),
+    ] = False,
     json_output: Annotated[
         bool, typer.Option("--json", help="Emit the JSON result instead of a table")
     ] = False,
@@ -366,27 +384,230 @@ def cfg(
     evidence) and therefore the same table, --json payload and warnings; linear
     blocks partition the decoded window while recursive blocks are disjoint but
     limited to reachable code.
+
+    --resolve-indirect only means something to the recursive traversal: it turns
+    an indirect ``jmp`` through a pointer-sized memory operand into a jump-table
+    lookup, so the dispatch targets become successors and are followed like any
+    other block. The linear sweep has no notion of a dispatch edge, so asking for
+    it there is rejected (exit code 2) instead of silently ignored.
     """
+    if resolve_indirect and traversal != "recursive":
+        _fail(
+            "--resolve-indirect needs --traversal recursive: the linear sweep does not "
+            "follow control flow, so indirect jumps cannot be resolved",
+            2,
+        )
     loaded = _load(path)
     try:
         start = resolve_target(loaded, address, function)
     except AnalysisError as exc:
         _fail(str(exc), 4)
-    builder = build_recursive_cfg if traversal == "recursive" else build_cfg
     try:
-        graph = builder(
-            path,
-            loaded,
-            start,
-            max_instructions=max_instructions,
-            max_blocks=max_blocks,
-        )
+        if traversal == "recursive":
+            graph = build_recursive_cfg(
+                path,
+                loaded,
+                start,
+                max_instructions=max_instructions,
+                max_blocks=max_blocks,
+                resolve_indirect=resolve_indirect,
+            )
+        else:
+            graph = build_cfg(
+                path,
+                loaded,
+                start,
+                max_instructions=max_instructions,
+                max_blocks=max_blocks,
+            )
     except AnalysisError as exc:
         _fail(str(exc), 5)
     if json_output:
         console.print_json(json.dumps(graph.to_dict()))
         return
     _print_cfg(graph)
+    if json_output:
+        console.print_json(json.dumps(graph.to_dict()))
+        return
+    _print_cfg(graph)
+
+
+def _print_binary_diff(result: BinaryDiff) -> None:
+    """Print a :class:`BinaryDiff` as an identity panel plus two tables.
+
+    The first table is the added/removed/changed count matrix for functions,
+    sections, imports and exports; the second lists the individual name deltas.
+    The function delta table then carries the address, name and change of every
+    candidate the comparison could not match.
+    """
+    header = Table.grid(padding=(0, 2))
+    header.add_column(style="bold cyan")
+    header.add_column()
+    header.add_row("Left", escape(result.left_path))
+    header.add_row("Right", escape(result.right_path))
+    header.add_row("Identical", "yes" if result.identical else "no")
+    console.print(Panel(header, title="CODEVANTA · binary diff"))
+
+    counts = Table(title="Deltas")
+    counts.add_column("Kind")
+    counts.add_column("Added", justify="right")
+    counts.add_column("Removed", justify="right")
+    counts.add_column("Changed", justify="right")
+    for kind, added, removed, changed in (
+        (
+            "Functions",
+            result.functions_added,
+            result.functions_removed,
+            result.functions_changed,
+        ),
+        ("Sections", result.sections_added, result.sections_removed, ()),
+        ("Imports", result.imports_added, result.imports_removed, ()),
+        ("Exports", result.exports_added, result.exports_removed, ()),
+    ):
+        counts.add_row(kind, str(len(added)), str(len(removed)), str(len(changed)))
+    console.print(counts)
+
+    named = (
+        [("Section", "added", name) for name in result.sections_added]
+        + [("Section", "removed", name) for name in result.sections_removed]
+        + [("Import", "added", name) for name in result.imports_added]
+        + [("Import", "removed", name) for name in result.imports_removed]
+        + [("Export", "added", name) for name in result.exports_added]
+        + [("Export", "removed", name) for name in result.exports_removed]
+    )
+    if named:
+        names = Table(title=f"Section, import and export deltas ({len(named)})")
+        names.add_column("Kind")
+        names.add_column("Change")
+        names.add_column("Name")
+        for kind, change, name in named:
+            names.add_row(escape(kind), escape(change), escape(name))
+        console.print(names)
+
+    deltas = sorted(
+        (*result.functions_added, *result.functions_removed, *result.functions_changed),
+        key=lambda delta: (delta.address, delta.change),
+    )
+    if deltas:
+        functions = Table(title=f"Function deltas ({len(deltas)})")
+        functions.add_column("Address", justify="right")
+        functions.add_column("Name")
+        functions.add_column("Change")
+        for delta in deltas:
+            functions.add_row(
+                f"0x{delta.address:x}",
+                escape(delta.name or "<unknown>"),
+                escape(delta.change),
+            )
+        console.print(functions)
+    else:
+        console.print("[dim]no function deltas[/]")
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+@app.command()
+def diff(
+    left: Annotated[Path, typer.Argument(help="Baseline (left-hand) binary")],
+    right: Annotated[Path, typer.Argument(help="Candidate (right-hand) binary")],
+    max_functions: Annotated[
+        int,
+        typer.Option(
+            "--max-functions", help="Per-side ceiling on compared function candidates"
+        ),
+    ] = DIFF_MAX_FUNCTIONS,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of tables")
+    ] = False,
+) -> None:
+    """Structurally diff two binaries (sections, imports, exports, functions).
+
+    The comparison is metadata only: no instruction bytes are read, compared or
+    executed, so the identical flag means "no structural delta was observed",
+    never "the machine code is equivalent". A difference is the successful
+    outcome, so the command exits 0 whether or not the binaries differ; only load
+    and input errors exit non-zero (2).
+    """
+    try:
+        result = diff_binaries(left, right, max_functions=max_functions)
+    except BinaryLoadError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    _print_binary_diff(result)
+
+
+def _print_jump_table(result: JumpTableResult) -> None:
+    """Print one :class:`JumpTableResult` as an index/target table plus a footer."""
+    table = Table(title=escape(f"Jump table at 0x{result.table_address:x}"))
+    table.add_column("Index", justify="right")
+    table.add_column("Target", justify="right")
+    for entry in result.entries:
+        table.add_row(str(entry.index), f"0x{entry.target:x}")
+    console.print(table)
+    if not result.entries:
+        console.print("[yellow]no pointer slots decoded at this address[/]")
+    console.print(
+        f"[dim]pointer size: {result.pointer_size} bytes"
+        f" · entries: {len(result.entries)}"
+        f" · truncated: {'yes' if result.truncated else 'no'}[/]"
+    )
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+@app.command("jump-table")
+def jump_table(
+    path: Path,
+    address: Annotated[
+        str,
+        typer.Option(
+            "--address",
+            "-a",
+            help="Virtual address of the first pointer slot (decimal or 0x hex)",
+        ),
+    ],
+    entries: Annotated[
+        int, typer.Option("--entries", help="Maximum pointer slots to decode")
+    ] = JUMP_TABLE_MAX_ENTRIES,
+    executable_only: Annotated[
+        bool,
+        typer.Option(
+            "--executable-only/--no-executable-only",
+            help="Stop the scan at pointers into non-executable sections",
+        ),
+    ] = True,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Decode a jump table (absolute pointer array) starting at ADDRESS.
+
+    Slots are read exclusively from the containing section's file bytes and
+    decoded with the binary's endianness and pointer width (8 bytes for a 64-bit
+    binary, 4 for a 32-bit one). The scan stops at the first slot that cannot be
+    a target, namely a zero terminator, an address no section maps, or a pointer
+    into a non-executable section while --executable-only is in effect, and every
+    such stop is reported as a warning. Decoded pointers are evidence of a
+    dispatch table, not proof that a dispatcher indexes it.
+    """
+    table_address = _parse_address(address)
+    loaded = _load(path)
+    try:
+        result = resolve_jump_table(
+            path,
+            loaded,
+            table_address,
+            max_entries=entries,
+            executable_only=executable_only,
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    _print_jump_table(result)
 
 
 #: Output formats accepted by ``codevanta callgraph``.
