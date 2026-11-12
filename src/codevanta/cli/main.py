@@ -76,7 +76,13 @@ from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.disassembler import DisassemblyError
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
-from codevanta.core.report import AnalysisError, build_report, disassemble_region, resolve_target
+from codevanta.core.report import (
+    DEFAULT_XREF_LIMIT,
+    AnalysisError,
+    build_report,
+    disassemble_region,
+    resolve_target,
+)
 from codevanta.core.strings import StringExtractor
 from codevanta.storage.session import SessionError, SessionRecord, SessionStore
 
@@ -255,16 +261,46 @@ def analyze(
         bool,
         typer.Option("--callgraph", help="Embed the direct-call call graph in the report"),
     ] = False,
+    xrefs: Annotated[
+        bool,
+        typer.Option("--xrefs", help="Embed the cross-reference section in the report"),
+    ] = False,
+    cfg: Annotated[
+        bool,
+        typer.Option("--cfg", help="Embed the entry-point control-flow graph in the report"),
+    ] = False,
+    xref_limit: Annotated[
+        int, typer.Option("--xref-limit", help="Maximum cross references kept in the report")
+    ] = DEFAULT_XREF_LIMIT,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Echo the JSON report on stdout (default without --output)"),
+    ] = False,
 ) -> None:
     """Run the phase 1 analysis and emit a JSON report.
 
-    ``--callgraph`` adds a ``callgraph`` section (bounded to 1000 nodes and 5000
-    edges) built by the analysis layer; without the flag the report contains no
-    such key. When ``--output`` is used a dim one-line graph summary
-    (nodes/edges/truncation) is printed after the file is written.
+    Each phase 2 section is opt-in and maps straight to its ``build_report``
+    argument: ``--xrefs`` adds ``xrefs`` (bounded by ``--xref-limit``, default
+    2000, capped at 200000) and ``--cfg`` adds the entry-point ``cfg`` (bounded
+    to 2000 instructions and 500 blocks), each with its own evidence and
+    warnings, and the provenance step chain gains ``find_xrefs``/``build_cfg``.
+    ``--callgraph`` adds the ``callgraph`` section (bounded to 1000 nodes and
+    5000 edges). Without the flags the report is the phase 1 payload.
+
+    When ``--output`` is used a dim one-line summary per embedded section
+    (nodes/edges, xrefs kept, CFG blocks; counts and truncation) is printed
+    after the file is written, and ``--json`` additionally echoes the payload on
+    stdout.
     """
     try:
-        report = build_report(path, string_limit=string_limit, include_callgraph=callgraph)
+        report = build_report(
+            path,
+            string_limit=string_limit,
+            xref_limit=xref_limit,
+            include_callgraph=callgraph,
+            include_xrefs=xrefs,
+            include_cfg=cfg,
+        )
     except (AnalysisError, BinaryLoadError) as exc:
         console.print(f"[bold red]error:[/] {exc}")
         raise typer.Exit(code=2) from exc
@@ -272,22 +308,35 @@ def analyze(
     if output is not None:
         output.write_text(payload, encoding="utf-8")
         console.print(f"[green]report written:[/] {output}")
-        if callgraph:
-            _print_report_callgraph_summary(report)
+        _print_report_summary(report)
+        if json_output:
+            console.print_json(payload)
         return
     console.print_json(payload)
 
 
-def _print_report_callgraph_summary(report: dict[str, Any]) -> None:
-    """Print a dim nodes/edges/truncation summary for an embedded call graph."""
+def _print_report_summary(report: dict[str, Any]) -> None:
+    """Print dim one-line summaries for the sections embedded in a report."""
     graph = report.get("callgraph")
-    if not isinstance(graph, dict):
-        return
-    console.print(
-        f"[dim]callgraph: {graph.get('node_count', 0)} nodes"
-        f" · {graph.get('edge_count', 0)} edges"
-        f" · truncated: {'yes' if graph.get('truncated') else 'no'}[/]"
-    )
+    if isinstance(graph, dict):
+        console.print(
+            f"[dim]callgraph: {graph.get('node_count', 0)} nodes"
+            f" · {graph.get('edge_count', 0)} edges"
+            f" · truncated: {'yes' if graph.get('truncated') else 'no'}[/]"
+        )
+    refs = report.get("xrefs")
+    if isinstance(refs, dict):
+        console.print(
+            f"[dim]xrefs: {refs.get('returned', 0)} of {refs.get('count', 0)} kept"
+            f" · truncated: {'yes' if refs.get('truncated') else 'no'}[/]"
+        )
+    flow = report.get("cfg")
+    if isinstance(flow, dict):
+        console.print(
+            f"[dim]cfg: {flow.get('block_count', 0)} blocks"
+            f" · {flow.get('instruction_count', 0)} instructions"
+            f" · truncated: {'yes' if flow.get('truncated') else 'no'}[/]"
+        )
 
 
 @app.command()

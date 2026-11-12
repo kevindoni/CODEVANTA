@@ -172,6 +172,13 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   phase 1 tools (fifteen in total). `codevanta_diff` takes `max_functions`,
   `deep`, `semantic`, and `threshold`, so the phase 2j pairing pass is reachable
   from an agent without a separate `codevanta_similarity` call.
+- **`analyze` integration** (`core/report.py`) — the `codevanta analyze` JSON
+  report can embed the phase 2 output under additive `xrefs` and `cfg` keys,
+  each with its own evidence and warnings, behind `--xrefs` and `--cfg`
+  (opt-in, like `--callgraph`). `xrefs` is bounded by `--xref-limit` (default
+  2000) on top of the scanner's 4 MB decode budget; the entry-point CFG is
+  bounded by 2000 instructions and 500 blocks. Binaries with no executable
+  content still produce a report with degraded, warning-carrying sections.
 - **CLI:** `codevanta struct` (with a repeatable `--address`/`-a` — more than one
   value merges the windows and adds a `windows:` footer line — plus `--function`,
   `--max-instructions`, `--max-fields`, `--include-stack`, `--json`, and a footer
@@ -183,8 +190,9 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   `--mode absolute|relative` and `--base ADDR` for signed-offset tables),
   `codevanta diff` (with `--deep` for the normalized-shape comparison, and
   `--semantic` / `--threshold` for the shape-similarity pairing),
-  `codevanta callgraph`, `codevanta analyze --callgraph`, plus the
-  `session save|list|show|annotate|notes` subcommands.
+  `codevanta callgraph`, `codevanta analyze` (with `--callgraph` for the call
+  graph and `--xrefs` / `--cfg` / `--xref-limit` / `--json` for the phase 2
+  sections), plus the `session save|list|show|annotate|notes` subcommands.
 
 Phase 2 is deliberately narrow: linear sweep by default with an additional
 bounded recursive traversal for CFGs, direct branch targets plus
@@ -255,6 +263,9 @@ codevanta disasm    C:\Windows\System32\notepad.exe --count 40
 codevanta analyze   samples\elf64_text.bin --output samples\report.json
 
 # Phase 2
+codevanta analyze   C:\Windows\System32\notepad.exe --xrefs --cfg       # report + xrefs + cfg
+codevanta analyze   C:\Windows\System32\notepad.exe                     # phase 1 only
+codevanta analyze   C:\Windows\System32\notepad.exe --xref-limit 200 --xrefs -o report.json
 codevanta xrefs     C:\Windows\System32\notepad.exe --limit 40
 codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000
 codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000 --traversal recursive
@@ -299,6 +310,13 @@ All addresses in reports are absolute virtual addresses (VA). Function
 candidates always state their detection source (`export`, `symbol`,
 `entry_point`) and confidence (`high`, `medium`, `low`, `unknown`).
 
+The `codevanta analyze` JSON report can include the phase 2 results: `--xrefs`
+adds an `xrefs` section (bounded by `--xref-limit`, default 2000) and `--cfg`
+adds the entry-point `cfg` (at most 2000 instructions and 500 blocks), both with
+evidence and warnings. Binaries with no executable content still produce a
+report with degraded, warning-carrying sections, and without the flags the
+report is the phase 1 payload.
+
 Phase 2 results carry their own evidence: xrefs are `certain` (the target is
 read directly from the decoded operand), CFG blocks are `medium` (block
 boundaries come from mnemonic heuristics), jump-table entries are `medium` (a
@@ -341,6 +359,7 @@ slot is proven, the callee is not); register and indexed operands are skipped an
 counted in `indirect_skipped`, which `codevanta xrefs --json` prints.
 `codevanta analyze --callgraph` embeds the graph in the report, bounded to 1000
 functions and 5000 edges, and marks it `truncated` when a cap cuts it short.
+The `xrefs` and `cfg` sections use the same opt-in shape (`--xrefs`, `--cfg`).
 
 ## Coding agent setup (MCP)
 
@@ -373,7 +392,9 @@ MCP tools (fifteen): `codevanta_info`, `codevanta_functions`,
 (`limit_functions`, `limit_edges`, defaulting to 1000 and 5000) and returns nodes,
 edges, `truncated`, `warnings`, and evidence. Import targets arrive as `import`
 nodes labelled from the import table; unresolved callees stay `external`.
-`codevanta_analyze` remains the phase 1 report and has no call-graph flag.
+`codevanta_analyze` keeps its phase 1 payload and has no call-graph or phase 2
+flag; ask for the sections from Python with `build_report(path,
+include_xrefs=True)` or use `codevanta_xrefs` / `codevanta_cfg`.
 
 `codevanta_diff` compares two binaries structurally (`max_functions` default
 5000, `deep=False`) and reports `warnings` when a cap truncated the comparison.

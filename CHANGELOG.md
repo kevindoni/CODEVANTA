@@ -529,6 +529,17 @@ All notable changes to CODEVANTA are documented here. The format follows
   `suggest_structs` merge rules, address validation, bounds and evidence keys, the
   repeatable `struct --address` switch with its `windows:` footer and exit-2
   combinations, limitations, and next steps.
+- `codevanta analyze` can now embed the phase 2 results in its JSON report under
+  two additive top-level keys, opt-in per section exactly like `--callgraph`:
+  `xrefs` (count, returned, truncated, items with per-item evidence, scanned
+  sections/bytes, scan-level truncation, skipped indirect calls, warnings) and
+  `cfg` (entry-point linear-sweep CFG with blocks, successors, and warnings).
+  Both degrade to warning-carrying empty results on binaries with no executable
+  content, and the provenance step chain gains `find_xrefs` and `build_cfg`.
+  New options: `--xrefs`, `--cfg`, `--xref-limit` (default 2000, capped at
+  200000) and `--json` (echo the payload when `--output` is used). Without the
+  new flags the report is exactly the phase 1 payload, so existing JSON
+  consumers are unaffected.
 
 ### Notes
 
