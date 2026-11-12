@@ -85,6 +85,15 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   It is `medium` confidence and explicitly not semantic equivalence — equal
   digests are not byte equality, and masked branch targets make different
   callees look alike.
+- **Function similarity** (`analysis/function_hash.py`) — `normalized_tokens`
+  exposes the token stream the digest hashes, and `function_similarity` scores
+  two regions as multisets of those tokens: `sum(min) / sum(max)` of their
+  counts (the Ruzicka / weighted-Jaccard overlap) in `0.0 .. 1.0`, with the
+  shared count, both side totals, and a warning per truncated side. It is
+  `medium` confidence and a *shape* measure only: literals are masked and the
+  comparison is order-insensitive, so `1.0` is not equality and `0.0` is not
+  proof of different behaviour. Library-only for now — no CLI command and no MCP
+  tool.
 - **Structural binary diff** (`analysis/binary_diff.py`) — `diff_binaries`
   compares two binaries as metadata only: functions matched by address then name,
   sections/exports by name, imports by `(library, name)`. Deltas are `added`,
@@ -119,17 +128,23 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   width comes from the `byte`/`word`/`dword`/`qword` keyword or else the
   pointer width, direction comes from operand position with `cmp`/`test` always
   reads, stack registers are skipped unless `include_stack=True`, and each
-  offset keeps its dominant width plus total read/write counts. Every record is
-  `medium` confidence and explicitly heuristic: no type names, no alignment or
-  padding inference, and offsets are bucketed per displacement so different
-  base registers share one bucket.
-- **MCP tools** — `codevanta_diff`, `codevanta_jump_table`, and
-  `codevanta_function_hash` join `codevanta_xrefs`, `codevanta_cfg`,
-  `codevanta_callgraph`, `codevanta_session_save`, and
-  `codevanta_session_list`, alongside the five phase 1 tools (thirteen in
+  offset keeps its dominant width plus total read/write counts. Each suggestion
+  also carries two layout *hints* computed from the fields it reports:
+  `alignment`, the greatest common divisor of the absolute non-zero offsets
+  (`None` when fewer than two distinct ones were seen), and `array_groups`,
+  maximal runs of at least three consecutive fields that share one width and one
+  stride. Every record is `medium` confidence and explicitly heuristic: no type
+  names, no padding or struct-size inference, and offsets are bucketed per
+  displacement so different base registers share one bucket.
+- **MCP tools** — `codevanta_struct` joins `codevanta_diff`,
+  `codevanta_jump_table`, `codevanta_function_hash`, `codevanta_xrefs`,
+  `codevanta_cfg`, `codevanta_callgraph`, `codevanta_session_save`, and
+  `codevanta_session_list`, alongside the five phase 1 tools (fourteen in
   total).
 - **CLI:** `codevanta struct` (with `--address`/`--function`,
-  `--max-instructions`, `--max-fields`, `--include-stack`, `--json`),
+  `--max-instructions`, `--max-fields`, `--include-stack`, `--json`, and a
+  footer reporting `alignment:` plus one line per array candidate or
+  `arrays: none`),
   `codevanta xrefs`, `codevanta cfg` (with
   `--traversal linear|recursive`, default `linear`, and `--resolve-indirect` for
   recursive traversals), `codevanta jump-table` (with
@@ -153,11 +168,14 @@ debugger yet. The phase 2g switches are `jump-table --mode absolute|relative
 (`deep=True`); the CFG's indirect resolution still uses the absolute layout.
 Phase 2h adds `codevanta struct` (and the `suggest_struct` API) plus the
 `codevanta_diff`, `codevanta_jump_table`, and `codevanta_function_hash` MCP
-tools.
+tools. Phase 2i adds the `alignment`/`array_groups` layout hints on a struct
+suggestion, the `function_similarity`/`normalized_tokens` API, and the
+`codevanta_struct` MCP tool (fourteen tools).
 See [docs/phase2.md](docs/phase2.md), [docs/phase2b.md](docs/phase2b.md),
 [docs/phase2c.md](docs/phase2c.md), [docs/phase2d.md](docs/phase2d.md),
 [docs/phase2e.md](docs/phase2e.md), [docs/phase2f.md](docs/phase2f.md),
-[docs/phase2g.md](docs/phase2g.md), and [docs/phase2h.md](docs/phase2h.md) for
+[docs/phase2g.md](docs/phase2g.md), [docs/phase2h.md](docs/phase2h.md), and
+[docs/phase2i.md](docs/phase2i.md) for
 scope, confidence semantics, and limitations.
 
 ## Installation
@@ -218,8 +236,12 @@ boundaries come from mnemonic heuristics), jump-table entries are `medium` (a
 pointer array found by shape is not proof a dispatcher indexes it), the
 structural diff is `medium` (metadata only, never bytes or behavior), the call
 graph is `medium` (calls are decoded, but caller attribution is a
-nearest-candidate heuristic), and struct fields are `medium` (an operand proves
-an access, not a type, alignment, or layout). `codevanta callgraph` defaults to
+nearest-candidate heuristic), struct fields are `medium` (an operand proves
+an access, not a type or a layout — `alignment` is only the gcd of the observed
+offsets and an `array_groups` entry is only a repeated width and stride), a
+function fingerprint is `medium` (normalized shape, not bytes), and a similarity
+score is `medium` (multiset overlap of normalized tokens, not semantics).
+`codevanta callgraph` defaults to
 `--format json`
 and can emit `dot`, `graphml`, or `html` (one self-contained file with an inline
 SVG view that pans, zooms, searches, and filters by kind without any CDN, opened
@@ -231,8 +253,11 @@ hex `--address` and a `--entries` slot budget; `codevanta diff` exits `0`
 whether or not the binaries differ, and `2` on load or input errors;
 `codevanta struct` defaults to the entry point, starts at `--address` or
 `--function` when given, reports each field's offset, width, read and write
-counts, and adds a footer naming the base registers the sweep saw plus one
-`warning:` line per limitation (`--json` for the full document). Sessions
+counts, and adds a footer naming the base registers the sweep saw, the inferred
+`alignment:` (`unknown` when none could be derived), one
+`array at 0x..: N x W-byte, stride S` line per array candidate (or
+`arrays: none`), plus one `warning:` line per limitation (`--json` for the full
+document, including `alignment` and `array_groups`). Sessions
 default to `$env:CODEVANTA_DB` or `~/.codevanta/sessions.db`, and
 `session annotate` accepts decimal or `0x` hex addresses.
 
@@ -266,11 +291,11 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools (thirteen): `codevanta_info`, `codevanta_functions`,
+MCP tools (fourteen): `codevanta_info`, `codevanta_functions`,
 `codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
 `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
-`codevanta_jump_table`, `codevanta_function_hash`, `codevanta_session_save`,
-`codevanta_session_list`.
+`codevanta_jump_table`, `codevanta_function_hash`, `codevanta_struct`,
+`codevanta_session_save`, `codevanta_session_list`.
 
 `codevanta_callgraph` takes the same bounded limits as the CLI
 (`limit_functions`, `limit_edges`, defaulting to 1000 and 5000) and returns nodes,
@@ -284,8 +309,12 @@ nodes labelled from the import table; unresolved callees stay `external`.
 `mode="relative"`; `entries` defaults to 256 and values above 4096 are rejected.
 `codevanta_function_hash` returns a SHA-256 over the normalized instruction
 shape (numeric literals masked) with a `truncated` flag — equal digests are not
-byte equality, and different digests are not a semantic difference. Struct
-suggestions are not exposed over MCP yet.
+byte equality, and different digests are not a semantic difference.
+`codevanta_struct` takes the same `address`/`function`/`max_instructions`/
+`max_fields`/`include_stack` arguments as the CLI and returns the suggestion
+document unchanged, including `alignment` (a number or `null`) and
+`array_groups`; fields are `medium` heuristics from operand shapes, never
+verified types. Function similarity has no MCP tool yet.
 
 Prompt you can paste into a coding agent:
 
@@ -301,7 +330,7 @@ src/codevanta/
 ├── ir/          # backend-neutral instruction model + adapter registry
 ├── mcp_server/  # MCP tools and stdio server for coding agents
 ├── setup/       # client config planning, apply, verify (claude/cursor/cline/vscode)
-├── analysis/    # cross-references, call graph, CFG (linear sweep + recursive traversal), jump tables (absolute + relative), function fingerprints, structural/deep diff, struct-field suggestions, graph/HTML export (phase 2)
+├── analysis/    # cross-references, call graph, CFG (linear sweep + recursive traversal), jump tables (absolute + relative), function fingerprints and similarity, structural/deep diff, struct-field suggestions with alignment/array hints, graph/HTML export (phase 2)
 ├── api/         # HTTP API (phase 2+)
 ├── cli/         # Typer command line surface
 ├── storage/     # SQLite session storage and annotations (phase 2)
@@ -333,6 +362,7 @@ plus smoke-tests the wheel on 3.13.
 - [Phase 2f — jump tables, CFG indirect resolution, interactive viewer, structural diff](docs/phase2f.md)
 - [Phase 2g — relative jump tables, function fingerprints, deep diff](docs/phase2g.md)
 - [Phase 2h — struct-field suggestions, MCP parity, Python 3.14 CI](docs/phase2h.md)
+- [Phase 2i — alignment/array hints, function similarity, struct over MCP](docs/phase2i.md)
 
 ## Roadmap
 

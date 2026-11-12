@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from codevanta.analysis.type_recovery import MAX_MAX_FIELDS, MAX_MAX_INSTRUCTIONS
 from codevanta.core.report import AnalysisError
 from codevanta.mcp_server import tools
 from codevanta.mcp_server.server import build_server
@@ -53,7 +54,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
     assert report["disassembly"]["instruction_count"] == 3
 
 
-def test_server_lists_thirteen_tools() -> None:
+def test_server_lists_fourteen_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
     assert names == [
@@ -69,9 +70,10 @@ def test_server_lists_thirteen_tools() -> None:
         "codevanta_session_list",
         "codevanta_session_save",
         "codevanta_strings",
+        "codevanta_struct",
         "codevanta_xrefs",
     ]
-    assert len(names) == 13
+    assert len(names) == 14
 
 
 def _payload(result: object) -> dict:
@@ -537,3 +539,88 @@ def test_function_hash_matches_shape_not_bytes(tmp_path: Path) -> None:
             )
     with pytest.raises(AnalysisError, match="file not found"):
         tools.function_hash(str(tmp_path / "missing.bin"), TEXT_ADDRESS)
+
+
+#: ``mov rax, [rdi + 0x10]``, ``mov [rdi + 0x18], rbx``, ``mov ecx, [rdi + 0x20]``, ``ret``.
+STRUCT_CODE = bytes.fromhex("488b471048895f188b4f20c3")
+
+
+def test_struct_recovers_fields_from_register_operands(tmp_path: Path) -> None:
+    binary = _write_elf64(tmp_path / "struct.bin", STRUCT_CODE)
+
+    payload = tools.struct(str(binary), TEXT_ADDRESS)
+
+    assert payload["address"] == "0x401000"
+    assert payload["instruction_count"] == 4
+    assert payload["field_count"] == 3
+    assert payload["max_fields"] == 64
+    assert payload["truncated"] is False
+    assert payload["include_stack"] is False
+    assert [field["offset"] for field in payload["fields"]] == [
+        "0x10",
+        "0x18",
+        "0x20",
+    ]
+    assert [
+        (field["width"], field["read_count"], field["write_count"])
+        for field in payload["fields"]
+    ] == [(8, 1, 0), (8, 0, 1), (4, 1, 0)]
+    assert payload["alignment"] == 8
+    assert payload["array_groups"] == []
+    assert payload["evidence"]["source"] == "type_recovery.suggestion"
+    assert payload["evidence"]["confidence"] == "medium"
+    assert json.loads(json.dumps(payload)) == payload
+
+    # Without an address or function the entry point is the sweep start.
+    assert tools.struct(str(binary))["address"] == "0x401000"
+
+
+def test_struct_caps_fields_and_validates_arguments(tmp_path: Path) -> None:
+    binary = _write_elf64(tmp_path / "struct_limits.bin", STRUCT_CODE)
+
+    capped = tools.struct(str(binary), TEXT_ADDRESS, max_fields=2)
+
+    assert capped["max_fields"] == 2
+    assert capped["field_count"] == 2
+    assert capped["truncated"] is True
+    assert [field["offset"] for field in capped["fields"]] == ["0x10", "0x18"]
+    assert capped["alignment"] == 8
+
+    # ``mov rax, [rbp + 8]`` is a stack slot, reported only on request.
+    stack_binary = _write_elf64(tmp_path / "stack.bin", bytes.fromhex("488b4508c3"))
+    assert tools.struct(str(stack_binary), TEXT_ADDRESS)["field_count"] == 0
+    stack = tools.struct(str(stack_binary), TEXT_ADDRESS, include_stack=True)
+    assert [(field["offset"], field["width"]) for field in stack["fields"]] == [
+        ("0x8", 8)
+    ]
+
+    result = asyncio.run(
+        build_server().call_tool(
+            "codevanta_struct",
+            {"path": str(binary), "address": TEXT_ADDRESS, "max_fields": 2},
+        )
+    )
+    assert _payload(result)["field_count"] == 2
+
+    with pytest.raises(AnalysisError, match="address"):
+        tools.struct(str(binary), -1)
+    with pytest.raises(AnalysisError, match="address"):
+        tools.struct(str(binary), True)
+    with pytest.raises(AnalysisError, match="function"):
+        tools.struct(str(binary), function=7)
+    with pytest.raises(AnalysisError, match="not found"):
+        tools.struct(str(binary), function="nope")
+    for max_instructions in (0, True, MAX_MAX_INSTRUCTIONS + 1):
+        with pytest.raises(AnalysisError, match="max_instructions"):
+            tools.struct(
+                str(binary), TEXT_ADDRESS, max_instructions=max_instructions
+            )
+    for max_fields in (0, True, MAX_MAX_FIELDS + 1):
+        with pytest.raises(AnalysisError, match="max_fields"):
+            tools.struct(str(binary), TEXT_ADDRESS, max_fields=max_fields)
+    with pytest.raises(AnalysisError, match="include_stack"):
+        tools.struct(str(binary), TEXT_ADDRESS, include_stack="yes")
+    with pytest.raises(AnalysisError, match="not inside an executable section"):
+        tools.struct(str(binary), 0)
+    with pytest.raises(AnalysisError, match="file not found"):
+        tools.struct(str(tmp_path / "missing.bin"), TEXT_ADDRESS)

@@ -279,7 +279,8 @@ All notable changes to CODEVANTA are documented here. The format follows
   with `max_instructions` default 2000) bring the server to thirteen tools.
   Arguments are validated the same way as the CLI (limits `1 .. 20000`,
   non-negative addresses, booleans rejected for flags) and analysis failures
-  raise `AnalysisError`; struct suggestions are not exposed over MCP yet.
+  raise `AnalysisError`; struct suggestions were not exposed over MCP until
+  `codevanta_struct` in phase 2i.
 - CLI: `codevanta struct PATH` with `--address`/`-a`, `--function`/`-f`,
   `--max-instructions`, `--max-fields`, `--include-stack`, and `--json`. The
   start address resolves as address, then function name, then entry point. The
@@ -305,6 +306,47 @@ All notable changes to CODEVANTA are documented here. The format follows
   bucket), the `medium` evidence labels, bounds and determinism, the thirteen
   MCP tools, the `codevanta struct` CLI reference, the new CI matrix, confidence,
   limitations, and next steps.
+- Struct layout hints (`codevanta.analysis.type_recovery`): `StructSuggestion`
+  gains `alignment` and `array_groups`, both derived from the fields the
+  suggestion actually reports, so the `max_fields` cap can change them.
+  `alignment` is the greatest common divisor of the absolute non-zero offsets —
+  offset `0` is ignored because it is a multiple of every candidate — and is
+  `None` when fewer than two distinct non-zero offsets were seen. `array_groups`
+  holds `ArrayGroup(offset, stride, count, width, evidence)` records for maximal
+  runs of at least three consecutive fields (in ascending offset order) that
+  share one width and one stride; a run stops at the first width or stride
+  change, the scan then restarts at the next field so no field belongs to two
+  groups, and `span` is `stride * (count - 1) + width`. Every group is `medium`
+  confidence (`type_recovery.array_run` / `stride_run_detection`) and its detail
+  states that the heuristic cannot tell an array from repeated struct members.
+- Function similarity (`codevanta.analysis.function_hash`):
+  `normalized_tokens(path, info, address, max_instructions=2000)` returns the
+  tokens the fingerprint hashes — one shared sweep, so the digest and the tokens
+  cannot disagree — and `function_similarity(...)` compares two regions as
+  multisets of those tokens (`shared = sum(min)`, `union = sum(max)`,
+  `score = shared / union`, in `0.0 .. 1.0`), returning
+  `SimilarityResult(score, shared, left_total, right_total, evidence, warnings)`
+  with the score rounded to four decimals in `to_dict()`. Evidence is
+  `function_hash.similarity` / `token_multiset` at `medium` confidence with a
+  shape-not-semantics caveat; a truncated side adds a warning, and a side with no
+  tokens raises `AnalysisError` instead of scoring `0.0`. Work is bounded to
+  `2 * max_instructions` instructions and `2 * max_instructions * 16` bytes.
+- MCP: `codevanta_struct` exposes `suggest_struct` with `address`/`function`/
+  `max_instructions`/`max_fields`/`include_stack` and returns the suggestion's
+  `to_dict()` unchanged, including `alignment` and `array_groups` — fourteen
+  tools total. Bounded arguments, `AnalysisError` on bad input, and the same
+  evidence semantics as the CLI. Function similarity is not exposed over MCP.
+- CLI: `codevanta struct` prints `alignment: <n>` (or `alignment: unknown` when
+  none could be derived) plus one
+  `array at 0x10: 3 x 8-byte, stride 8` line per array candidate — or
+  `arrays: none` when no run was found — between the counts line and the
+  warning lines. `--json` output carries `alignment` and `array_groups`
+  unchanged.
+- Documentation: `docs/phase2i.md` covers the gcd alignment rule and its `None`
+  cases, the maximal-run array heuristic and its evidence, the Ruzicka multiset
+  similarity and its normalization, the fourteen MCP tools including
+  `codevanta_struct`, the `codevanta struct` footer, the `medium` labels, bounds
+  and determinism, limitations, and next steps.
 
 ### Notes
 
@@ -323,12 +365,18 @@ All notable changes to CODEVANTA are documented here. The format follows
   `diff --deep`; the CFG's indirect resolution still uses the absolute layout.
   Phase 2h adds heuristic struct-field suggestions (`suggest_struct` and
   `codevanta struct`), which report an offset, an access width, and read/write
-  counts only: there is no type name, no alignment or padding inference, and no
-  cross-function merging, and offsets reached through different base registers
-  share one bucket. Struct suggestions are not exposed over MCP yet.
+  counts only: there is no type name and no cross-function merging, and offsets
+  reached through different base registers share one bucket. Phase 2i adds
+  `alignment` (the gcd of the reported non-zero offsets, `None` when fewer than
+  two exist) and `array_groups` (maximal runs of at least three equally wide,
+  equally spaced fields) to those suggestions — both are `medium` heuristics over
+  one bounded window, so they cannot prove padding, a struct size or a declared
+  array — plus `function_similarity`, a multiset overlap of normalized tokens
+  that is library-only for now, and the `codevanta_struct` MCP tool (fourteen
+  tools).
   See `docs/phase2.md`, `docs/phase2b.md`, `docs/phase2c.md`,
-  `docs/phase2d.md`, `docs/phase2e.md`, `docs/phase2f.md`, `docs/phase2g.md`, and
-  `docs/phase2h.md`.
+  `docs/phase2d.md`, `docs/phase2e.md`, `docs/phase2f.md`, `docs/phase2g.md`,
+  `docs/phase2h.md`, and `docs/phase2i.md`.
 - Node boundaries and caller attribution are heuristics, not proven function
   extents. Sessions and annotations live in one local SQLite file with no schema
   migrations yet.

@@ -200,6 +200,38 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Suggest struct fields for the memory a function accesses around a "
+            "base register, starting at an address, a named function, or the "
+            "entry point. Only '[reg]', '[reg + 0xNN]' and '[reg - 0xNN]' "
+            "operands are read; index/scale/segment forms are skipped. Width "
+            "comes from the Intel size keyword, direction from the operand "
+            "position (cmp/test/call/jmp/push are always reads). 'alignment' is "
+            "the gcd of the absolute non-zero offsets and 'array_groups' lists "
+            "runs of at least three "
+            "equally spaced fields; 'truncated' means max_fields dropped "
+            "offsets. Fields are medium-confidence heuristics from operand "
+            "shapes, not verified types, and carry no signedness or purpose."
+        )
+    )
+    def codevanta_struct(
+        path: str,
+        address: int | None = None,
+        function: str | None = None,
+        max_instructions: int = 2000,
+        max_fields: int = 64,
+        include_stack: bool = False,
+    ) -> dict:
+        return tools.struct(
+            path,
+            address=address,
+            function=function,
+            max_instructions=max_instructions,
+            max_fields=max_fields,
+            include_stack=include_stack,
+        )
+
+    @server.tool(
+        description=(
             "Analyze a binary and persist its fingerprint, function count, and "
             "string count as a new session in the local SQLite session database."
         )

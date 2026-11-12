@@ -12,15 +12,32 @@ the memory operands of every decoded instruction:
    (``byte``/``word``/``dword``/``qword`` = 1/2/4/8), falling back to the
    pointer width of the binary when the operand carries no keyword.
 3. The access **direction** is a write when the memory operand is the *first*
-   operand, and a read otherwise. Instructions that only compare -- ``cmp``,
-   ``cmpsb``/``cmpsw``/``cmpsd``/``cmpsq``, ``test`` -- are always reads, even
-   though the memory operand comes first.
+   operand, and a read otherwise. Instructions that only dereference a memory
+   operand -- ``cmp``, ``cmpsb``/``cmpsw``/``cmpsd``/``cmpsq``, ``test``,
+   ``call``, ``jmp`` and ``push`` -- are always reads, even though the memory
+   operand comes first.
 
 The accesses are then aggregated **per offset**: the dominant width of an offset
 is the one seen most often (ties go to the wider access, which is the safer
 assumption), and the read/write counts are totals for that offset over all
 widths. Fields are returned sorted by ascending offset, so the result is
 deterministic for a given input.
+
+Two cheap layout hints are derived from those fields:
+
+* ``alignment`` is the greatest common divisor of the **absolute** offsets,
+  ignoring offset 0 (which is a multiple of everything). It is ``None`` when
+  fewer than two distinct absolute non-zero offsets were seen, because a single
+  offset carries no information about a layout. Natural alignment therefore shows up as
+  a power-of-two gcd; odd offsets collapse it to 1.
+* ``array_groups`` are **maximal runs** of at least
+  :data:`_MIN_ARRAY_ELEMENTS` consecutive fields (in ascending offset order)
+  that share one width *and* one stride between neighbours. Each run becomes one
+  :class:`ArrayGroup` starting at its first field. A run is never extended past a
+  width change or a stride change, and never overlaps the next group.
+
+Both hints are computed from the fields that are actually reported, i.e. after
+the ``max_fields`` cap, so a group never refers to a field that was dropped.
 
 Everything here is a *heuristic*: a struct field recovered from operand shapes
 is a hypothesis about how a function treats memory around one base register. It
@@ -45,8 +62,9 @@ non-Intel-shaped binary simply yields no fields instead of wrong ones.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from math import gcd
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +76,7 @@ from codevanta.evidence.models import Evidence
 from codevanta.ir.instruction import IRInstruction
 
 __all__ = [
+    "ArrayGroup",
     "DEFAULT_MAX_FIELDS",
     "DEFAULT_MAX_INSTRUCTIONS",
     "MAX_MAX_FIELDS",
@@ -145,6 +164,13 @@ _FIELD_EVIDENCE_SOURCE = "type_recovery.memory_operand"
 _FIELD_EVIDENCE_METHOD = "operand_scan"
 _SUGGESTION_EVIDENCE_SOURCE = "type_recovery.suggestion"
 _SUGGESTION_EVIDENCE_METHOD = "operand_aggregation"
+_ARRAY_EVIDENCE_SOURCE = "type_recovery.array_run"
+_ARRAY_EVIDENCE_METHOD = "stride_run_detection"
+
+#: Smallest number of equally spaced, equally wide fields that is reported as an
+#: :class:`ArrayGroup`. Two fields are only a coincidence; three is the minimum
+#: at which a repeated stride starts to carry information.
+_MIN_ARRAY_ELEMENTS = 3
 
 
 @dataclass(frozen=True)
@@ -220,6 +246,45 @@ class SuggestedField:
 
 
 @dataclass(frozen=True)
+class ArrayGroup:
+    """A run of equally spaced, equally wide fields that looks like an array.
+
+    The run is *maximal*: it cannot be extended left or right by another field
+    with the same width and stride, and it never overlaps another group.
+
+    Attributes:
+        offset: Offset of the first field of the run.
+        stride: Distance in bytes between consecutive fields; always positive.
+        count: Number of fields in the run (at least
+            :data:`_MIN_ARRAY_ELEMENTS`).
+        width: Shared dominant width of the run's fields, in bytes.
+        evidence: Justification, always at ``Confidence.MEDIUM`` and always
+            carrying a heuristic caveat.
+    """
+
+    offset: int
+    stride: int
+    count: int
+    width: int
+    evidence: Evidence
+
+    @property
+    def span(self) -> int:
+        """Total byte span covered by the run, i.e. ``stride * (count - 1) + width``."""
+        return self.stride * (self.count - 1) + self.width
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "offset": f"0x{self.offset:x}",
+            "stride": self.stride,
+            "count": self.count,
+            "width": self.width,
+            "span": self.span,
+            "evidence": self.evidence.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class StructSuggestion:
     """The fields suggested for the struct a function receives in a register.
 
@@ -233,6 +298,10 @@ class StructSuggestion:
             Instruction-budget exhaustion is not reported here.
         include_stack: Whether stack-based operands were kept.
         evidence: Justification for the suggestion as a whole.
+        alignment: GCD of the absolute non-zero field offsets, or ``None`` when
+            fewer than two distinct non-zero offsets were found.
+        array_groups: Maximal runs of at least :data:`_MIN_ARRAY_ELEMENTS`
+            equally wide, equally spaced fields, in ascending offset order.
     """
 
     address: int
@@ -242,6 +311,8 @@ class StructSuggestion:
     truncated: bool
     include_stack: bool
     evidence: Evidence
+    alignment: int | None = None
+    array_groups: tuple[ArrayGroup, ...] = ()
 
     @property
     def field_count(self) -> int:
@@ -257,6 +328,8 @@ class StructSuggestion:
             "truncated": self.truncated,
             "include_stack": self.include_stack,
             "fields": [field.to_dict() for field in self.fields],
+            "alignment": self.alignment,
+            "array_groups": [group.to_dict() for group in self.array_groups],
             "evidence": self.evidence.to_dict(),
         }
 
@@ -413,6 +486,92 @@ def _aggregate(accesses: Iterable[FieldAccess]) -> list[SuggestedField]:
     return fields
 
 
+def _alignment(fields: Sequence[SuggestedField]) -> int | None:
+    """GCD of the absolute non-zero field offsets, or ``None`` when too few.
+
+    Offset 0 is ignored because it is a multiple of every candidate alignment and
+    would therefore contribute nothing. Fewer than two distinct non-zero offsets
+    cannot distinguish an alignment from the offset itself, so the answer is
+    ``None`` instead of a guess.
+    """
+    magnitudes = sorted({abs(field.offset) for field in fields if field.offset != 0})
+    if len(magnitudes) < 2:
+        return None
+    result = magnitudes[0]
+    for magnitude in magnitudes[1:]:
+        result = gcd(result, magnitude)
+    return result
+
+
+def _array_group_evidence(
+    first: SuggestedField, stride: int, count: int, width: int
+) -> Evidence:
+    """Build the MEDIUM-confidence evidence record for one array run."""
+    return Evidence(
+        source=_ARRAY_EVIDENCE_SOURCE,
+        method=_ARRAY_EVIDENCE_METHOD,
+        confidence=Confidence.MEDIUM,
+        address=first.first_access,
+        detail=(
+            f"array candidate at offset 0x{first.offset:x}: {count} fields of "
+            f"{width} byte(s) spaced {stride} byte(s) apart; run heuristic only, "
+            "it cannot tell an array from repeated struct members and is not a "
+            "verified type"
+        ),
+        extra={
+            "offset": first.offset,
+            "stride": stride,
+            "count": count,
+            "width": width,
+        },
+    )
+
+
+def _array_groups(fields: Sequence[SuggestedField]) -> tuple[ArrayGroup, ...]:
+    """Group maximal runs of equally wide, equally spaced fields.
+
+    Fields must already be sorted by ascending offset, which
+    :func:`_aggregate` guarantees. A run needs at least
+    :data:`_MIN_ARRAY_ELEMENTS` fields with one shared width and one shared
+    stride between neighbours; the scan is linear, and every field belongs to at
+    most one group, so the result is deterministic.
+    """
+    groups: list[ArrayGroup] = []
+    total = len(fields)
+    start = 0
+    while start < total:
+        width = fields[start].width
+        end = start
+        stride: int | None = None
+        while end + 1 < total:
+            following = fields[end + 1]
+            if following.width != width:
+                break
+            step = following.offset - fields[end].offset
+            if stride is None:
+                stride = step
+            elif step != stride:
+                break
+            end += 1
+        count = end - start + 1
+        if stride is not None and count >= _MIN_ARRAY_ELEMENTS:
+            first = fields[start]
+            groups.append(
+                ArrayGroup(
+                    offset=first.offset,
+                    stride=stride,
+                    count=count,
+                    width=width,
+                    evidence=_array_group_evidence(first, stride, count, width),
+                )
+            )
+            start = end + 1
+        else:
+            # No run here: retry from the next field, a shorter run may start there.
+            start += 1
+    return tuple(groups)
+
+
 def _require_int(name: str, value: object, minimum: int, maximum: int) -> int:
     """Validate an integer option and return it as ``int``."""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -450,7 +609,8 @@ def suggest_struct(
 
     Returns:
         The :class:`StructSuggestion` for the region, with fields sorted by
-        ascending offset.
+        ascending offset, the offset-gcd ``alignment`` and the ``array_groups``
+        runs derived from those reported fields.
 
     Raises:
         AnalysisError: When ``start``, ``max_instructions`` or ``max_fields`` is
@@ -461,7 +621,9 @@ def suggest_struct(
     Note:
         Two calls with the same arguments always produce the same suggestion:
         the sweep is linear, aggregation is per offset, and fields, widths and
-        counters are all ordered deterministically.
+        counters are all ordered deterministically. ``alignment`` and
+        ``array_groups`` are derived from the reported fields only, so capping
+        with ``max_fields`` cannot leave a group pointing at a dropped field.
     """
     if isinstance(start, bool) or not isinstance(start, int):
         raise AnalysisError(f"start must be an integer, got {start!r}")
@@ -502,6 +664,8 @@ def suggest_struct(
     all_fields = _aggregate(accesses)
     fields = tuple(all_fields[:field_cap])
     truncated = len(all_fields) > field_cap
+    alignment = _alignment(fields)
+    array_groups = _array_groups(fields)
 
     evidence = Evidence(
         source=_SUGGESTION_EVIDENCE_SOURCE,
@@ -511,6 +675,8 @@ def suggest_struct(
         detail=(
             f"{len(fields)} suggested field(s) from {len(accesses)} memory access(es) "
             f"over {len(instructions)} instruction(s) at 0x{start:x}"
+            + (f", alignment {alignment}" if alignment is not None else "")
+            + f", {len(array_groups)} array candidate(s)"
             + (" (field cap reached)" if truncated else "")
             + "; fields are heuristic from operand shapes, not verified types"
         ),
@@ -522,6 +688,8 @@ def suggest_struct(
             "field_count": len(fields),
             "truncated": truncated,
             "include_stack": include_stack,
+            "alignment": alignment,
+            "array_group_count": len(array_groups),
         },
     )
     return StructSuggestion(
@@ -532,4 +700,6 @@ def suggest_struct(
         truncated=truncated,
         include_stack=include_stack,
         evidence=evidence,
+        alignment=alignment,
+        array_groups=array_groups,
     )
