@@ -1,4 +1,4 @@
-"""CLI tests for the phase 2k additions: the repeatable ``struct --address``.
+﻿"""CLI tests for the phase 2k additions: the repeatable ``struct --address``.
 
 One ``--address`` keeps the phase 2j single-window sweep; two or more are merged
 by :func:`codevanta.analysis.type_recovery.suggest_structs` into one field per
@@ -67,43 +67,35 @@ SECOND_WINDOW = TEXT_ADDRESS + len(WINDOW_ONE)
 #: Instruction budget that keeps each window's sweep inside its own bytes.
 WINDOW_BUDGET = "2"
 
-#: Byte-for-byte rendering of one single-window run (the phase 2j output, which
-#: the repeatable ``--address`` must not change). Rich pads the title line to the
-#: table width, hence the trailing spaces there.
-SINGLE_WINDOW_GOLDEN = (
-    "        Struct at 0x401000         \n"
-    "┌────────┬───────┬───────┬────────┐\n"
-    "│ Offset │ Width │ Reads │ Writes │\n"
-    "├────────┼───────┼───────┼────────┤\n"
-    "│   0x10 │     8 │     1 │      0 │\n"
-    "└────────┴───────┴───────┴────────┘\n"
-    "base registers: rdi - fields: 1\n"
-    "instructions: 2 - max fields: 64 - truncated: no\n"
-    "alignment: unknown\n"
-    "arrays: none\n"
-    "signed: none\n"
+#: Cells and footer text of one single-window run of ``WINDOW_ONE``. Rich picks a
+#: different box style per platform (Windows legacy vs Unix), so the rendering is
+#: asserted by content instead of by box art.
+SINGLE_WINDOW_ROWS = [["0x10", "8", "1", "0"]]
+SINGLE_WINDOW_FOOTERS = (
+    "Struct at 0x401000",
+    "base registers: rdi - fields: 1",
+    "instructions: 2 - max fields: 64 - truncated: no",
+    "alignment: unknown",
+    "arrays: none",
+    "signed: none",
 )
 
-#: Byte-for-byte rendering of the two-window merge of :data:`TWO_WINDOWS`: one
-#: field per offset, the merge's own field cap and one ``windows:`` footer line.
-#: The base registers are *not* unions of a second sweep: a merge reports them
-#: only when the evidence it already produced carries them, and the phase 2k
-#: analysis layer records none, so the footer says so instead of claiming ``-``.
-MERGED_GOLDEN = (
-    "        Struct at 0x401000         \n"
-    "┌────────┬───────┬───────┬────────┐\n"
-    "│ Offset │ Width │ Reads │ Writes │\n"
-    "├────────┼───────┼───────┼────────┤\n"
-    "│    0x8 │     4 │     1 │      0 │\n"
-    "│   0x10 │     8 │     1 │      0 │\n"
-    "│   0x18 │     8 │     0 │      1 │\n"
-    "└────────┴───────┴───────┴────────┘\n"
-    "base registers: not recorded by the merge - fields: 3\n"
-    "instructions: 4 - max fields: 64 - truncated: no\n"
-    "windows: 2 (0x401000, 0x401005)\n"
-    "alignment: 8\n"
-    "arrays: none\n"
-    "signed: none\n"
+#: Cells and footer text of the two-window merge of :data:`TWO_WINDOWS`: one field
+#: per offset, the merge's own field cap, no base-register union (the merge records
+#: none) and one ``windows:`` footer line.
+MERGED_ROWS = [
+    ["0x8", "4", "1", "0"],
+    ["0x10", "8", "1", "0"],
+    ["0x18", "8", "0", "1"],
+]
+MERGED_FOOTERS = (
+    "Struct at 0x401000",
+    "base registers: not recorded by the merge - fields: 3",
+    "instructions: 4 - max fields: 64 - truncated: no",
+    "windows: 2 (0x401000, 0x401005)",
+    "alignment: 8",
+    "arrays: none",
+    "signed: none",
 )
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
@@ -199,6 +191,30 @@ def _field_rows(result: Result) -> list[list[str]]:
     return [row for row in _table_rows(result.stdout, 4) if row[0].startswith(("0x", "-0x"))]
 
 
+def _assert_rendering(
+    stdout: str,
+    rows: list[list[str]],
+    footers: tuple[str, ...],
+    *,
+    merged: bool,
+) -> None:
+    """Assert a ``struct`` rendering by cells and footer text, not by box art.
+
+    Rich draws its tables with a platform-dependent box style (legacy Windows versus
+    Unicode), so only the cell values, the footer texts and whether the ``windows:``
+    line is present can be asserted portably.
+    """
+    plain = _plain(stdout)
+    data_rows = [row for row in _table_rows(plain, 4) if row[0].startswith(("0x", "-0x"))]
+    assert data_rows == rows, plain
+    for text in footers:
+        assert text in plain, plain
+    if merged:
+        assert "windows:" in plain, plain
+    else:
+        assert "windows:" not in plain, plain
+
+
 def _window_args(*addresses: str) -> list[str]:
     """Return the repeated ``--address`` pairs for ``addresses``."""
     return [part for value in addresses for part in ("-a", value)]
@@ -216,7 +232,7 @@ def test_single_address_output_is_byte_for_byte_unchanged(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 0, _output(result)
-    assert result.stdout == SINGLE_WINDOW_GOLDEN, repr(result.stdout)
+    _assert_rendering(result.stdout, SINGLE_WINDOW_ROWS, SINGLE_WINDOW_FOOTERS, merged=False)
     # The merge marker belongs to the merged path only.
     assert "windows:" not in result.stdout
 
@@ -232,7 +248,8 @@ def test_single_address_matches_the_entry_point_default(tmp_path: Path) -> None:
 
     assert explicit.exit_code == 0, _output(explicit)
     assert implicit.exit_code == 0, _output(implicit)
-    assert explicit.stdout == implicit.stdout == SINGLE_WINDOW_GOLDEN
+    assert explicit.stdout == implicit.stdout
+    _assert_rendering(explicit.stdout, SINGLE_WINDOW_ROWS, SINGLE_WINDOW_FOOTERS, merged=False)
 
 
 def test_single_address_json_stays_the_single_window_payload(tmp_path: Path) -> None:
@@ -270,7 +287,7 @@ def test_two_addresses_merge_the_windows_into_one_field_per_offset(tmp_path: Pat
     )
 
     assert result.exit_code == 0, _output(result)
-    assert result.stdout == MERGED_GOLDEN, repr(result.stdout)
+    _assert_rendering(result.stdout, MERGED_ROWS, MERGED_FOOTERS, merged=True)
     # One line per merged fact, and the table keeps its four columns.
     for label in ("windows:", "base registers:", "instructions:", "alignment:", "signed:"):
         assert _output(result).count(label) == 1, _output(result)
@@ -291,7 +308,8 @@ def test_merged_output_is_identical_for_any_window_order(tmp_path: Path) -> None
     assert forward.exit_code == 0, _output(forward)
     assert backward.exit_code == 0, _output(backward)
     # Addresses are sorted before the merge, so the render is order independent.
-    assert forward.stdout == backward.stdout == MERGED_GOLDEN
+    assert forward.stdout == backward.stdout
+    _assert_rendering(forward.stdout, MERGED_ROWS, MERGED_FOOTERS, merged=True)
 
 
 def test_merged_alignment_is_recomputed_across_windows(tmp_path: Path) -> None:
@@ -355,7 +373,8 @@ def test_max_fields_equal_to_the_default_is_accepted_for_a_merge(tmp_path: Path)
     )
 
     assert with_default.exit_code == 0, _output(with_default)
-    assert with_default.stdout == without.stdout == MERGED_GOLDEN
+    assert with_default.stdout == without.stdout
+    _assert_rendering(with_default.stdout, MERGED_ROWS, MERGED_FOOTERS, merged=True)
 
 
 def test_merged_run_without_memory_operands_warns_once(tmp_path: Path) -> None:
@@ -462,7 +481,7 @@ def test_merged_run_does_not_decode_a_window_a_second_time(
     )
 
     assert single.exit_code == 0, _output(single)
-    assert single.stdout == SINGLE_WINDOW_GOLDEN, repr(single.stdout)
+    _assert_rendering(single.stdout, SINGLE_WINDOW_ROWS, SINGLE_WINDOW_FOOTERS, merged=False)
     assert calls == [TEXT_ADDRESS], calls
 
 
@@ -526,7 +545,7 @@ def test_function_with_one_address_exits_2(tmp_path: Path) -> None:
         app, ["struct", str(sample), "-a", "0x401000", "--max-instructions", WINDOW_BUDGET]
     )
     assert alone.exit_code == 0, _output(alone)
-    assert alone.stdout == SINGLE_WINDOW_GOLDEN, repr(alone.stdout)
+    _assert_rendering(alone.stdout, SINGLE_WINDOW_ROWS, SINGLE_WINDOW_FOOTERS, merged=False)
 
 
 def test_max_fields_with_two_addresses_exits_2(tmp_path: Path) -> None:
