@@ -485,6 +485,8 @@ plus smoke-tests the wheel on 3.13.
   contract, the nine dashboard routes, and the fifteen MCP tools
 - [Sample binaries](docs/samples.md) — the committed PE/Mach-O/ELF fixtures and
   how to regenerate them
+- [Contributor attribution](docs/attribution.md) — how agent commits are credited,
+  and how to make an agent appear in GitHub's contributor graph
 - [Phase 2 — cross-references, CFGs, sessions](docs/phase2.md)
 - [Phase 2b — call graphs, graph export, session annotations](docs/phase2b.md)
 - [Phase 2c — import/indirect calls, embedded call graphs, MCP call graph](docs/phase2c.md)
