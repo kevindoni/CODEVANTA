@@ -4,6 +4,39 @@ All notable changes to CODEVANTA are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Cross-reference scanner (`codevanta.analysis.xrefs`): `call`, `jump`, and
+  `branch` references recovered from direct branch operands in executable
+  sections. Targets that are only reachable through registers or memory are
+  skipped rather than guessed. Every reference carries evidence
+  (`capstone.direct_call` / `direct_jump` / `conditional_branch`, confidence
+  `certain`), and the scan reports section coverage, scanned bytes, and whether
+  it was truncated by the `max_bytes` budget.
+- Control-flow graph builder (`codevanta.analysis.cfg`): linear sweep of one
+  region into `BasicBlock`s with sorted, deduplicated successor edges derived
+  from leader and terminator rules. Indirect branches stay unresolved; the
+  sweep is bounded by `max_instructions` and `max_blocks` and is labelled
+  `medium` confidence because block boundaries are heuristic.
+- SQLite session storage (`codevanta.storage.session`): additive analysis
+  records (fingerprint, format, architecture, bitness, entry point, function and
+  string counts, notes) with `save`, `get`, `list`, and `delete`. Standard
+  library only, parameterized SQL, bounded queries.
+- CLI: `codevanta xrefs` (with `--limit`, `--max-bytes`, `--json`),
+  `codevanta cfg` (with `--address`/`--function`, `--max-instructions`,
+  `--max-blocks`, `--json`), and `codevanta session save|list|show` (with
+  `--db`, defaulting to `$CODEVANTA_DB` or `~/.codevanta/sessions.db`).
+
+### Notes
+
+- Phase 2 is in progress: linear sweep only, direct branch targets only, no
+  recursive traversal, no call-graph recursion, no graph viewer, and no
+  debugger yet. See `docs/phase2.md`.
+- Phase 2 results are not exposed over MCP yet; the server still serves the five
+  phase 1 tools.
+
 ## [0.1.0] - 2026-12-11
 
 ### Added
@@ -30,4 +63,5 @@ All notable changes to CODEVANTA are documented here. The format follows
 - Static analysis only: target binaries are never executed.
 - PyVEX/angr, Z3, and Unicorn are intentionally deferred to a later phase.
 
+[Unreleased]: https://github.com/kevindoni/CODEVANTA/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/kevindoni/CODEVANTA/releases/tag/v0.1.0

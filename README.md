@@ -47,6 +47,24 @@ Delivered in phase 1:
 - **MCP server** (`codevanta mcp serve`) exposing the same five tools to coding agents.
 - **Guided setup** (`codevanta setup`) for Claude Code, Cursor, Cline, and VS Code, with plan preview, backups, and verification.
 
+### Phase 2 (in progress)
+
+Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
+
+- **Cross-references** (`analysis/xrefs.py`) — `call`/`jump`/`branch` references
+  recovered from direct branch operands in executable sections, each with
+  evidence and an optional callee name.
+- **Control-flow graphs** (`analysis/cfg.py`) — basic blocks and successor edges
+  for one region, built by linear sweep with leader/terminator rules.
+- **Session storage** (`storage/session.py`) — additive SQLite records of each
+  analysis run (fingerprint, format, arch, entry point, function/string counts).
+- **CLI:** `codevanta xrefs`, `codevanta cfg`, `codevanta session save|list|show`.
+
+Phase 2 is deliberately narrow: linear sweep only, direct branch targets only,
+no recursive traversal or call-graph recursion, no graph viewer, and no debugger
+yet. See [docs/phase2.md](docs/phase2.md) for scope, confidence semantics, and
+limitations.
+
 ## Installation
 
 ```powershell
@@ -71,11 +89,24 @@ codevanta functions C:\Windows\System32\kernel32.dll --limit 8
 codevanta strings   C:\Windows\System32\notepad.exe --min-length 8
 codevanta disasm    C:\Windows\System32\notepad.exe --count 40
 codevanta analyze   samples\elf64_text.bin --output samples\report.json
+
+# Phase 2
+codevanta xrefs     C:\Windows\System32\notepad.exe --limit 40
+codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000
+codevanta session save C:\Windows\System32\notepad.exe --notes "baseline triage"
+codevanta session list --limit 10
+codevanta session show 4f9c1a7b2d3e
 ```
 
 All addresses in reports are absolute virtual addresses (VA). Function
 candidates always state their detection source (`export`, `symbol`,
 `entry_point`) and confidence (`high`, `medium`, `low`, `unknown`).
+
+Phase 2 results carry their own evidence: xrefs are `certain` (the target is
+read directly from the decoded operand), CFG blocks are `medium` (block
+boundaries come from mnemonic heuristics). `codevanta cfg` defaults to the entry
+point and sessions default to `$env:CODEVANTA_DB` or
+`~/.codevanta/sessions.db`.
 
 ## Coding agent setup (MCP)
 
@@ -115,10 +146,10 @@ src/codevanta/
 ├── ir/          # backend-neutral instruction model + adapter registry
 ├── mcp_server/  # MCP tools and stdio server for coding agents
 ├── setup/       # client config planning, apply, verify (claude/cursor/cline/vscode)
-├── analysis/    # cross-references and CFG (phase 2+)
+├── analysis/    # cross-references and linear-sweep CFG (phase 2)
 ├── api/         # HTTP API (phase 2+)
 ├── cli/         # Typer command line surface
-├── storage/     # session storage (phase 2+)
+├── storage/     # SQLite session storage (phase 2)
 └── plugins/     # plugin system (phase 5)
 tests/           # unit and integration tests
 docs/            # architecture and install notes
@@ -136,6 +167,7 @@ ruff check src tests
 
 - [Project specification](PROJECT_SPEC.md)
 - [Architecture](docs/architecture.md)
+- [Phase 2 — cross-references, CFGs, sessions](docs/phase2.md)
 
 ## Roadmap
 
