@@ -92,6 +92,14 @@ def _write_elf64(path: Path, code: bytes, *, text_address: int = TEXT_ADDRESS) -
     return path
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    """Strip terminal escape sequences from ``text``."""
+    return _ANSI_ESCAPE.sub("", text)
+
+
 def _table_rows(stdout: str, columns: int) -> list[list[str]]:
     """Return the cell lists of every data row in a Rich table.
 
@@ -99,7 +107,7 @@ def _table_rows(stdout: str, columns: int) -> list[list[str]]:
     do not depend on the console encoding of the platform running the tests.
     """
     rows: list[list[str]] = []
-    for line in stdout.splitlines():
+    for line in _plain(stdout).splitlines():
         stripped = line.strip()
         for bar in ("\u2502", "|"):
             if stripped.count(bar) != columns + 1:
@@ -118,24 +126,27 @@ def _block_rows(stdout: str) -> list[list[str]]:
 
 def _block_count(stdout: str) -> int:
     """Return the block count from the table title, or ``-1`` when absent."""
-    match = _BLOCK_COUNT.search(stdout)
+    match = _BLOCK_COUNT.search(_plain(stdout))
     assert match is not None, stdout
     return int(match.group(1))
 
 
 def _payload(stdout: str) -> dict:
     """Return the parsed JSON object printed by ``cfg --json``."""
-    return json.loads(stdout[stdout.index("{") : stdout.rindex("}") + 1])
+    text = _plain(stdout)
+    return json.loads(text[text.index("{") : text.rindex("}") + 1])
 
 
 def _output(result: Result) -> str:
-    """Return stdout and stderr merged into one whitespace-flattened string.
+    """Return stdout and stderr merged, ANSI-stripped and whitespace-flattened.
 
-    Click writes usage errors to stderr (and Rich wraps them), so both streams
-    are combined before matching text.
+    Click writes usage errors to stderr (and Rich wraps and colorizes them), so
+    both streams are combined and terminal escape sequences removed before
+    matching text; otherwise ``--traversal`` can arrive as ``-\\x1b[..m-traversal``.
     """
     stderr = getattr(result, "stderr", "") or ""
-    return " ".join(f"{result.stdout} {stderr}".split())
+    merged = _plain(f"{result.stdout} {stderr}")
+    return " ".join(merged.split())
 
 
 # ---- --traversal recursive -------------------------------------------------
