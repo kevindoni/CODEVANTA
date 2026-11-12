@@ -12,8 +12,8 @@ strings, evidence, JSON report) with three analysis building blocks:
 All three are read-only with respect to the analysed target: bytes are read
 from disk and decoded, nothing is loaded into a process or executed.
 
-**Status:** in progress. There is no web viewer, no debugger, and no recursive
-traversal yet — see [Limitations](#limitations).
+**Status:** in progress. There is no web viewer and no debugger yet — see
+[Limitations](#limitations).
 
 ## Delivered scope
 
@@ -59,6 +59,26 @@ section) and derives blocks with local rules only:
 
 Indirect branches (`jmp rax`, `jmp qword ptr [...]`, jump tables) are not
 resolved, so those blocks simply end with an unresolved terminator.
+
+### Recursive-descent CFG (`analysis/recursive_cfg.py`)
+
+`build_recursive_cfg(path, info, start, max_instructions=2000, max_blocks=500,
+max_functions=32, max_bytes=1_000_000)` walks code by following statically
+known direct transfers from one seed address:
+
+- **Jump targets** become intra-function block edges; conditional jumps also
+  fall through, so both arms are decoded.
+- **Direct call targets** become function-boundary candidates
+  (`cfg.recursive_descent` / `direct_call_target`, medium confidence — the
+  boundary is a candidate, not proven) and the next walk seeds.
+- **Indirect transfers** (`call rax`, `jmp qword ptr [...]`) stay explicitly
+  unresolved with their reason; no edge, boundary, or function is invented.
+- **Budgets:** instruction, block, function, and byte budgets all bound the
+  walk; `RecursiveCFG.truncated` and the warnings say exactly which budget cut
+  what. Overlapping blocks (a branch into the middle of decoded code) count
+  their instructions twice, and `visited_instructions` says so.
+- Per-function graphs reuse the `FunctionCFG` shape of the linear sweep, so
+  consumers handle both with one parser.
 
 ### Session store (`storage/session.py`)
 
@@ -127,10 +147,6 @@ embedded in code sections.
 
 ## Limitations
 
-- **Linear sweep only.** The CFG decodes sequentially from `start`. There is no
-  recursive descent, no function-boundary detection, and no code/data
-  disambiguation, so embedded data inside a code section can decode as
-  instructions.
 - **Direct branch targets only.** Register- and memory-indirect transfers are
   ignored (xrefs) or left unresolved (CFG). Jump tables are not interpreted.
 - **No call-graph recursion.** A CFG covers one region starting at the address

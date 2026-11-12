@@ -8,6 +8,16 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- Recursive-descent CFG (`codevanta.analysis.recursive_cfg`): walks code from
+  one seed address by following statically known direct transfers. Jump
+  targets become intra-function block edges; direct call targets become
+  function-boundary candidates (`cfg.recursive_descent` /
+  `direct_call_target`, medium confidence) and the next walk seeds; indirect
+  transfers stay explicitly unresolved with their reason. Instruction, block,
+  function, and byte budgets bound the walk, and `RecursiveCFG.truncated`
+  plus warnings say which budget cut what. Transfer classification moved to
+  `analysis/_shared.py` so xrefs, the linear sweep, and the recursive walk
+  answer "is this a transfer / is the target known" identically.
 - Cross-reference scanner (`codevanta.analysis.xrefs`): `call`, `jump`, and
   `branch` references recovered from direct branch operands in executable
   sections. Targets that are only reachable through registers or memory are

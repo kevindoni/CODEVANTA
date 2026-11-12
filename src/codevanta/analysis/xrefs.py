@@ -2,9 +2,10 @@
 
 The scan is deliberately conservative: a cross reference is only emitted when
 the *entire* operand text of a transfer instruction is a hexadecimal literal
-(``^0x[0-9a-fA-F]+$``). Register-indirect (``call rax``) and memory-indirect
-(``jmp qword ptr [rax]``) transfers are therefore ignored rather than guessed,
-because their target is not statically known at this layer.
+(``^#?0x[0-9a-fA-F]+$``, the optional ``#`` covering ARM-style syntax).
+Register-indirect (``call rax``) and memory-indirect (``jmp qword ptr [rax]``)
+transfers are therefore ignored rather than guessed, because their target is
+not statically known at this layer.
 
 Every step is bounded (``max_bytes``) and the analysed file is only ever read
 from disk; nothing is loaded or executed.
@@ -12,11 +13,11 @@ from disk; nothing is loaded or executed.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from codevanta.analysis._shared import direct_target, transfer_kind
 from codevanta.core.disassembler import Disassembler, DisassemblyError
 from codevanta.core.functions import FunctionCandidate, discover_functions
 from codevanta.core.loader import BinaryInfo
@@ -28,42 +29,6 @@ __all__ = ["DEFAULT_MAX_BYTES", "Xref", "XrefResult", "find_xrefs"]
 
 #: Default ceiling on how many executable bytes a single scan will decode.
 DEFAULT_MAX_BYTES = 4_000_000
-
-#: Operand text that denotes an absolute, statically known target.
-_DIRECT_OPERAND = re.compile(r"^0x[0-9a-fA-F]+$")
-
-_BRANCH_MNEMONICS = frozenset(
-    {
-        "je",
-        "jne",
-        "jz",
-        "jnz",
-        "jb",
-        "jbe",
-        "ja",
-        "jae",
-        "jl",
-        "jle",
-        "jg",
-        "jge",
-        "js",
-        "jns",
-        "jo",
-        "jno",
-        "jp",
-        "jnp",
-        "jcxz",
-        "jecxz",
-        "jrcxz",
-    }
-)
-
-#: Maps a lowercase mnemonic to the cross-reference kind it produces.
-_KIND_BY_MNEMONIC: dict[str, str] = {
-    "call": "call",
-    "jmp": "jump",
-    **{mnemonic: "branch" for mnemonic in _BRANCH_MNEMONICS},
-}
 
 #: Maps a cross-reference kind to the evidence source that justifies it.
 _SOURCE_BY_KIND: dict[str, str] = {
@@ -142,22 +107,6 @@ class XrefResult:
             "warnings": list(self.warnings),
             "evidence": self.evidence.to_dict(),
         }
-
-
-def _kind_for(mnemonic: str) -> str | None:
-    """Return the cross-reference kind for ``mnemonic`` if it is a transfer."""
-    return _KIND_BY_MNEMONIC.get(mnemonic.strip().lower())
-
-
-def _direct_target(operands: str) -> int | None:
-    """Parse an absolute target from ``operands``; ignore registers/memory."""
-    text = operands.strip()
-    if not _DIRECT_OPERAND.match(text):
-        return None
-    try:
-        return int(text, 16)
-    except ValueError:  # pragma: no cover - the regex guarantees hex digits
-        return None
 
 
 def _scan_evidence(xref_count: int) -> Evidence:
@@ -269,10 +218,10 @@ def find_xrefs(
         truncated = truncated or disassembly.truncated
 
         for instruction in disassembly.instructions:
-            kind = _kind_for(instruction.mnemonic)
+            kind = transfer_kind(instruction.mnemonic)
             if kind is None:
                 continue
-            to_address = _direct_target(instruction.operands)
+            to_address = direct_target(instruction.operands)
             if to_address is None:
                 continue
             text = instruction.text

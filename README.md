@@ -56,13 +56,16 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   evidence and an optional callee name.
 - **Control-flow graphs** (`analysis/cfg.py`) — basic blocks and successor edges
   for one region, built by linear sweep with leader/terminator rules.
+- **Recursive-descent CFG** (`analysis/recursive_cfg.py`) — follows statically
+  known direct jumps and calls from a seed address, discovers function-boundary
+  candidates, and leaves indirect targets explicitly unresolved.
 - **Session storage** (`storage/session.py`) — additive SQLite records of each
   analysis run (fingerprint, format, arch, entry point, function/string counts).
 - **CLI:** `codevanta xrefs`, `codevanta cfg`, `codevanta session save|list|show`.
 
-Phase 2 is deliberately narrow: linear sweep only, direct branch targets only,
-no recursive traversal or call-graph recursion, no graph viewer, and no debugger
-yet. See [docs/phase2.md](docs/phase2.md) for scope, confidence semantics, and
+Phase 2 is deliberately narrow: direct branch targets only, no call-graph
+recursion, no graph viewer, and no debugger yet. See
+[docs/phase2.md](docs/phase2.md) for scope, confidence semantics, and
 limitations.
 
 ## Installation

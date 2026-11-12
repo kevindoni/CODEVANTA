@@ -26,6 +26,10 @@ flow. Every block and the function carry :class:`Evidence` stating exactly how
 they were produced, and the target binary is only ever read, never executed.
 Indirect branches (``jmp rax``, ``jmp qword ptr [...]``, jump tables) are not
 resolved in phase 2, so their blocks end with an unresolved terminator.
+
+Mnemonic classification and direct-target parsing live in
+:mod:`codevanta.analysis._shared` so the xref scanner and the recursive-descent
+walker (:mod:`codevanta.analysis.recursive_cfg`) apply identical rules.
 """
 
 from __future__ import annotations
@@ -34,6 +38,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from codevanta.analysis._shared import (
+    direct_target,
+    dropped_targets_warning,
+    successors,
+    terminator_kind,
+    terminator_mnemonic,
+)
 from codevanta.core.disassembler import Disassembler, DisassemblyError
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo
@@ -46,43 +57,6 @@ __all__ = ["BasicBlock", "FunctionCFG", "build_cfg"]
 
 #: Widest instruction any supported architecture can decode (x86 allows 15).
 _MAX_INSTRUCTION_BYTES = 16
-
-#: Mnemonics that unconditionally end a block and never fall through.
-_RET_MNEMONICS = frozenset(
-    {"ret", "retn", "retf", "retq", "iret", "iretd", "iretq", "eret"}
-)
-
-#: Unconditional jump mnemonics per supported architecture (x86 / ARM / AArch64).
-_UNCONDITIONAL_JUMPS = frozenset({"jmp", "ljmp", "b", "br", "bx"})
-
-#: Conditional branch mnemonics that are not covered by a ``j``/``b.`` prefix.
-_CONDITIONAL_JUMP_MNEMONICS = frozenset(
-    {
-        # AArch64 compare-and-branch / test-and-branch
-        "cbz",
-        "cbnz",
-        "tbz",
-        "tbnz",
-        # ARM (A32/T32) conditional branches, written without the "b." infix
-        "beq",
-        "bne",
-        "bhs",
-        "blo",
-        "bcs",
-        "bcc",
-        "bmi",
-        "bpl",
-        "bvs",
-        "bvc",
-        "bhi",
-        "bls",
-        "bge",
-        "blt",
-        "bgt",
-        "ble",
-        "bal",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -126,7 +100,11 @@ class BasicBlock:
 
 @dataclass(frozen=True)
 class FunctionCFG:
-    """Control-flow graph for one function region produced by linear sweep.
+    """Control-flow graph for one function region.
+
+    Produced by the linear sweep in this module or by the recursive-descent
+    walker in :mod:`codevanta.analysis.recursive_cfg` (whose evidence carries
+    the ``cfg.recursive_descent`` source label).
 
     Attributes:
         function_address: Requested start address (also the entry block start).
@@ -267,11 +245,11 @@ def _split_blocks(
 
     leaders: set[int] = {addresses[0]}
     for index, instruction in enumerate(instructions):
-        if _terminator_kind(instruction.mnemonic) is None:
+        if terminator_kind(instruction.mnemonic) is None:
             continue
         if index + 1 < len(instructions):
             leaders.add(addresses[index + 1])
-        target = _direct_target(instruction.operands)
+        target = direct_target(instruction.operands)
         if target is not None and target in decoded:
             leaders.add(target)
 
@@ -293,8 +271,8 @@ def _split_blocks(
                 start=chunk[0].address,
                 end=chunk[-1].address + chunk[-1].size,
                 instructions=[instruction.to_dict() for instruction in chunk],
-                successors=_successors(chunk[-1], leaders, dropped),
-                terminator=_terminator_mnemonic(chunk[-1].mnemonic),
+                successors=successors(chunk[-1], leaders, dropped),
+                terminator=terminator_mnemonic(chunk[-1].mnemonic),
                 evidence=Evidence(
                     source="cfg.linear_sweep",
                     method="basic_block",
@@ -306,13 +284,9 @@ def _split_blocks(
         )
 
     warnings: list[str] = []
-    if dropped:  # bounded: only the first few unresolved edge targets are listed
-        unique = list(dict.fromkeys(dropped))
-        shown = ", ".join(f"0x{address:x}" for address in unique[:8])
-        extra = f" (+{len(unique) - 8} more)" if len(unique) > 8 else ""
-        warnings.append(
-            f"edge target(s) {shown}{extra} were not decoded; those edges are omitted"
-        )
+    warning = dropped_targets_warning(dropped)  # bounded: lists at most 8 targets
+    if warning:
+        warnings.append(warning)
 
     truncated = False
     if len(blocks) > max_blocks:
@@ -322,79 +296,6 @@ def _split_blocks(
             f"block limit reached (max_blocks={max_blocks}); later blocks were not reported"
         )
     return blocks, truncated, warnings
-
-
-def _successors(
-    last: IRInstruction,
-    block_starts: set[int],
-    dropped: list[int],
-) -> tuple[int, ...]:
-    """Compute the sorted, deduplicated successor set of a final instruction."""
-    kind = _terminator_kind(last.mnemonic)
-    candidates: list[int] = []
-
-    if kind in (None, "cond"):  # ordinary instructions and conditional jumps fall through
-        candidates.append(last.address + last.size)
-    if kind in ("jmp", "cond"):  # direct branch targets
-        target = _direct_target(last.operands)
-        if target is not None:
-            candidates.append(target)
-
-    successors: set[int] = set()
-    for address in candidates:
-        if address in block_starts:
-            successors.add(address)
-        else:
-            dropped.append(address)
-    return tuple(sorted(successors))
-
-
-def _terminator_kind(mnemonic: str) -> str | None:
-    """Classify a mnemonic as ``"ret"``, ``"jmp"``, ``"cond"`` or ``None``."""
-    name = (mnemonic or "").strip().lower()
-    if not name:
-        return None
-    if name in _RET_MNEMONICS or name.startswith("ret"):
-        return "ret"
-    if name in _UNCONDITIONAL_JUMPS:
-        return "jmp"
-    if name in _CONDITIONAL_JUMP_MNEMONICS or name.startswith("b."):
-        return "cond"
-    if name.startswith("j"):  # x86 Jcc family: je, jne, jle, jrcxz, ...
-        return "cond"
-    return None
-
-
-def _terminator_mnemonic(mnemonic: str) -> str | None:
-    """Return the normalized terminator mnemonic, or ``None`` for a fallthrough end."""
-    name = (mnemonic or "").strip().lower()
-    if not name or _terminator_kind(name) is None:
-        return None
-    return name
-
-
-def _direct_target(operands: str) -> int | None:
-    """Return the immediate branch target encoded in ``operands``, if any.
-
-    Only straight hexadecimal immediates are accepted (``jmp 0x401006``,
-    ``b.eq #0x401006``). Register and memory operands (``jmp rax``,
-    ``jmp qword ptr [rip + 0x20]``) are indirect and therefore unresolved.
-    """
-    text = (operands or "").strip()
-    if not text:
-        return None
-    lowered = text.lower()
-    if any(marker in lowered for marker in ("[", "]", "ptr", ":")):
-        return None
-    if "," in text:
-        return None
-    token = text.lstrip("#").strip().lower()
-    if not token.startswith("0x"):
-        return None
-    try:
-        return int(token, 16)
-    except ValueError:
-        return None
 
 
 def _function_name_for(info: BinaryInfo, start: int) -> str | None:
