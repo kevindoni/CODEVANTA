@@ -89,6 +89,10 @@ authoritative per-agent record. `.mailmap` keeps the maintainer's identities
 collapsed in `git shortlog`, which is why local counts and the GitHub contributor
 graph disagree.
 
+To make the agent appear in the graph itself, give it its own GitHub account and
+commit through `scripts/agent_commit.py`; [docs/attribution.md](docs/attribution.md)
+walks through the account, the noreply address, the helper and the check.
+
 ## Pull requests
 
 `main` is protected: a pull request is required and the CI checks

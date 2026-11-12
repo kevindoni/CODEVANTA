@@ -58,6 +58,10 @@ not legal persons and hold no copyright in this repository.
   pull request carried a co-author trailer.
 * This file, not the contributor graph, is the authoritative record of which
   agents worked on what.
+* To make an agent appear in the graph itself, see
+  [docs/attribution.md](docs/attribution.md): the agent needs its own GitHub
+  account, and its commits must carry that account's verified noreply address as
+  the author email (`scripts/agent_commit.py` does this).
 
 ## Individual contributors
 
