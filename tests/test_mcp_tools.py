@@ -62,7 +62,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
     assert report["disassembly"]["instruction_count"] == 3
 
 
-def test_server_lists_fifteen_tools() -> None:
+def test_server_lists_sixteen_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
     assert names == [
@@ -71,6 +71,7 @@ def test_server_lists_fifteen_tools() -> None:
         "codevanta_cfg",
         "codevanta_diff",
         "codevanta_disasm",
+        "codevanta_entropy",
         "codevanta_function_hash",
         "codevanta_functions",
         "codevanta_info",
@@ -82,7 +83,6 @@ def test_server_lists_fifteen_tools() -> None:
         "codevanta_struct",
         "codevanta_xrefs",
     ]
-    assert len(names) == 15
 
 
 def _payload(result: object) -> dict:
@@ -1129,5 +1129,62 @@ def test_run_passes_the_normalised_host_with_hardening(
     settings = call["transport_security"]
     assert isinstance(settings, TransportSecuritySettings)
     assert settings.enable_dns_rebinding_protection is True
+
+
+def test_entropy_reports_sections_with_evidence(elf64_text_path: Path) -> None:
+    payload = tools.entropy(str(elf64_text_path))
+
+    assert payload["threshold"] == 7.2
+    assert payload["section_count"] == len(payload["sections"]) >= 1
+    text = next(s for s in payload["sections"] if s["name"] == ".text")
+    assert text["entropy"] is not None
+    assert text["evidence"]["source"] == "entropy.section"
+    assert isinstance(payload["packed_candidates"], list)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"threshold": 0.0}, "threshold"),
+        ({"threshold": 8.5}, "threshold"),
+        ({"threshold": -1.0}, "threshold"),
+        ({"max_sample_bytes": 0}, "max_sample_bytes"),
+        ({"max_sample_bytes": -1}, "max_sample_bytes"),
+    ],
+)
+def test_entropy_rejects_out_of_range_bounds(
+    elf64_text_path: Path, kwargs: dict[str, object], match: str
+) -> None:
+    with pytest.raises(AnalysisError, match=match):
+        tools.entropy(str(elf64_text_path), **kwargs)  # type: ignore[arg-type]
+
+
+def test_analyze_include_flags_add_phase2_sections(call_elf_path: Path) -> None:
+    base = tools.analyze(str(call_elf_path))
+    assert "xrefs" not in base
+    assert "cfg" not in base
+    assert "callgraph" not in base
+
+    payload = tools.analyze(str(call_elf_path), include_xrefs=True, include_cfg=True)
+    assert payload["xrefs"]["count"] >= 1  # the fixture calls 0x401010
+    assert "blocks" in payload["cfg"] or "block_count" in payload["cfg"]
+    assert "callgraph" not in payload  # still opt-in per flag
+
+
+def test_server_call_tool_entropy_and_analyze_flags(elf64_text_path: Path) -> None:
+    result = asyncio.run(
+        build_server().call_tool("codevanta_entropy", {"path": str(elf64_text_path)})
+    )
+    payload = _payload(result)
+    assert payload["section_count"] >= 1
+
+    result = asyncio.run(
+        build_server().call_tool(
+            "codevanta_analyze",
+            {"path": str(elf64_text_path), "include_xrefs": True},
+        )
+    )
+    payload = _payload(result)
+    assert "xrefs" in payload
 
 
