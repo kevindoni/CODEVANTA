@@ -19,7 +19,7 @@ from codevanta.analysis.callgraph import (
     CallGraph,
     build_call_graph,
 )
-from codevanta.analysis.cfg import FunctionCFG, build_cfg
+from codevanta.analysis.cfg import FunctionCFG, build_cfg, build_recursive_cfg
 from codevanta.analysis.graph_export import (
     DEFAULT_MAX_EDGES as EXPORT_MAX_EDGES,
 )
@@ -325,6 +325,10 @@ def _print_cfg(graph: FunctionCFG) -> None:
         console.print("[dim]graph truncated; raise --max-instructions/--max-blocks for more.[/]")
 
 
+#: Traversal strategies accepted by ``codevanta cfg``.
+CfgTraversal = Literal["linear", "recursive"]
+
+
 @app.command()
 def cfg(
     path: Path,
@@ -335,23 +339,42 @@ def cfg(
         str | None, typer.Option("--function", "-f", help="Function name to graph")
     ] = None,
     max_instructions: Annotated[
-        int, typer.Option("--max-instructions", help="Instruction budget for the linear sweep")
+        int, typer.Option("--max-instructions", help="Instruction budget for the traversal")
     ] = 2000,
     max_blocks: Annotated[
         int, typer.Option("--max-blocks", help="Maximum basic blocks reported")
     ] = 500,
+    traversal: Annotated[
+        CfgTraversal,
+        typer.Option(
+            "--traversal",
+            help=(
+                "Traversal strategy: linear (contiguous linear sweep, default) or "
+                "recursive (follow jump targets from the entry block only)"
+            ),
+        ),
+    ] = "linear",
     json_output: Annotated[
         bool, typer.Option("--json", help="Emit the JSON result instead of a table")
     ] = False,
 ) -> None:
-    """Build a control-flow graph for the entry point, an address, or a function."""
+    """Build a control-flow graph for the entry point, an address, or a function.
+
+    The --traversal option selects linear (default: contiguous window sweep) or
+    recursive (control-flow driven: only code reachable from the start address is
+    graphed). Both return the same FunctionCFG structure (blocks, successors,
+    evidence) and therefore the same table, --json payload and warnings; linear
+    blocks partition the decoded window while recursive blocks are disjoint but
+    limited to reachable code.
+    """
     loaded = _load(path)
     try:
         start = resolve_target(loaded, address, function)
     except AnalysisError as exc:
         _fail(str(exc), 4)
+    builder = build_recursive_cfg if traversal == "recursive" else build_cfg
     try:
-        graph = build_cfg(
+        graph = builder(
             path,
             loaded,
             start,

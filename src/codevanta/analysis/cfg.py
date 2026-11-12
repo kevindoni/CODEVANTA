@@ -26,10 +26,22 @@ flow. Every block and the function carry :class:`Evidence` stating exactly how
 they were produced, and the target binary is only ever read, never executed.
 Indirect branches (``jmp rax``, ``jmp qword ptr [...]``, jump tables) are not
 resolved in phase 2, so their blocks end with an unresolved terminator.
+
+:func:`build_recursive_cfg` offers the same block model from a different
+traversal: instead of sweeping a contiguous window it *follows* control flow
+from ``start`` with a worklist of block starts and a visited set, so
+unreachable bytes (padding, alignment tables, data embedded in ``.text``) are
+never reported as code. ``build_cfg`` stays the flat-window baseline.
+
+A traversal can decode one block *past* a leader it only discovers later (a
+backward ``jmp`` into the middle of an already decoded run). A post-traversal
+split pass therefore cuts every block at the leaders inside it, so the reported
+ranges are disjoint and every instruction address is reported exactly once.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,10 +54,16 @@ from codevanta.evidence.confidence import Confidence
 from codevanta.evidence.models import Evidence
 from codevanta.ir.instruction import IRInstruction
 
-__all__ = ["BasicBlock", "FunctionCFG", "build_cfg"]
+__all__ = ["BasicBlock", "FunctionCFG", "build_cfg", "build_recursive_cfg"]
 
 #: Widest instruction any supported architecture can decode (x86 allows 15).
 _MAX_INSTRUCTION_BYTES = 16
+
+#: Decode window for a single recursively traversed block. A block normally
+#: ends at a terminator long before this, so the cap only bounds pathological
+#: runs of unterminated instructions (such a run is simply split into more
+#: blocks at the fallthrough, which yields the same successors).
+_MAX_BLOCK_INSTRUCTIONS = 256
 
 #: Mnemonics that unconditionally end a block and never fall through.
 _RET_MNEMONICS = frozenset(
@@ -126,14 +144,16 @@ class BasicBlock:
 
 @dataclass(frozen=True)
 class FunctionCFG:
-    """Control-flow graph for one function region produced by linear sweep.
+    """Control-flow graph for one function region.
 
     Attributes:
         function_address: Requested start address (also the entry block start).
         function_name: Name from function discovery when a candidate starts at
             ``function_address``, else ``None``.
-        blocks: Blocks in ascending address order.
-        instruction_count: Total number of decoded instructions.
+        blocks: Blocks in ascending address order with disjoint ranges.
+        instruction_count: Total number of decoded instructions; for
+            :func:`build_recursive_cfg` this counts *unique* instruction
+            addresses across the disjoint blocks.
         truncated: ``True`` when instruction decoding or block reporting was
             cut short by a limit, so the graph may be incomplete.
         evidence: How the graph as a whole was derived.
@@ -251,6 +271,438 @@ def build_cfg(
         truncated=truncated,
         evidence=evidence,
         warnings=tuple(warnings),
+    )
+
+
+def build_recursive_cfg(
+    path: str | Path,
+    info: BinaryInfo,
+    start: int,
+    max_instructions: int = 2000,
+    max_blocks: int = 500,
+) -> FunctionCFG:
+    """Build a CFG by *following* control flow from ``start`` (recursive traversal).
+
+    Unlike :func:`build_cfg` this never sweeps a contiguous window: a worklist
+    of block starts plus a visited set drive the traversal, so only code
+    reachable from ``start`` becomes a block.
+
+    Traversal rules:
+
+    1. **Worklist.** ``start`` is the first leader. Each block is decoded from
+       its leader until a terminator mnemonic, the instruction budget, an
+       already-visited leader (the block ends just before it), or the end of an
+       executable section.
+    2. **Successors.** A conditional jump leads to its fallthrough *and* its
+       direct target, an unconditional jump to its direct target only (no
+       fallthrough), a return to nothing, and any other instruction to its
+       fallthrough. Only targets inside an executable, file-backed section are
+       kept.
+    3. **Calls stay flat.** ``call`` is an ordinary instruction: the return
+       address is the fallthrough and the callee is *not* followed.
+    4. **Bounded.** ``max_instructions`` caps decoded instructions and
+       ``max_blocks`` caps reported blocks; the visited set plus the worklist
+       make cycles terminate. Hitting either limit marks the graph
+       ``truncated``.
+    5. **Disjoint blocks.** Traversal hypotheses can overlap: a block decoded
+       before a backward ``jmp`` is discovered runs past that target. A post-
+       traversal split pass cuts every block at the leaders inside it (a split
+       leading segment falls through to the split address and has no
+       terminator, the trailing segment keeps the original terminator and
+       successors), then keeps the most complete block per start address. The
+       reported ranges therefore never overlap and ``instruction_count`` counts
+       unique instruction addresses.
+
+    Args:
+        path: File the bytes are read from (read-only; never executed).
+        info: Loaded binary metadata used for address mapping and decoding.
+        start: Virtual address of the first instruction; must be inside an
+            executable section.
+        max_instructions: Total instruction budget (1 ..
+            ``MAX_DISASSEMBLY_COUNT``).
+        max_blocks: Maximum number of blocks to report (1 ..
+            ``MAX_DISASSEMBLY_COUNT``).
+
+    Returns:
+        The reconstructed :class:`FunctionCFG` with blocks in ascending
+        address order.
+
+    Raises:
+        AnalysisError: When ``start`` is not executable code, when a limit is
+            out of range, or when the architecture cannot be disassembled.
+    """
+    _validate_limits(max_instructions, max_blocks)
+
+    section = info.section_for_va(start)
+    if section is None or not section.is_executable:
+        raise AnalysisError(f"address 0x{start:x} is not inside an executable section")
+
+    try:
+        disassembler = Disassembler(info.architecture, info.bitness, info.endianness)
+    except DisassemblyError as exc:
+        raise AnalysisError(f"cannot disassemble 0x{start:x}: {exc}") from exc
+
+    # Leaders already queued are block starts: this set *is* the visited set.
+    leaders: set[int] = {start}
+    worklist: deque[int] = deque([start])
+    decoded: dict[int, _Segment] = {}
+    remaining = max_instructions
+    indirect_unresolved = 0
+    budget_exhausted = False
+    dropped: list[int] = []
+    warnings: list[str] = []
+
+    while worklist and remaining > 0 and len(decoded) < max_blocks:
+        leader = worklist.popleft()
+        if leader in decoded:  # pragma: no cover - a leader is queued once
+            continue
+        chunk, reason = _decode_block(path, info, disassembler, leader, leaders, remaining)
+        if not chunk:
+            warnings.append(f"no decodable instruction at block start 0x{leader:x}")
+            continue
+        if reason == "budget":
+            budget_exhausted = True
+        remaining -= len(chunk)
+        last = chunk[-1]
+        successors, unresolved = _recursive_successors(info, last, dropped)
+        indirect_unresolved += int(unresolved)
+        decoded[leader] = _Segment(
+            instructions=tuple(chunk),
+            successors=successors,
+            terminator=_terminator_mnemonic(last.mnemonic),
+        )
+        for successor in successors:  # sorted, so queue order stays deterministic
+            if successor not in leaders:
+                leaders.add(successor)
+                worklist.append(successor)
+
+    # Overlapping traversal hypotheses become disjoint blocks here.
+    segments = _split_at_leaders(list(decoded.values()))
+    block_limit_from_split = len(segments) > max_blocks
+    if block_limit_from_split:
+        segments = segments[:max_blocks]
+    blocks = [_to_block(segment) for segment in segments]
+    # Disjoint ranges mean each instruction address is reported exactly once.
+    instruction_count = len(
+        {instruction.address for segment in segments for instruction in segment.instructions}
+    )
+    if worklist and not remaining:
+        budget_exhausted = True
+    block_limit_reached = bool(worklist) and len(decoded) >= max_blocks
+    truncated = budget_exhausted or bool(worklist) or block_limit_from_split
+
+    if budget_exhausted:
+        warnings.append(
+            f"instruction limit reached (max_instructions={max_instructions}); "
+            "the graph may be incomplete"
+        )
+    if block_limit_reached:
+        warnings.append(
+            f"block limit reached (max_blocks={max_blocks}); {len(worklist)} reached "
+            "block(s) were not decoded and the graph may be incomplete"
+        )
+    if block_limit_from_split:
+        warnings.append(
+            f"block limit reached (max_blocks={max_blocks}); splitting blocks at "
+            "interior leaders produced more blocks and later ones were not reported"
+        )
+    if dropped:
+        warnings.append(
+            f"edge target(s) {_address_sample(dropped)} are outside any executable "
+            "section; those edges are omitted"
+        )
+    missing = sorted(
+        {address for block in blocks for address in block.successors}
+        - {block.start for block in blocks}
+    )
+    if missing and not truncated:
+        warnings.append(
+            f"edge(s) to {_address_sample(missing)} have no reported block; those edges are kept"
+        )
+    if indirect_unresolved:
+        warnings.append(
+            f"{indirect_unresolved} indirect branch target(s) were not resolved "
+            "(register/memory operands) and those edges are omitted"
+        )
+
+    evidence = Evidence(
+        source="cfg.recursive_traversal",
+        method="recursive_traversal",
+        confidence=Confidence.MEDIUM,
+        address=start,
+        detail=(
+            f"recursive traversal from 0x{start:x} followed control flow into {len(blocks)} "
+            f"block(s) / {instruction_count} unique instruction(s); bounded by "
+            f"max_instructions={max_instructions} and max_blocks={max_blocks}; "
+            f"{indirect_unresolved} indirect target(s) unresolved and call targets not "
+            "followed; blocks split at interior leaders so reported ranges are disjoint; "
+            "boundaries are heuristic"
+        ),
+    )
+    return FunctionCFG(
+        function_address=start,
+        function_name=_function_name_for(info, start),
+        blocks=blocks,
+        instruction_count=instruction_count,
+        truncated=truncated,
+        evidence=evidence,
+        warnings=tuple(warnings),
+    )
+
+
+def _validate_limits(max_instructions: int, max_blocks: int) -> None:
+    """Reject out-of-range traversal limits."""
+    if max_instructions < 1:
+        raise AnalysisError("max_instructions must be >= 1")
+    if max_instructions > MAX_DISASSEMBLY_COUNT:
+        raise AnalysisError(f"max_instructions too large (limit {MAX_DISASSEMBLY_COUNT})")
+    if max_blocks < 1:
+        raise AnalysisError("max_blocks must be >= 1")
+    if max_blocks > MAX_DISASSEMBLY_COUNT:
+        raise AnalysisError(f"max_blocks too large (limit {MAX_DISASSEMBLY_COUNT})")
+
+
+def _decode_block(
+    path: str | Path,
+    info: BinaryInfo,
+    disassembler: Disassembler,
+    leader: int,
+    known_starts: set[int],
+    budget: int,
+) -> tuple[list[IRInstruction], str]:
+    """Decode the single basic block that begins at ``leader``.
+
+    Args:
+        path: File the bytes are read from (read-only).
+        info: Loaded binary metadata.
+        disassembler: Decoder already bound to the binary's architecture.
+        leader: Block start; assumed to be executable and file-backed.
+        known_starts: Leaders already queued, i.e. addresses that must begin a
+            block. Decoding stops *before* re-entering one of them.
+        budget: Instructions still available in the overall budget.
+
+    Returns:
+        ``(instructions, reason)`` where ``reason`` is ``"terminator"``,
+        ``"leader"``, ``"budget"``, ``"section"``, ``"window"`` (the per-block
+        decode window filled up, so the block continues at the fallthrough) or
+        ``"empty"``.
+    """
+    if budget <= 0:
+        return [], "budget"
+    window = min(budget, _MAX_BLOCK_INSTRUCTIONS)
+    try:
+        code = read_code(path, info, leader, window * _MAX_INSTRUCTION_BYTES)
+    except AnalysisError:
+        return [], "empty"
+    try:
+        result = disassembler.disassemble(code, base_address=leader, max_instructions=window)
+    except DisassemblyError as exc:  # pragma: no cover - decoder is already validated
+        raise AnalysisError(f"cannot disassemble 0x{leader:x}: {exc}") from exc
+
+    chunk: list[IRInstruction] = []
+    for instruction in result.instructions:
+        if len(chunk) >= budget:
+            return chunk, "budget"
+        if chunk and instruction.address in known_starts:
+            return chunk, "leader"
+        chunk.append(instruction)
+        if _terminator_kind(instruction.mnemonic) is not None:
+            return chunk, "terminator"
+        if not _is_executable_address(info, instruction.address + instruction.size):
+            return chunk, "section"
+    return chunk, "window" if chunk else "empty"
+
+
+def _recursive_successors(
+    info: BinaryInfo,
+    last: IRInstruction,
+    dropped: list[int],
+) -> tuple[tuple[int, ...], bool]:
+    """Return ``(successors, indirect_unresolved)`` for a block's final instruction.
+
+    Conditional jumps yield fallthrough *and* target, unconditional jumps only
+    their direct target (never a fallthrough), returns nothing, and ordinary
+    instructions (calls included) only the fallthrough. Targets outside an
+    executable, file-backed section are discarded and recorded in ``dropped``.
+    """
+    kind = _terminator_kind(last.mnemonic)
+    candidates: list[int] = []
+    unresolved = False
+
+    if kind in (None, "cond"):  # ordinary instructions and conditional jumps fall through
+        candidates.append(last.address + last.size)
+    if kind in ("jmp", "cond"):  # direct branch targets only
+        target = _direct_target(last.operands)
+        if target is None:
+            unresolved = True
+        else:
+            candidates.append(target)
+
+    kept: set[int] = set()
+    for address in candidates:
+        if _is_executable_address(info, address):
+            kept.add(address)
+        else:
+            dropped.append(address)
+    return tuple(sorted(kept)), unresolved
+
+
+@dataclass(frozen=True)
+class _Segment:
+    """One decoded instruction run with the edges the traversal gave it.
+
+    Internal to :func:`build_recursive_cfg`: the traversal records raw runs and
+    only turns them into :class:`BasicBlock` objects after the split pass, so the
+    split can discard instructions without touching serialized data.
+    """
+
+    instructions: tuple[IRInstruction, ...]
+    successors: tuple[int, ...]
+    terminator: str | None
+    split: bool = False
+
+    @property
+    def start(self) -> int:
+        """Virtual address of the first instruction in the run."""
+        return self.instructions[0].address
+
+    @property
+    def end(self) -> int:
+        """Virtual address just past the last instruction (exclusive)."""
+        last = self.instructions[-1]
+        return last.address + last.size
+
+
+def _split_at_leaders(decoded: list[_Segment]) -> list[_Segment]:
+    """Turn traversed runs into blocks with disjoint address ranges.
+
+    Traversal is driven by a worklist, so a run decoded early can reach past a
+    leader that is only discovered later (a backward ``jmp`` into an already
+    decoded region); two reported blocks would then claim the same instruction
+    addresses. This pass removes that overlap:
+
+    1. **Leaders.** Every traversed block start is a leader.
+    2. **Split.** Each run is cut at every leader that appears strictly inside
+       it. The leading piece of such a cut falls through to the split address
+       (its only successor) and reports no terminator; the trailing piece keeps
+       the original terminator and successor set.
+    3. **Dedupe.** Pieces sharing a start address collapse to the most complete
+       one (most instructions, then farthest end, then most successors), which
+       is deterministic because the input is ordered by start first.
+    4. **Order and clip.** The result is sorted by start and clipped so ranges
+       never overlap.
+
+    Args:
+        decoded: Runs exactly as the traversal decoded them, in any order.
+
+    Returns:
+        Disjoint segments in ascending address order.
+    """
+    ordered = sorted(decoded, key=lambda segment: segment.start)
+    leaders = {segment.start for segment in ordered}
+    candidates = [piece for segment in ordered for piece in _cut_segment(segment, leaders)]
+    return _clip_overlaps(_most_complete(candidates))
+
+
+def _cut_segment(segment: _Segment, leaders: set[int]) -> list[_Segment]:
+    """Cut one run at every leader that is strictly inside it."""
+    instructions = segment.instructions
+    cuts = [
+        index
+        for index, instruction in enumerate(instructions)
+        if index > 0 and instruction.address in leaders
+    ]
+    if not cuts:
+        return [segment]
+
+    bounds = [0, *cuts, len(instructions)]
+    pieces: list[_Segment] = []
+    for position in range(len(bounds) - 1):
+        piece = instructions[bounds[position] : bounds[position + 1]]
+        trailing = position + 2 >= len(bounds)
+        pieces.append(
+            _Segment(
+                instructions=piece,
+                # Only the tail keeps the original edges; a cut piece simply
+                # falls through to the split address.
+                successors=segment.successors
+                if trailing
+                else (instructions[bounds[position + 1]].address,),
+                terminator=segment.terminator if trailing else None,
+                split=True,
+            )
+        )
+    return pieces
+
+
+def _most_complete(segments: list[_Segment]) -> list[_Segment]:
+    """Keep the most complete segment per start address, ordered by start."""
+    best: dict[int, _Segment] = {}
+    for segment in segments:  # deterministic input order breaks exact ties
+        current = best.get(segment.start)
+        if current is None or _completeness(segment) > _completeness(current):
+            best[segment.start] = segment
+    return sorted(best.values(), key=lambda segment: segment.start)
+
+
+def _completeness(segment: _Segment) -> tuple[int, int, int]:
+    """Ranking key used to choose between segments that share a start address."""
+    return (len(segment.instructions), segment.end, len(segment.successors))
+
+
+def _clip_overlaps(segments: list[_Segment]) -> list[_Segment]:
+    """Trim a run whose instructions still reach into the next kept block.
+
+    The split already guarantees disjointness whenever leaders land on
+    instruction boundaries of the containing run. Overlapping decodes of the
+    same bytes can disagree about boundaries, so any instruction that would
+    cross the next block start is dropped here and the run simply falls through
+    to it. A run is never emptied: an undecodable first instruction is kept as
+    is and reported through the traversal's warnings.
+    """
+    clipped: list[_Segment] = []
+    for index, segment in enumerate(segments):
+        if index + 1 >= len(segments):
+            clipped.append(segment)
+            continue
+        next_start = segments[index + 1].start
+        kept = tuple(
+            instruction
+            for instruction in segment.instructions
+            if instruction.address + instruction.size <= next_start
+        )
+        if not kept or len(kept) == len(segment.instructions):
+            clipped.append(segment)
+            continue
+        clipped.append(
+            _Segment(
+                instructions=kept,
+                successors=(next_start,),
+                terminator=None,
+                split=True,
+            )
+        )
+    return clipped
+
+
+def _to_block(segment: _Segment) -> BasicBlock:
+    """Serialize one disjoint segment into a :class:`BasicBlock`."""
+    detail = f"{len(segment.instructions)} instructions reached by recursive traversal"
+    if segment.split:
+        detail += " and split at interior leaders"
+    return BasicBlock(
+        start=segment.start,
+        end=segment.end,
+        instructions=[instruction.to_dict() for instruction in segment.instructions],
+        successors=segment.successors,
+        terminator=segment.terminator,
+        evidence=Evidence(
+            source="cfg.recursive_traversal",
+            method="basic_block",
+            confidence=Confidence.MEDIUM,
+            address=segment.start,
+            detail=detail,
+        ),
     )
 
 
@@ -395,6 +847,23 @@ def _direct_target(operands: str) -> int | None:
         return int(token, 16)
     except ValueError:
         return None
+
+
+def _is_executable_address(info: BinaryInfo, address: int) -> bool:
+    """Return ``True`` when ``address`` is executable *and* backed by file bytes."""
+    if address < 0:
+        return False
+    section = info.section_for_va(address)
+    if section is None or not section.is_executable:
+        return False
+    return info.va_to_offset(address) is not None
+
+
+def _address_sample(addresses: list[int]) -> str:
+    """Format at most eight addresses for a warning, noting how many were cut."""
+    unique = list(dict.fromkeys(addresses))
+    shown = ", ".join(f"0x{address:x}" for address in unique[:8])
+    return f"{shown} (+{len(unique) - 8} more)" if len(unique) > 8 else shown
 
 
 def _function_name_for(info: BinaryInfo, start: int) -> str | None:

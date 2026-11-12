@@ -59,7 +59,11 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   other slots become `call_indirect`, and register/indexed calls that cannot be
   resolved are skipped and counted (`indirect_skipped`).
 - **Control-flow graphs** (`analysis/cfg.py`) — basic blocks and successor edges
-  for one region, built by linear sweep with leader/terminator rules.
+  for one region. The default is a linear sweep with leader/terminator rules;
+  `build_recursive_cfg` (and `codevanta cfg --traversal recursive`) instead walks
+  control flow from the start address with a worklist and a visited set, so
+  blocks come from real branch targets and unreachable padding after a `ret` or
+  `jmp` is excluded. Indirect targets stay unresolved either way.
 - **Call graph** (`analysis/callgraph.py`) — `call`, `call_import`, and
   `call_indirect` cross-references aggregated into nodes and edges. Import slots
   become `import` nodes labelled from the import table; unresolved callees stay
@@ -79,17 +83,20 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
 - **MCP tools** — `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`,
   `codevanta_session_save`, `codevanta_session_list`, alongside the five phase 1
   tools (ten in total).
-- **CLI:** `codevanta xrefs`, `codevanta cfg`, `codevanta callgraph`,
+- **CLI:** `codevanta xrefs`, `codevanta cfg` (with
+  `--traversal linear|recursive`, default `linear`), `codevanta callgraph`,
   `codevanta analyze --callgraph`, plus the
   `session save|list|show|annotate|notes` subcommands.
 
-Phase 2 is deliberately narrow: linear sweep only, direct branch targets plus
+Phase 2 is deliberately narrow: linear sweep by default with an additional
+bounded recursive traversal for CFGs, direct branch targets plus
 absolute/RIP-relative pointer slots only, call graph edges from `call` /
-`call_import` / `call_indirect` only, no register-target resolution, no recursive
-traversal, no interactive graph viewer (the HTML/SVG export is a static file),
-and no debugger yet. See [docs/phase2.md](docs/phase2.md),
-[docs/phase2b.md](docs/phase2b.md), [docs/phase2c.md](docs/phase2c.md), and
-[docs/phase2d.md](docs/phase2d.md) for scope, confidence semantics, and
+`call_import` / `call_indirect` only, no indirect target resolution, no following
+calls into callees, no cross-function analysis, no interactive graph viewer (the
+HTML/SVG export is a static file), and no debugger yet. See
+[docs/phase2.md](docs/phase2.md), [docs/phase2b.md](docs/phase2b.md),
+[docs/phase2c.md](docs/phase2c.md), [docs/phase2d.md](docs/phase2d.md), and
+[docs/phase2e.md](docs/phase2e.md) for scope, confidence semantics, and
 limitations.
 
 ## Installation
@@ -120,6 +127,7 @@ codevanta analyze   samples\elf64_text.bin --output samples\report.json
 # Phase 2
 codevanta xrefs     C:\Windows\System32\notepad.exe --limit 40
 codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000
+codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000 --traversal recursive
 codevanta callgraph C:\Windows\System32\notepad.exe --format dot -o callgraph.dot
 codevanta callgraph C:\Windows\System32\notepad.exe --format graphml -o callgraph.graphml
 codevanta callgraph C:\Windows\System32\notepad.exe --format html -o callgraph.html
@@ -142,7 +150,9 @@ boundaries come from mnemonic heuristics), and the call graph is `medium`
 (calls are decoded, but caller attribution is a nearest-candidate heuristic).
 `codevanta callgraph` defaults to `--format json` and can emit `dot`, `graphml`,
 or `html` (one self-contained file with an inline SVG view, opened straight from
-disk); `codevanta cfg` defaults to the entry point; sessions default to
+disk); `codevanta cfg` defaults to the entry point and to `--traversal linear`,
+and `--traversal recursive` reports the same shape with evidence source
+`cfg.recursive_traversal`; sessions default to
 `$env:CODEVANTA_DB` or `~/.codevanta/sessions.db`, and `session annotate` accepts
 decimal or `0x` hex addresses.
 
@@ -201,7 +211,7 @@ src/codevanta/
 ├── ir/          # backend-neutral instruction model + adapter registry
 ├── mcp_server/  # MCP tools and stdio server for coding agents
 ├── setup/       # client config planning, apply, verify (claude/cursor/cline/vscode)
-├── analysis/    # cross-references, call graph, linear-sweep CFG, DOT/GraphML/HTML export (phase 2)
+├── analysis/    # cross-references, call graph, CFG (linear sweep + recursive traversal), graph/HTML export (phase 2)
 ├── api/         # HTTP API (phase 2+)
 ├── cli/         # Typer command line surface
 ├── storage/     # SQLite session storage and annotations (phase 2)
@@ -226,6 +236,7 @@ ruff check src tests
 - [Phase 2b — call graphs, graph export, session annotations](docs/phase2b.md)
 - [Phase 2c — import/indirect calls, embedded call graphs, MCP call graph](docs/phase2c.md)
 - [Phase 2d — offline HTML/SVG graph viewer](docs/phase2d.md)
+- [Phase 2e — recursive CFG traversal](docs/phase2e.md)
 
 ## Roadmap
 
