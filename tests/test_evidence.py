@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from evidence.confidence import Confidence
-from evidence.models import Evidence
-from evidence.provenance import Provenance
+from codevanta.evidence.confidence import Confidence
+from codevanta.evidence.models import Evidence
+from codevanta.evidence.provenance import Provenance
 
 
 def test_confidence_scores_are_ordered() -> None:

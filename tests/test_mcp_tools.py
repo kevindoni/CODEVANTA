@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from core.report import AnalysisError
-from mcp_server import tools
-from mcp_server.server import build_server
+from codevanta.core.report import AnalysisError
+from codevanta.mcp_server import tools
+from codevanta.mcp_server.server import build_server
 
 
 def test_binary_info_on_elf(elf64_path: Path) -> None:

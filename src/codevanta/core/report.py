@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from evidence.provenance import Provenance
+from codevanta.evidence.provenance import Provenance
 
 from .disassembler import Disassembler, DisassemblyError, DisassemblyResult
 from .functions import discover_functions

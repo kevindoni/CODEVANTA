@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from evidence.confidence import Confidence
-from evidence.models import Evidence
+from codevanta.evidence.confidence import Confidence
+from codevanta.evidence.models import Evidence
 
 from .loader import BinaryInfo
 

@@ -15,8 +15,8 @@ from typing import Any
 
 import lief
 
-from evidence.confidence import Confidence
-from evidence.models import Evidence
+from codevanta.evidence.confidence import Confidence
+from codevanta.evidence.models import Evidence
 
 try:  # keep expected parser warnings (e.g. section-only ELF) out of stderr
     lief.logging.set_level(lief.logging.LEVEL.ERROR)

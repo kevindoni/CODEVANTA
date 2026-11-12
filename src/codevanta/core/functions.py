@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from evidence.confidence import Confidence
-from evidence.models import Evidence
+from codevanta.evidence.confidence import Confidence
+from codevanta.evidence.models import Evidence
 
 from .loader import BinaryInfo
 

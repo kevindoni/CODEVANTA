@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from core.loader import BinaryLoader, BinaryLoadError
+from codevanta.core.loader import BinaryLoader, BinaryLoadError
 
 
 def test_load_minimal_elf64(elf64_path: Path) -> None:

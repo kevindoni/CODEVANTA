@@ -1,0 +1,15 @@
+include LICENSE
+include README.md
+include CHANGELOG.md
+include requirements.txt
+include pyproject.toml
+
+graft docs
+graft scripts
+graft tests
+
+prune **/__pycache__
+prune .pytest_cache
+prune .ruff_cache
+global-exclude *.py[cod]
+global-exclude report_*.json

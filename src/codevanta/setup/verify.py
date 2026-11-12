@@ -29,7 +29,7 @@ def verify_entry(adapter: ClientAdapter, ctx: SetupContext, scope: str) -> dict[
 
 def verify_tools() -> dict[str, Any]:
     """Run one tool call on a synthetic ELF to prove the tool layer works."""
-    from mcp_server import tools
+    from codevanta.mcp_server import tools
 
     with tempfile.TemporaryDirectory() as tmp:
         sample = Path(tmp) / "sample_elf64.bin"

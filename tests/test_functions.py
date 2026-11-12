@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from core.functions import discover_functions
-from core.loader import BinaryInfo, ExportInfo, SymbolInfo
+from codevanta.core.functions import discover_functions
+from codevanta.core.loader import BinaryInfo, ExportInfo, SymbolInfo
 
 
 def _make_info(**overrides: object) -> BinaryInfo:

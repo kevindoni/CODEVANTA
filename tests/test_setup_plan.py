@@ -8,9 +8,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from cli.main import app
-from setup.apply import apply_plan
-from setup.clients import (
+from codevanta.cli.main import app
+from codevanta.setup.apply import apply_plan
+from codevanta.setup.clients import (
     ClaudeCodeClient,
     ClineClient,
     CursorClient,

@@ -12,10 +12,10 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-from core.functions import discover_functions
-from core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
-from core.report import AnalysisError, build_report, disassemble_region, resolve_target
-from core.strings import StringExtractor
+from codevanta.core.functions import discover_functions
+from codevanta.core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
+from codevanta.core.report import AnalysisError, build_report, disassemble_region, resolve_target
+from codevanta.core.strings import StringExtractor
 
 app = typer.Typer(
     name="codevanta",
@@ -195,7 +195,7 @@ app.add_typer(mcp_app, name="mcp")
 def mcp_serve() -> None:
     """Serve CODEVANTA tools to coding agents over MCP (stdio)."""
     try:
-        from mcp_server.server import run as run_server
+        from codevanta.mcp_server.server import run as run_server
     except ImportError as exc:  # pragma: no cover - dependency guard
         console.print(f"[bold red]error:[/] MCP support needs the 'mcp' package: {exc}")
         raise typer.Exit(code=2) from exc
@@ -213,7 +213,7 @@ def _render_plan(plan) -> None:
 
 
 def _adapters_for(ctx, names: list[str] | None):
-    from setup.clients import SetupError, detected_clients, get_client
+    from codevanta.setup.clients import SetupError, detected_clients, get_client
 
     try:
         if names:
@@ -239,9 +239,9 @@ def setup(
     verify: Annotated[bool, typer.Option("--verify", help="Verify after applying")] = False,
 ) -> None:
     """Register CODEVANTA as an MCP server for coding agents."""
-    from setup.apply import apply_plan
-    from setup.clients import SetupContext, SetupError
-    from setup.verify import verify_entry, verify_tools
+    from codevanta.setup.apply import apply_plan
+    from codevanta.setup.clients import SetupContext, SetupError
+    from codevanta.setup.verify import verify_entry, verify_tools
 
     ctx = SetupContext.from_environment(project)
     adapters = _adapters_for(ctx, client)
@@ -289,8 +289,8 @@ def uninstall(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Apply without confirmation")] = False,
 ) -> None:
     """Remove CODEVANTA from coding-agent MCP settings."""
-    from setup.apply import apply_plan
-    from setup.clients import SetupContext, SetupError
+    from codevanta.setup.apply import apply_plan
+    from codevanta.setup.clients import SetupContext, SetupError
 
     ctx = SetupContext.from_environment(project)
     adapters = _adapters_for(ctx, client)

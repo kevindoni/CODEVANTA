@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from core.strings import StringExtractor
+from codevanta.core.strings import StringExtractor
 
 
 def test_extracts_ascii_and_utf16(tmp_path: Path) -> None:

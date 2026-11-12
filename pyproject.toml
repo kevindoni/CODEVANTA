@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,15 +8,21 @@ version = "0.1.0"
 description = "CODEVANTA — Advanced Code Intelligence: AI-Powered Reverse Engineering & Binary Analysis Platform"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "CODEVANTA" }]
-keywords = ["reverse-engineering", "binary-analysis", "disassembly", "security", "pe", "elf"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "kevindoni" }]
+keywords = ["reverse-engineering", "binary-analysis", "disassembly", "security", "pe", "elf", "mcp"]
 classifiers = [
   "Development Status :: 3 - Alpha",
+  "Environment :: Console",
   "Intended Audience :: Developers",
   "Intended Audience :: Information Technology",
-  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Security",
 ]
 dependencies = [
@@ -27,32 +33,29 @@ dependencies = [
   "mcp>=2.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/kevindoni/CODEVANTA"
+Repository = "https://github.com/kevindoni/CODEVANTA"
+Issues = "https://github.com/kevindoni/CODEVANTA/issues"
+Documentation = "https://github.com/kevindoni/CODEVANTA/blob/main/docs/install.md"
+Changelog = "https://github.com/kevindoni/CODEVANTA/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
   "ruff>=0.5",
+  "build>=1.2",
 ]
 
 [project.scripts]
-codevanta = "cli.main:main"
+codevanta = "codevanta.cli.main:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = [
-  "core*",
-  "analysis*",
-  "ir*",
-  "evidence*",
-  "api*",
-  "cli*",
-  "storage*",
-  "plugins*",
-  "mcp_server*",
-  "setup*",
-]
+include = ["codevanta*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

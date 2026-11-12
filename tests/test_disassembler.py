@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.disassembler import Disassembler, DisassemblyError
+from codevanta.core.disassembler import Disassembler, DisassemblyError
 
 
 def test_disassemble_x64_nops() -> None:

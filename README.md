@@ -108,7 +108,7 @@ Prompt you can paste into a coding agent:
 ## Project layout
 
 ```text
-src/
+src/codevanta/
 ├── core/        # loader (LIEF), disassembler (Capstone), strings, functions, shared report
 ├── evidence/    # evidence records, provenance, confidence scoring
 ├── ir/          # backend-neutral instruction model + adapter registry
@@ -120,7 +120,8 @@ src/
 ├── storage/     # session storage (phase 2+)
 └── plugins/     # plugin system (phase 5)
 tests/           # unit and integration tests
-docs/            # architecture notes
+docs/            # architecture and install notes
+scripts/         # one-line bootstrap installers
 ```
 
 ## Testing

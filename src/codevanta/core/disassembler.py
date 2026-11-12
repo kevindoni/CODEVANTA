@@ -7,9 +7,9 @@ from typing import Any
 
 import capstone
 
-from evidence.confidence import Confidence
-from evidence.models import Evidence
-from ir.instruction import IRInstruction
+from codevanta.evidence.confidence import Confidence
+from codevanta.evidence.models import Evidence
+from codevanta.ir.instruction import IRInstruction
 
 
 class DisassemblyError(Exception):

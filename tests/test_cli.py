@@ -7,7 +7,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from cli.main import app
+from codevanta.cli.main import app
 
 runner = CliRunner()
 

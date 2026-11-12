@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from core.functions import discover_functions
-from core.report import (
+from codevanta.core.functions import discover_functions
+from codevanta.core.report import (
     MAX_DISASSEMBLY_COUNT,
     MAX_STRING_LIMIT,
     AnalysisError,
@@ -15,7 +15,7 @@ from core.report import (
     load_binary,
     resolve_target,
 )
-from core.strings import StringExtractor
+from codevanta.core.strings import StringExtractor
 
 
 def _validate_path(path: str) -> Path:
