@@ -8,6 +8,18 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Changed
 
+- Dashboard usability pass (`codevanta gui`): the workflow is now guided
+  instead of expert-first. Step 1 is a single path field with one primary
+  **Analyze** button (Enter works too); its result renders as a plain-language
+  overview — format/arch chips, section/import/export/symbol/function/string
+  counts, entry point, human-readable file size, SHA-256 — instead of a raw
+  JSON table. Step 2 presents the six deeper views as cards with
+  plain-English titles and one-line questions they answer ("Who calls whom",
+  "Code flow", "Data layouts", ...), each carrying only its own contextual
+  options. Diff moved into a collapsed "Advanced" disclosure, the empty state
+  explains what to do first, and JSON stays available under "Raw JSON (for
+  scripts and agents)". Element ids stayed stable where tests pin them; all
+  rendering remains `textContent`-only with zero external references.
 - Dashboard redesign (`codevanta gui`): the layout was rewritten around a
   sticky top bar with trust badges (read-only, local), a hero path input with
   Enter-to-run, a labeled options panel, a full-width seven-action toolbar,
