@@ -74,6 +74,7 @@ from codevanta.analysis.type_recovery import (
 )
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.disassembler import DisassemblyError
+from codevanta.core.entropy import analyze_entropy
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
 from codevanta.core.report import (
@@ -166,6 +167,60 @@ def info(path: Annotated[Path, typer.Argument(help="Path to a PE or ELF binary")
     _print_sections(loaded)
     for warning in loaded.warnings:
         console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+@app.command()
+def entropy(
+    path: Path,
+    threshold: Annotated[
+        float,
+        typer.Option(
+            help="Entropy (bits/byte) at or above which a section is flagged as possibly packed"
+        ),
+    ] = 7.2,
+    max_sample_bytes: Annotated[
+        int, typer.Option(help="Maximum bytes sampled per section")
+    ] = 65_536,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Show per-section Shannon entropy and packing triage hints."""
+    loaded = _load(path)
+    try:
+        report = analyze_entropy(
+            path, loaded, threshold=threshold, max_sample_bytes=max_sample_bytes
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 4)
+    if json_output:
+        console.print_json(json.dumps(report.to_dict()))
+        return
+    table = Table(title="Section entropy (bits/byte)")
+    table.add_column("Section")
+    table.add_column("Entropy", justify="right")
+    table.add_column("Sampled", justify="right")
+    table.add_column("Exec")
+    table.add_column("Packed hint")
+    for section in report.sections:
+        entropy_text = f"{section.entropy:.3f}" if section.entropy is not None else "-"
+        packed_text = "yes" if section.packed_hint else "-"
+        style = "yellow" if section.packed_hint else ""
+        table.add_row(
+            escape(section.name),
+            entropy_text,
+            str(section.sampled_bytes),
+            "yes" if section.is_executable else "-",
+            f"[{style}]{packed_text}[/]" if style else packed_text,
+        )
+    console.print(table)
+    for warning in report.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    if report.packed_candidates:
+        console.print(
+            "[dim]high entropy suggests packing or compression — a heuristic, "
+            "not proof; check imports and entry-point stubs before concluding.[/]"
+        )
 
 
 @app.command()
