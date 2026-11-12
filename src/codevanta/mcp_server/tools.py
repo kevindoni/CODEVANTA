@@ -28,6 +28,12 @@ from codevanta.analysis.type_recovery import (
     suggest_struct,
 )
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
+from codevanta.core.entropy import (
+    DEFAULT_MAX_SAMPLE_BYTES,
+    MAX_SAMPLE_LIMIT,
+    PACKED_HINT_THRESHOLD,
+    analyze_entropy,
+)
 from codevanta.core.functions import discover_functions
 from codevanta.core.report import (
     MAX_DISASSEMBLY_COUNT,
@@ -144,9 +150,44 @@ def disasm(
     }
 
 
-def analyze(path: str, string_limit: int = 5000) -> dict[str, Any]:
-    """Return the full phase 1 report with provenance and evidence."""
-    return build_report(_validate_path(path), string_limit=string_limit)
+def analyze(
+    path: str,
+    string_limit: int = 5000,
+    include_xrefs: bool = False,
+    include_cfg: bool = False,
+    include_callgraph: bool = False,
+) -> dict[str, Any]:
+    """Return the analysis report; phase 2 sections are opt-in per flag.
+
+    Mirrors the CLI ``analyze`` flags: the base report always carries binary
+    metadata, functions, strings, entry-point disassembly, and provenance;
+    ``include_xrefs`` / ``include_cfg`` / ``include_callgraph`` add the phase 2
+    sections agents would otherwise fetch through the dedicated tools.
+    """
+    return build_report(
+        _validate_path(path),
+        string_limit=string_limit,
+        include_xrefs=include_xrefs,
+        include_cfg=include_cfg,
+        include_callgraph=include_callgraph,
+    )
+
+
+def entropy(
+    path: str,
+    threshold: float = PACKED_HINT_THRESHOLD,
+    max_sample_bytes: int = DEFAULT_MAX_SAMPLE_BYTES,
+) -> dict[str, Any]:
+    """Return per-section Shannon entropy with packing triage hints."""
+    if not 0.0 < threshold <= 8.0:
+        raise AnalysisError("threshold must be in (0, 8]")
+    if max_sample_bytes < 1 or max_sample_bytes > MAX_SAMPLE_LIMIT:
+        raise AnalysisError(f"max_sample_bytes must be between 1 and {MAX_SAMPLE_LIMIT}")
+    target = _validate_path(path)
+    info = load_binary(target)
+    return analyze_entropy(
+        target, info, threshold=threshold, max_sample_bytes=max_sample_bytes
+    ).to_dict()
 
 
 def xrefs(

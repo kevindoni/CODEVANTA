@@ -8,6 +8,11 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- MCP: `codevanta_entropy` exposes the entropy triage over MCP (same bounded
+  `threshold` / `max_sample_bytes` validation as the CLI), and
+  `codevanta_analyze` gains `include_xrefs` / `include_cfg` /
+  `include_callgraph` flags mirroring the CLI so a single call can carry the
+  phase 2 sections; defaults keep the phase 1 payload unchanged.
 - Entropy triage (`codevanta.core.entropy` + `codevanta entropy`): per-section
   Shannon entropy sampled from file bytes (capped per section, sample size
   reported) with a packing heuristic — sections at or above the threshold

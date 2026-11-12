@@ -111,8 +111,35 @@ def build_server() -> MCPServer:
     @server.tool(
         description="Produce the full phase 1 JSON report with provenance and evidence."
     )
-    def codevanta_analyze(path: str, string_limit: int = 5000) -> dict:
-        return tools.analyze(path, string_limit=string_limit)
+    def codevanta_analyze(
+        path: str,
+        string_limit: int = 5000,
+        include_xrefs: bool = False,
+        include_cfg: bool = False,
+        include_callgraph: bool = False,
+    ) -> dict:
+        return tools.analyze(
+            path,
+            string_limit=string_limit,
+            include_xrefs=include_xrefs,
+            include_cfg=include_cfg,
+            include_callgraph=include_callgraph,
+        )
+
+    @server.tool(
+        description=(
+            "Per-section Shannon entropy sampled from file bytes with a packing "
+            "triage hint: sections at or above the threshold (default 7.2 bits/byte) "
+            "are flagged as possibly packed — a heuristic, not proof. Sections "
+            "without file bytes carry entropy null with a warning."
+        )
+    )
+    def codevanta_entropy(
+        path: str,
+        threshold: float = 7.2,
+        max_sample_bytes: int = 65_536,
+    ) -> dict:
+        return tools.entropy(path, threshold=threshold, max_sample_bytes=max_sample_bytes)
 
     @server.tool(
         description=(

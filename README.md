@@ -409,11 +409,14 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools (fifteen): `codevanta_info`, `codevanta_functions`,
+MCP tools (sixteen): `codevanta_info`, `codevanta_functions`,
 `codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
 `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
 `codevanta_jump_table`, `codevanta_function_hash`, `codevanta_similarity`,
-`codevanta_struct`, `codevanta_session_save`, `codevanta_session_list`.
+`codevanta_struct`, `codevanta_entropy`, `codevanta_session_save`,
+`codevanta_session_list`. `codevanta_analyze` mirrors the CLI flags
+(`include_xrefs` / `include_cfg` / `include_callgraph`, default off) so a
+single call can carry the phase 2 sections when an agent prefers one payload.
 
 `codevanta_callgraph` takes the same bounded limits as the CLI
 (`limit_functions`, `limit_edges`, defaulting to 1000 and 5000) and returns nodes,
