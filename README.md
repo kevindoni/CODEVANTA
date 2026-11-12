@@ -68,6 +68,10 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   confidence and warns when a call site cannot be attributed.
 - **Graph export** (`analysis/graph_export.py`) — the call graph rendered as
   Graphviz DOT or GraphML by one dependency-free, deterministic exporter.
+- **Offline graph viewer** (`analysis/html_view.py`) — `codevanta callgraph
+  --format html` writes one self-contained HTML5 document with an inline SVG
+  view: three kind-based columns, header counts, and a collapsible edge table. No
+  CDN, no web font, no JavaScript and no server, so it opens offline from disk.
 - **Session storage** (`storage/session.py`) — additive SQLite records of each
   analysis run (fingerprint, format, arch, entry point, function/string counts)
   plus per-address analyst annotations (`annotate`, `annotations`,
@@ -82,9 +86,10 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
 Phase 2 is deliberately narrow: linear sweep only, direct branch targets plus
 absolute/RIP-relative pointer slots only, call graph edges from `call` /
 `call_import` / `call_indirect` only, no register-target resolution, no recursive
-traversal, no graph viewer, and no debugger yet. See
-[docs/phase2.md](docs/phase2.md), [docs/phase2b.md](docs/phase2b.md), and
-[docs/phase2c.md](docs/phase2c.md) for scope, confidence semantics, and
+traversal, no interactive graph viewer (the HTML/SVG export is a static file),
+and no debugger yet. See [docs/phase2.md](docs/phase2.md),
+[docs/phase2b.md](docs/phase2b.md), [docs/phase2c.md](docs/phase2c.md), and
+[docs/phase2d.md](docs/phase2d.md) for scope, confidence semantics, and
 limitations.
 
 ## Installation
@@ -116,6 +121,9 @@ codevanta analyze   samples\elf64_text.bin --output samples\report.json
 codevanta xrefs     C:\Windows\System32\notepad.exe --limit 40
 codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000
 codevanta callgraph C:\Windows\System32\notepad.exe --format dot -o callgraph.dot
+codevanta callgraph C:\Windows\System32\notepad.exe --format graphml -o callgraph.graphml
+codevanta callgraph C:\Windows\System32\notepad.exe --format html -o callgraph.html
+Invoke-Item callgraph.html
 codevanta analyze   C:\Windows\System32\notepad.exe --callgraph -o report.json
 codevanta session save C:\Windows\System32\notepad.exe --notes "baseline triage"
 codevanta session list --limit 10
@@ -132,8 +140,9 @@ Phase 2 results carry their own evidence: xrefs are `certain` (the target is
 read directly from the decoded operand), CFG blocks are `medium` (block
 boundaries come from mnemonic heuristics), and the call graph is `medium`
 (calls are decoded, but caller attribution is a nearest-candidate heuristic).
-`codevanta callgraph` defaults to `--format json` and can emit `dot` or
-`graphml`; `codevanta cfg` defaults to the entry point; sessions default to
+`codevanta callgraph` defaults to `--format json` and can emit `dot`, `graphml`,
+or `html` (one self-contained file with an inline SVG view, opened straight from
+disk); `codevanta cfg` defaults to the entry point; sessions default to
 `$env:CODEVANTA_DB` or `~/.codevanta/sessions.db`, and `session annotate` accepts
 decimal or `0x` hex addresses.
 
@@ -192,7 +201,7 @@ src/codevanta/
 ├── ir/          # backend-neutral instruction model + adapter registry
 ├── mcp_server/  # MCP tools and stdio server for coding agents
 ├── setup/       # client config planning, apply, verify (claude/cursor/cline/vscode)
-├── analysis/    # cross-references, call graph, linear-sweep CFG, DOT/GraphML export (phase 2)
+├── analysis/    # cross-references, call graph, linear-sweep CFG, DOT/GraphML/HTML export (phase 2)
 ├── api/         # HTTP API (phase 2+)
 ├── cli/         # Typer command line surface
 ├── storage/     # SQLite session storage and annotations (phase 2)
@@ -216,6 +225,7 @@ ruff check src tests
 - [Phase 2 — cross-references, CFGs, sessions](docs/phase2.md)
 - [Phase 2b — call graphs, graph export, session annotations](docs/phase2b.md)
 - [Phase 2c — import/indirect calls, embedded call graphs, MCP call graph](docs/phase2c.md)
+- [Phase 2d — offline HTML/SVG graph viewer](docs/phase2d.md)
 
 ## Roadmap
 

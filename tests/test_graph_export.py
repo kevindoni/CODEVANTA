@@ -20,6 +20,7 @@ from codevanta.analysis.graph_export import (
     GraphExportError,
     to_dot,
     to_graphml,
+    validate_graph,
 )
 
 EXPORTERS = (to_dot, to_graphml)
@@ -414,6 +415,106 @@ def test_graph_export_error_is_a_value_error(export) -> None:
     """``GraphExportError`` stays catchable as ``ValueError``."""
     with pytest.raises(ValueError, match="graph must be a dict"):
         export(None)
+
+
+# --------------------------------------------------------------------------- #
+# validate_graph
+# --------------------------------------------------------------------------- #
+
+
+def test_validate_graph_normalizes_and_orders() -> None:
+    """The normalized copy is sorted, string-typed and filled with defaults."""
+    validated = validate_graph(
+        _graph(
+            [
+                {"id": "b", "label": "parse", "kind": "function"},
+                {"id": "a", "label": "main"},
+            ],
+            [{"source": "a", "target": "b"}, {"source": "b", "target": "a", "label": "tail"}],
+        )
+    )
+
+    assert validated == {
+        "nodes": [
+            {"id": "a", "label": "main", "kind": ""},
+            {"id": "b", "label": "parse", "kind": "function"},
+        ],
+        "edges": [
+            {"source": "a", "target": "b", "label": DEFAULT_EDGE_LABEL},
+            {"source": "b", "target": "a", "label": "tail"},
+        ],
+    }
+
+
+def test_validate_graph_returns_an_independent_copy() -> None:
+    """Mutating the result never touches the caller's graph."""
+    graph = _sample_graph()
+    validated = validate_graph(graph)
+
+    validated["nodes"][0]["label"] = "mutated"
+    validated["edges"].append({"source": "a", "target": "a", "label": "loop"})
+
+    assert graph["nodes"][0]["label"] == "main"
+    assert len(graph["edges"]) == 2
+    assert validate_graph(graph) == validate_graph(_sample_graph())
+
+
+def test_validate_graph_output_renders_identically() -> None:
+    """Rendering the normalized copy produces exactly the same documents."""
+    graph = _sample_graph()
+    validated = validate_graph(graph)
+
+    for export in EXPORTERS:
+        assert export(graph) == export(validated)
+
+
+def test_validate_graph_is_exported() -> None:
+    """``validate_graph`` is part of the module's public surface."""
+    assert "validate_graph" in graph_export.__all__
+
+
+def test_validate_graph_rejects_duplicate_ids() -> None:
+    """A repeated node id is rejected, as it is by the exporters."""
+    graph = _graph(
+        [{"id": "a", "label": "main"}, {"id": "a", "label": "again"}],
+        [],
+    )
+
+    with pytest.raises(GraphExportError, match="duplicate node id 'a'"):
+        validate_graph(graph)
+
+
+@pytest.mark.parametrize("endpoint", ["source", "target"])
+def test_validate_graph_rejects_unknown_endpoints(endpoint: str) -> None:
+    """Edges must reference existing node ids."""
+    edge = {"source": "a", "target": "a", endpoint: "ghost"}
+
+    with pytest.raises(GraphExportError, match=f"{endpoint} 'ghost' is not a known node id"):
+        validate_graph(_graph([{"id": "a", "label": "main"}], [edge]))
+
+
+def test_validate_graph_rejects_non_dict_graph() -> None:
+    """Non-mapping input is rejected with the shared message."""
+    with pytest.raises(GraphExportError, match="graph must be a dict"):
+        validate_graph(None)
+
+
+def test_validate_graph_enforces_limits() -> None:
+    """Node and edge budgets are applied before anything is normalized."""
+    graph = _sample_graph()
+
+    with pytest.raises(GraphExportError, match="max_nodes is 2"):
+        validate_graph(graph, max_nodes=2)
+    with pytest.raises(GraphExportError, match="max_edges is 1"):
+        validate_graph(graph, max_edges=1)
+
+
+@pytest.mark.parametrize("export", [validate_graph, *EXPORTERS])
+@pytest.mark.parametrize("bad_limit", [0, -1, "10", 2.5, None, True])
+def test_validate_graph_matches_exporter_limits(export, bad_limit: object) -> None:
+    """Every public entry point rejects the same unusable limits."""
+    with pytest.raises(GraphExportError):
+        export(_graph([], []), max_nodes=bad_limit)
 
 
 def test_exporter_module_is_standalone() -> None:

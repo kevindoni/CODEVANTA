@@ -31,6 +31,7 @@ from codevanta.analysis.graph_export import (
     to_dot,
     to_graphml,
 )
+from codevanta.analysis.html_view import to_html
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
@@ -366,32 +367,31 @@ def cfg(
 
 
 #: Output formats accepted by ``codevanta callgraph``.
-CallGraphFormat = Literal["json", "dot", "graphml"]
+CallGraphFormat = Literal["json", "dot", "graphml", "html"]
 
 
 def _render_call_graph(graph: CallGraph, output_format: CallGraphFormat, path: Path) -> str:
-    """Render ``graph`` as JSON, DOT or GraphML text.
+    """Render ``graph`` as JSON, DOT, GraphML or HTML text.
 
     ``json`` serializes the analysis payload itself (:meth:`CallGraph.to_dict`);
-    ``dot`` and ``graphml`` render the generic graph model so the shared exporter
-    in :mod:`codevanta.analysis.graph_export` stays the only serializer.
+    ``dot``, ``graphml`` and ``html`` render the generic graph model so the shared
+    exporters in :mod:`codevanta.analysis.graph_export` and the viewer in
+    :mod:`codevanta.analysis.html_view` stay the only serializers.
+
+    Every serializer is given size-derived caps (``max(DEFAULT, len(...))``) so a
+    graph the analysis already accepted is never rejected downstream for being
+    larger than the exporter default.
     """
-    if output_format == "dot":
+    if output_format in ("dot", "graphml", "html"):
         model = graph.to_graph_model()
-        return to_dot(
-            model,
-            title=f"callgraph {path.name}",
-            max_nodes=max(EXPORT_MAX_NODES, len(model["nodes"])),
-            max_edges=max(EXPORT_MAX_EDGES, len(model["edges"])),
-        )
-    if output_format == "graphml":
-        model = graph.to_graph_model()
-        return to_graphml(
-            model,
-            title=f"callgraph {path.name}",
-            max_nodes=max(EXPORT_MAX_NODES, len(model["nodes"])),
-            max_edges=max(EXPORT_MAX_EDGES, len(model["edges"])),
-        )
+        title = f"callgraph {path.name}"
+        max_nodes = max(EXPORT_MAX_NODES, len(model["nodes"]))
+        max_edges = max(EXPORT_MAX_EDGES, len(model["edges"]))
+        if output_format == "dot":
+            return to_dot(model, title=title, max_nodes=max_nodes, max_edges=max_edges)
+        if output_format == "graphml":
+            return to_graphml(model, title=title, max_nodes=max_nodes, max_edges=max_edges)
+        return to_html(model, title=title, max_nodes=max_nodes, max_edges=max_edges)
     return json.dumps(graph.to_dict(), indent=2)
 
 
@@ -407,14 +407,20 @@ def callgraph(
     ] = DEFAULT_MAX_EDGES,
     output_format: Annotated[
         CallGraphFormat,
-        typer.Option("--format", help="Output format: json (analysis payload), dot or graphml"),
+        typer.Option(
+            "--format",
+            help=(
+                "Output format: json (analysis payload), dot, graphml or html "
+                "(self-contained SVG viewer)"
+            ),
+        ),
     ] = "json",
     output: Annotated[
         Path | None,
         typer.Option("--output", "-o", help="Write the graph to this path instead of stdout"),
     ] = None,
 ) -> None:
-    """Build the direct-call call graph and emit it as JSON, DOT or GraphML."""
+    """Build the direct-call call graph and emit it as JSON, DOT, GraphML or HTML."""
     loaded = _load(path)
     try:
         graph = build_call_graph(
@@ -429,8 +435,8 @@ def callgraph(
         _fail(str(exc), 2)
     if output is not None:
         try:
-            output.write_text(payload, encoding="utf-8")
-        except OSError as exc:
+            output.write_text(payload, encoding="utf-8", newline="\n")
+        except (OSError, UnicodeError) as exc:
             _fail(f"cannot write {output}: {exc}", 2)
         console.print(f"[green]graph written:[/] {escape(str(output))}")
     else:

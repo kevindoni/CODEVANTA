@@ -94,14 +94,33 @@ All notable changes to CODEVANTA are documented here. The format follows
   nodes, the embedded report graph, the ten MCP tools, CLI examples, remaining
   limits, and next steps; the README now links `CONTRIBUTORS.md` from its
   Community section.
+- `validate_graph` (`codevanta.analysis.graph_export`) is now public: the DOT and
+  GraphML checks return a normalized, deterministically ordered copy, so other
+  renderers reuse one contract instead of duplicating it.
+- Offline HTML/SVG graph viewer (`codevanta.analysis.html_view`): `to_html`
+  renders the shared graph model as one self-contained HTML5 document — inline
+  stylesheet, inline SVG in three `kind`-based columns
+  (`function`/`entry_point`, `call_site`, everything else), header node/edge
+  counts, arrowed straight-line edges, a collapsible `<details>` table listing
+  every edge, and an `application/json` payload of the normalized graph. It
+  references no `http(s)` URL, CDN, web font or external file and contains no
+  JavaScript logic, so it opens offline; the `<svg>` omits `xmlns` and is
+  inline-only. Output is byte-identical for identical content.
+- CLI: `codevanta callgraph --format html` (with `--output`/`-o`) joins
+  `json|dot|graphml`. Every serializer now receives size-derived caps
+  (`max(default, len(...))`), so a graph the analysis already accepted is never
+  rejected downstream by an exporter default.
+- Documentation: `docs/phase2d.md` covers the viewer, the three columns, document
+  anatomy, caps and sizing, offline guarantees, limits, and next steps.
 
 ### Notes
 
 - Phase 2 is in progress: linear sweep only, direct branch targets plus absolute
   and RIP-relative pointer slots only, no register-target or indexed-memory
-  resolution, no slot dereferencing, no recursive traversal, no graph viewer, and
-  no debugger yet. See `docs/phase2.md`, `docs/phase2b.md`, and
-  `docs/phase2c.md`.
+  resolution, no slot dereferencing, no recursive traversal, no interactive graph
+  viewer (the HTML/SVG export is a static, script-free file), and no debugger yet.
+  See `docs/phase2.md`, `docs/phase2b.md`, `docs/phase2c.md`, and
+  `docs/phase2d.md`.
 - Node boundaries and caller attribution are heuristics, not proven function
   extents. Sessions and annotations live in one local SQLite file with no schema
   migrations yet.

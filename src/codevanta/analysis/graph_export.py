@@ -13,6 +13,10 @@ producer that can describe a graph as
 
 can therefore render it through :func:`to_dot` or :func:`to_graphml` — the call
 graph, the control-flow graph, and future viewers all share one renderer.
+:func:`validate_graph` exposes the same checks directly and returns the
+normalized, deterministically ordered copy that both exporters render, so other
+views (such as :mod:`codevanta.analysis.html_view`) can reuse it instead of
+duplicating the contract.
 
 Contract
 --------
@@ -55,8 +59,10 @@ __all__ = [
     "DEFAULT_MAX_NODES",
     "DEFAULT_TITLE",
     "GraphExportError",
+    "sanitize_text",
     "to_dot",
     "to_graphml",
+    "validate_graph",
 ]
 
 #: Title used when the caller does not pass one.
@@ -239,9 +245,62 @@ def _parse_graph(
     return nodes, edges
 
 
+def validate_graph(
+    graph: Any,
+    max_nodes: int = DEFAULT_MAX_NODES,
+    max_edges: int = DEFAULT_MAX_EDGES,
+) -> dict[str, Any]:
+    """Validate ``graph`` and return a normalized, deterministically ordered copy.
+
+    The checks are exactly the ones :func:`to_dot` and :func:`to_graphml` apply,
+    so a graph accepted here renders without further validation.  The returned
+    mapping never aliases the input: fresh node and edge dicts are built, blank
+    edge labels are replaced by ``"call"``, missing ``kind`` values become
+    ``""``, and both lists are sorted (nodes by ``id``, edges by
+    ``(source, target, label)``).
+
+    Args:
+        graph: Mapping with ``"nodes"`` and ``"edges"`` lists (see module docs).
+        max_nodes: Maximum number of nodes to accept (``>= 1``).
+        max_edges: Maximum number of edges to accept (``>= 1``).
+
+    Returns:
+        ``{"nodes": [{"id", "label", "kind"}...], "edges": [{"source",
+        "target", "label"}...]}`` with every value a ``str``.
+
+    Raises:
+        GraphExportError: If the graph or any limit violates the contract.
+
+    Examples:
+        >>> validate_graph(
+        ...     {
+        ...         "nodes": [{"id": "b", "label": "parse"}, {"id": "a", "label": "main"}],
+        ...         "edges": [{"source": "a", "target": "b"}],
+        ...     }
+        ... )["edges"]
+        [{'source': 'a', 'target': 'b', 'label': 'call'}]
+    """
+    nodes, edges = _parse_graph(graph, max_nodes, max_edges)
+    return {
+        "nodes": [{"id": node.id, "label": node.label, "kind": node.kind} for node in nodes],
+        "edges": [
+            {"source": edge.source, "target": edge.target, "label": edge.label} for edge in edges
+        ],
+    }
+
+
 def _sanitize(value: str) -> str:
     """Replace characters that cannot be represented in output with ``U+FFFD``."""
     return _ILLEGAL_TEXT_RE.sub(_REPLACEMENT_CHAR, value)
+
+
+def sanitize_text(value: str) -> str:
+    """Replace characters that cannot be represented in output with ``U+FFFD``.
+
+    Shared by the DOT, GraphML, and HTML exporters so every text surface treats
+    illegal characters (control characters, lone surrogates) the same way.
+    """
+    return _sanitize(value)
 
 
 def _display_label(label: str, node_id: str) -> str:
@@ -271,7 +330,8 @@ def to_dot(
     Node ids and labels are emitted as double-quoted, escaped strings; nodes are
     drawn as ``box`` when their ``kind`` is ``"function"`` or ``"entry_point"``
     and as ``ellipse`` otherwise.  Edges always carry a label, defaulting to
-    ``"call"``.
+    ``"call"``.  Validation and deterministic ordering are delegated to
+    :func:`validate_graph`.
 
     Args:
         graph: Mapping with ``"nodes"`` and ``"edges"`` lists (see module docs).
@@ -285,18 +345,18 @@ def to_dot(
     Raises:
         GraphExportError: If the graph or any limit violates the contract.
     """
-    nodes, edges = _parse_graph(graph, max_nodes, max_edges)
+    validated = validate_graph(graph, max_nodes, max_edges)
     heading = _dot_quote(_check_title(title))
 
     lines = [f"digraph {heading} {{", f"  graph [label={heading}];"]
-    for node in nodes:
-        label = _dot_quote(_display_label(node.label, node.id))
-        lines.append(f"  {_dot_quote(node.id)} [label={label}, shape={_dot_shape(node.kind)}];")
+    for node in validated["nodes"]:
+        label = _dot_quote(_display_label(node["label"], node["id"]))
+        lines.append(f"  {_dot_quote(node['id'])} [label={label}, shape={_dot_shape(node['kind'])}];")
 
-    for edge in edges:
+    for edge in validated["edges"]:
         lines.append(
-            f"  {_dot_quote(edge.source)} -> {_dot_quote(edge.target)}"
-            f" [label={_dot_quote(edge.label)}];"
+            f"  {_dot_quote(edge['source'])} -> {_dot_quote(edge['target'])}"
+            f" [label={_dot_quote(edge['label'])}];"
         )
 
     lines.append("}")
@@ -329,7 +389,8 @@ def to_graphml(
 
     The document declares ``key`` elements for the node ``label``, the node
     ``kind`` and the edge ``label`` attributes, a directed ``graph`` element,
-    and a ``desc`` element holding the title.
+    and a ``desc`` element holding the title.  Validation and deterministic
+    ordering are delegated to :func:`validate_graph`.
 
     Args:
         graph: Mapping with ``"nodes"`` and ``"edges"`` lists (see module docs).
@@ -343,7 +404,7 @@ def to_graphml(
     Raises:
         GraphExportError: If the graph or any limit violates the contract.
     """
-    nodes, edges = _parse_graph(graph, max_nodes, max_edges)
+    validated = validate_graph(graph, max_nodes, max_edges)
     heading = _check_title(title)
 
     root = ElementTree.Element("graphml")
@@ -362,18 +423,18 @@ def to_graphml(
     description = ElementTree.SubElement(graph_element, "desc")
     description.text = _sanitize(heading)
 
-    for node in nodes:
+    for node in validated["nodes"]:
         element = ElementTree.SubElement(graph_element, "node")
-        element.set("id", _sanitize(node.id))
-        _append_graphml_data(element, _KEY_NODE_LABEL, _display_label(node.label, node.id))
-        if node.kind.strip():
-            _append_graphml_data(element, _KEY_NODE_KIND, node.kind)
+        element.set("id", _sanitize(node["id"]))
+        _append_graphml_data(element, _KEY_NODE_LABEL, _display_label(node["label"], node["id"]))
+        if node["kind"].strip():
+            _append_graphml_data(element, _KEY_NODE_KIND, node["kind"])
 
-    for edge in edges:
+    for edge in validated["edges"]:
         element = ElementTree.SubElement(graph_element, "edge")
-        element.set("source", _sanitize(edge.source))
-        element.set("target", _sanitize(edge.target))
-        _append_graphml_data(element, _KEY_EDGE_LABEL, edge.label)
+        element.set("source", _sanitize(edge["source"]))
+        element.set("target", _sanitize(edge["target"]))
+        _append_graphml_data(element, _KEY_EDGE_LABEL, edge["label"])
 
     ElementTree.indent(root, space="  ")
     body = ElementTree.tostring(root, encoding="unicode")
