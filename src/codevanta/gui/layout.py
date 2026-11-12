@@ -8,8 +8,9 @@ binary-analysis tool) and makes it trivially testable.
 Security posture of the generated page:
 
 * Every API response is rendered with ``textContent`` (plus ``textContent`` on
-  every cell the table builder creates), so a hostile binary cannot inject
-  markup through a symbol name, a string literal or an error message.
+  every cell the table and summary builders create), so a hostile binary
+  cannot inject markup through a symbol name, a string literal or an error
+  message.
 * The only network target is the same-origin ``/api/*`` route table served by
   :mod:`codevanta.gui.server`; the page never contacts a third party.
 * Nothing is uploaded: the file paths typed into the form are resolved by the
@@ -38,6 +39,7 @@ _STYLE = """
   --acc-bg: rgba(45, 212, 191, 0.09);
   --err: #f87171;
   --ok: #4ade80;
+  --warn: #fbbf24;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
           "Helvetica Neue", Arial, sans-serif;
@@ -58,12 +60,13 @@ body {
     var(--bg);
   color: var(--ink);
 }
-.wrap { max-width: 1240px; margin: 0 auto; padding: 0 28px; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 28px; }
+.hidden { display: none !important; }
 
 /* ---- top bar ---------------------------------------------------------- */
 .topbar {
   border-bottom: 1px solid var(--line);
-  background: rgba(10, 12, 16, 0.82);
+  background: rgba(10, 12, 16, 0.85);
   position: sticky; top: 0; z-index: 5;
 }
 .topbar .wrap {
@@ -85,13 +88,8 @@ body {
   font-size: 17px; font-weight: 700; letter-spacing: 0.14em;
   text-transform: uppercase; color: var(--ink);
 }
-.brand h1 em {
-  font-style: normal; color: var(--acc);
-}
-.brand p {
-  margin: 2px 0 0;
-  font-size: 12px; color: var(--dim);
-}
+.brand h1 em { font-style: normal; color: var(--acc); }
+.brand p { margin: 2px 0 0; font-size: 12px; color: #7c8aa0; }
 .meta { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .pill {
   display: inline-flex; align-items: center; gap: 7px;
@@ -110,7 +108,7 @@ body {
 .pill.secure .dot { background: var(--acc); box-shadow: 0 0 6px rgba(45, 212, 191, 0.8); }
 
 /* ---- cards ------------------------------------------------------------ */
-main.wrap { padding-top: 24px; display: grid; gap: 16px; }
+main.wrap { padding-top: 22px; display: grid; gap: 16px; }
 .card {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -118,10 +116,7 @@ main.wrap { padding-top: 24px; display: grid; gap: 16px; }
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.03);
   padding: 20px 22px 22px;
 }
-.card-head {
-  display: flex; align-items: baseline; gap: 12px;
-  margin: 0 0 16px;
-}
+.card-head { display: flex; align-items: baseline; gap: 12px; margin: 0 0 14px; }
 .card-head h2 {
   margin: 0;
   font-size: 13px; font-weight: 700; letter-spacing: 0.12em;
@@ -146,7 +141,7 @@ input, select {
   font: 500 13px/1 var(--sans);
   transition: border-color 0.15s, box-shadow 0.15s;
 }
-input.mono, .mono input { font-family: var(--mono); }
+.mono input, input.mono { font-family: var(--mono); }
 input:focus, select:focus {
   outline: none;
   border-color: var(--acc);
@@ -165,57 +160,35 @@ input::placeholder { color: #46536b; }
   pointer-events: none;
 }
 
-/* ---- hero path row ---------------------------------------------------- */
-.path-row { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 14px; }
-.path-row .grow { flex: 1; }
-#path {
-  height: 46px;
-  font-size: 14px;
-  border-color: var(--line-2);
+/* ---- hero ------------------------------------------------------------- */
+.step-tag {
+  display: inline-flex; align-items: center; gap: 8px;
+  margin: 0 0 10px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--acc);
 }
-.path-row kbd {
-  display: inline-block;
-  margin-left: 8px;
+.step-tag .n {
+  width: 18px; height: 18px; border-radius: 50%;
+  display: grid; place-items: center;
+  border: 1px solid rgba(45, 212, 191, 0.5);
+  font: 700 10px/1 var(--mono);
+}
+.hero-row { display: flex; gap: 12px; align-items: stretch; }
+.hero-row .grow { flex: 1; }
+#path { height: 48px; font-size: 14px; }
+.hero-row kbd {
+  display: inline-block; margin-left: 8px;
   padding: 2px 6px;
-  border: 1px solid var(--line-2);
-  border-bottom-width: 2px;
-  border-radius: 5px;
-  background: #0b0e13;
-  font: 600 10px/1.4 var(--mono);
-  color: var(--dim);
+  border: 1px solid var(--line-2); border-bottom-width: 2px;
+  border-radius: 5px; background: #0b0e13;
+  font: 600 10px/1.4 var(--mono); color: var(--dim);
 }
+.hero-hint { margin: 10px 0 0; font-size: 12px; color: #7c8aa0; }
 
-/* ---- option grids ------------------------------------------------------ */
-.options {
-  border: 1px dashed var(--line);
-  border-radius: 8px;
-  padding: 14px 14px 2px;
-  margin: 0 0 16px;
-}
-.options legend {
-  padding: 0 6px;
-  font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
-  text-transform: uppercase; color: var(--dim);
-}
-.grid-opts {
-  display: grid; gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-}
-.grid-opts > div { min-width: 0; }
-
-/* ---- buttons ----------------------------------------------------------- */
-.group-label {
-  margin: 0 0 8px;
-  font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
-  text-transform: uppercase; color: var(--dim);
-}
-.verbs {
-  display: grid; gap: 8px;
-  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
-}
+/* ---- buttons ---------------------------------------------------------- */
 button {
   height: 40px;
-  padding: 0 14px;
+  padding: 0 16px;
   border: 1px solid var(--line-2);
   border-radius: 8px;
   background: transparent;
@@ -224,6 +197,7 @@ button {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   cursor: pointer;
+  white-space: nowrap;
   transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.06s;
 }
 button:hover {
@@ -238,22 +212,66 @@ button.primary {
   color: #052e28;
   font-weight: 750;
 }
-button.primary:hover {
-  color: #052e28;
-  filter: brightness(1.08);
-  background: linear-gradient(180deg, var(--acc), var(--acc-strong));
-}
-.row-2col {
-  display: grid; gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-}
+button.primary:hover { color: #052e28; filter: brightness(1.08); }
+#run-info { height: 48px; padding: 0 22px; font-size: 13px; }
 
-/* ---- result ------------------------------------------------------------ */
-.card.result { display: grid; gap: 0; }
-.result-head {
-  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-  margin: 0 0 14px;
+/* ---- explore tools ---------------------------------------------------- */
+.tools {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
 }
+.tool {
+  display: flex; flex-direction: column; gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1118;
+  padding: 14px 14px 12px;
+}
+.tool-top { display: flex; align-items: center; gap: 10px; }
+.glyph {
+  width: 30px; height: 30px; flex: none;
+  display: grid; place-items: center;
+  border-radius: 7px;
+  border: 1px solid var(--line-2);
+  background: #10151d;
+  color: var(--acc);
+  font: 700 11px/1 var(--mono);
+  letter-spacing: 0.02em;
+}
+.tool-top b { font-size: 14px; font-weight: 650; color: var(--ink); }
+.tool .desc { margin: 0; font-size: 12.5px; color: var(--mut); line-height: 1.45; }
+.tool-opts { display: grid; gap: 8px; grid-template-columns: 1fr 1fr; }
+.tool-opts .full { grid-column: 1 / -1; }
+.tool-opts label { font-size: 10px; margin: 0; color: var(--dim); }
+.tool-opts input, .tool-opts select { height: 32px; font-size: 12px; }
+.tool-opts .single { grid-template-columns: 1fr; }
+.tool button { width: 100%; height: 36px; margin-top: 2px; }
+
+/* ---- diff (collapsed secondary task) ----------------------------------- */
+details.diffbox { border: 1px dashed var(--line-2); border-radius: var(--radius); background: rgba(13, 17, 24, 0.6); }
+details.diffbox > summary {
+  cursor: pointer; padding: 14px 18px;
+  font-size: 13px; font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--mut);
+  user-select: none; list-style: none;
+  display: flex; align-items: center; gap: 10px;
+}
+details.diffbox > summary::before {
+  content: "";
+  width: 0; height: 0;
+  border-left: 5px solid var(--dim);
+  border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+  transition: transform 0.15s;
+}
+details.diffbox[open] > summary::before { transform: rotate(90deg); }
+details.diffbox > summary:hover { color: var(--ink); }
+.diffbox-body { padding: 4px 18px 18px; }
+.diffgrid { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+.diffgrid + .diffgrid { margin-top: 12px; }
+
+/* ---- result ----------------------------------------------------------- */
+.card.result { display: grid; gap: 0; }
+.result-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 0 0 14px; }
 .result-head h2 {
   margin: 0;
   font-size: 13px; font-weight: 700; letter-spacing: 0.12em;
@@ -270,6 +288,48 @@ button.primary:hover {
   text-transform: none;
 }
 .status.error { color: var(--err); border-color: rgba(248, 113, 113, 0.4); }
+
+#empty { padding: 26px 8px 10px; text-align: center; }
+#empty .big { margin: 0 0 6px; font-size: 16px; font-weight: 650; color: var(--mut); }
+#empty p { margin: 0 auto; max-width: 520px; font-size: 13px; color: var(--dim); }
+
+#summary { display: grid; gap: 14px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  display: inline-flex; align-items: baseline; gap: 7px;
+  padding: 7px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: #0d1118;
+}
+.chip .k {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--dim);
+}
+.chip .v { font: 600 12.5px/1 var(--mono); color: var(--ink); }
+.chip.acc .v { color: var(--acc); }
+.kv {
+  display: grid; gap: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0b0e13;
+  overflow: hidden;
+}
+.kv-row {
+  display: grid; grid-template-columns: 170px 1fr;
+  border-bottom: 1px solid var(--line);
+}
+.kv-row:last-child { border-bottom: none; }
+.kv-row .k {
+  padding: 9px 14px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--dim);
+  background: rgba(22, 27, 37, 0.5);
+}
+.kv-row .v { padding: 9px 14px; font: 500 12.5px/1.5 var(--mono); color: #c3cedd; word-break: break-all; }
+.kv-note { margin: 0; font-size: 12px; color: var(--dim); }
+.kv-note b { color: var(--mut); font-weight: 650; }
+
 .table-wrap {
   overflow: auto;
   max-height: 56vh;
@@ -295,11 +355,7 @@ table#tbl th {
   background: var(--card-2);
   border-bottom: 1px solid var(--line-2);
 }
-td.conf {
-  font: 600 10px/1 var(--sans);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
+td.conf { font: 600 10px/1 var(--sans); letter-spacing: 0.06em; text-transform: uppercase; }
 td.conf::before {
   content: "";
   display: inline-block;
@@ -309,52 +365,57 @@ td.conf::before {
 }
 td.conf-high { color: var(--ok); }
 td.conf-high::before { background: var(--ok); box-shadow: 0 0 5px rgba(74, 222, 128, 0.7); }
-td.conf-medium { color: #fbbf24; }
-td.conf-medium::before { background: #fbbf24; box-shadow: 0 0 5px rgba(251, 191, 36, 0.6); }
+td.conf-medium { color: var(--warn); }
+td.conf-medium::before { background: var(--warn); box-shadow: 0 0 5px rgba(251, 191, 36, 0.6); }
 td.conf-low { color: var(--err); }
 td.conf-low::before { background: var(--err); box-shadow: 0 0 5px rgba(248, 113, 113, 0.6); }
-details.raw {
-  margin-top: 12px;
+
+#codeview {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #0b0e13;
+  overflow: auto;
+  max-height: 60vh;
 }
+pre#codepre {
+  margin: 0;
+  padding: 16px 18px;
+  font: 400 12.5px/1.6 var(--mono);
+  color: #cfe6dc;
+  white-space: pre;
+}
+details.raw { margin-top: 12px; border: 1px solid var(--line); border-radius: 8px; background: #0b0e13; }
 details.raw summary {
-  cursor: pointer;
-  padding: 9px 14px;
+  cursor: pointer; padding: 9px 14px;
   font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
   text-transform: uppercase; color: var(--dim);
-  user-select: none;
-  list-style: none;
+  user-select: none; list-style: none;
   display: flex; align-items: center; gap: 8px;
 }
 details.raw summary::before {
   content: "";
   width: 0; height: 0;
   border-left: 5px solid var(--dim);
-  border-top: 4px solid transparent;
-  border-bottom: 4px solid transparent;
+  border-top: 4px solid transparent; border-bottom: 4px solid transparent;
   transition: transform 0.15s;
 }
 details.raw[open] summary::before { transform: rotate(90deg); }
 details.raw summary:hover { color: var(--mut); }
 pre#out {
-  margin: 0;
-  padding: 14px;
-  max-height: 340px;
-  overflow: auto;
+  margin: 0; padding: 14px;
+  max-height: 340px; overflow: auto;
   border-top: 1px solid var(--line);
   font: 400 12px/1.55 var(--mono);
   color: #b9c5d6;
-  white-space: pre-wrap;
-  word-break: break-word;
+  white-space: pre-wrap; word-break: break-word;
 }
 
 /* ---- responsive -------------------------------------------------------- */
 @media (max-width: 760px) {
   .topbar .wrap { flex-wrap: wrap; }
   .meta { margin-left: 0; }
-  .path-row { flex-direction: column; align-items: stretch; }
+  .hero-row { flex-direction: column; }
+  .diffgrid { grid-template-columns: 1fr; }
 }
 """
 
@@ -364,7 +425,7 @@ _BODY = """
     <div class="mark">CV</div>
     <div class="brand">
       <h1>code<em>vanta</em></h1>
-      <p>Advanced code intelligence &middot; decode, analyze, understand</p>
+      <p>Look inside any binary &mdash; safely, offline, step by step</p>
     </div>
     <div class="meta">
       <span class="pill"><span class="dot"></span>read-only</span>
@@ -373,120 +434,24 @@ _BODY = """
   </div>
 </div>
 <main class="wrap">
-  <section class="card">
-    <div class="card-head">
-      <h2>Analyze a binary</h2>
-      <p class="hint">files are parsed, never executed or modified &mdash; nothing leaves this machine</p>
-    </div>
-    <div class="path-row">
-      <div class="grow mono">
-        <label for="path">Binary path <kbd>Enter</kbd> runs Info</label>
-        <input id="path" type="text" spellcheck="false" autocomplete="off"
-               placeholder="absolute path to a PE, ELF or Mach-O file">
-      </div>
-    </div>
-    <fieldset class="options">
-      <legend>Options</legend>
-      <div class="grid-opts">
-        <div>
-          <label for="address">Address (hex or decimal)</label>
-          <input id="address" type="text" spellcheck="false" autocomplete="off" value="0x401000">
-        </div>
-        <div>
-          <label for="limit">Limit</label>
-          <input id="limit" type="number" min="0" max="200000" step="1" value="100">
-        </div>
-        <div>
-          <label for="min_length">Strings &middot; min length</label>
-          <input id="min_length" type="number" min="1" max="200000" step="1" value="4">
-        </div>
-        <div>
-          <label for="max_fields">Struct &middot; max fields</label>
-          <input id="max_fields" type="number" min="1" max="512" step="1" value="64">
-        </div>
-        <div>
-          <label for="limit_edges">Callgraph &middot; max edges</label>
-          <input id="limit_edges" type="number" min="1" max="200000" step="1" value="5000">
-        </div>
-        <div>
-          <label for="traversal">CFG traversal</label>
-          <div class="selwrap">
-            <select id="traversal">
-              <option value="linear">linear</option>
-              <option value="recursive">recursive</option>
-            </select>
-          </div>
-        </div>
-        <div>
-          <label for="include_stack">Struct &middot; include stack</label>
-          <div class="selwrap">
-            <select id="include_stack">
-              <option value="0">no</option>
-              <option value="1">yes</option>
-            </select>
-          </div>
-        </div>
-      </div>
-    </fieldset>
-    <p class="group-label">Run analysis</p>
-    <div class="grid-opts" style="margin-bottom:14px">
-      <div>
-        <label for="backend">Decompile &middot; backend</label>
-        <div class="selwrap">
-          <select id="backend">
-            <option value="auto">auto</option>
-            <option value="native">native</option>
-            <option value="angr">angr</option>
-            <option value="ghidra">ghidra</option>
-          </select>
-        </div>
-      </div>
-    </div>
-    <div class="verbs">
-      <button type="button" data-action="info">Info</button>
-      <button type="button" data-action="functions">Functions</button>
-      <button type="button" data-action="strings">Strings</button>
-      <button type="button" data-action="xrefs">Xrefs</button>
-      <button type="button" data-action="cfg">CFG</button>
-      <button type="button" data-action="struct">Struct</button>
-      <button type="button" data-action="callgraph">Callgraph</button>
-      <button type="button" data-action="decompile">Decompile</button>
-    </div>
-  </section>
 
   <section class="card">
-    <div class="card-head">
-      <h2>Diff two binaries</h2>
-      <p class="hint">pair every function across two builds of the same program</p>
-    </div>
-    <div class="row-2col">
-      <div class="mono">
-        <label for="left">Baseline</label>
-        <input id="left" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path">
-      </div>
-      <div class="mono">
-        <label for="right">Candidate</label>
-        <input id="right" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path">
-      </div>
-    </div>
-    <div class="grid-opts" style="margin-top:12px">
-      <div>
-        <label for="semantic">Mode</label>
-        <div class="selwrap">
-          <select id="semantic">
-            <option value="0">structural</option>
-            <option value="1">semantic</option>
-          </select>
-        </div>
+    <p class="step-tag"><span class="n">1</span> Pick a file</p>
+    <div class="hero-row">
+      <div class="grow mono">
+        <label for="path">Binary path <kbd>Enter</kbd></label>
+        <input id="path" type="text" spellcheck="false" autocomplete="off"
+               placeholder="absolute path &mdash; e.g. a .exe, .dll, .so or Mach-O file">
       </div>
       <div>
-        <label for="threshold" title="0-1 similarity cutoff: 0 pairs everything, 1 demands identical shapes">Semantic threshold</label>
-        <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.5">
+        <label style="visibility:hidden">run</label>
+        <button type="button" id="run-info" class="primary" data-action="info">Analyze &rsaquo;</button>
       </div>
     </div>
-    <div class="verbs" style="margin-top:14px; grid-template-columns: minmax(0, 200px)">
-      <button type="button" data-action="diff" class="primary">Diff</button>
-    </div>
+    <p class="hero-hint">
+      The file is only read from disk &mdash; never executed, never modified, never uploaded.
+      Start with <b>Analyze</b>: you get a plain-language overview, then the views below dig deeper.
+    </p>
   </section>
 
   <section class="card result">
@@ -494,17 +459,195 @@ _BODY = """
       <h2>Result</h2>
       <span class="status" id="status">idle</span>
     </div>
-    <div class="table-wrap">
+    <div id="empty">
+      <p class="big">Nothing loaded yet</p>
+      <p>Type the path to a program above and press <b>Analyze</b> (or Enter).
+         You will see what the file is made of &mdash; then each view below answers one question about it.</p>
+    </div>
+    <div id="summary" class="hidden"></div>
+    <div id="codeview" class="hidden"><pre id="codepre"></pre></div>
+    <div class="table-wrap hidden">
       <table id="tbl">
         <thead><tr></tr></thead>
         <tbody></tbody>
       </table>
     </div>
-    <details class="raw" open>
-      <summary>Raw JSON</summary>
-      <pre id="out">No request yet. Point the path field at a binary and pick an analysis above.</pre>
+    <details class="raw">
+      <summary>Raw JSON (for scripts and agents)</summary>
+      <pre id="out">No request yet.</pre>
     </details>
   </section>
+
+  <section class="card">
+    <p class="step-tag"><span class="n">2</span> Dig deeper &mdash; one question per view</p>
+    <div class="tools">
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">fn</span><b>Functions</b></div>
+        <p class="desc">What code lives here? Lists candidate functions and how confident we are about each.</p>
+        <div class="tool-opts single">
+          <div>
+            <label for="fn-limit">Max rows</label>
+            <input id="fn-limit" type="number" min="1" max="200000" step="1" value="100">
+          </div>
+        </div>
+        <button type="button" data-action="functions">Show functions</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">tx</span><b>Text inside</b></div>
+        <p class="desc">Readable strings hidden in the file &mdash; names, messages, URLs, paths.</p>
+        <div class="tool-opts">
+          <div>
+            <label for="st-min">Shortest string</label>
+            <input id="st-min" type="number" min="1" max="200000" step="1" value="4">
+          </div>
+          <div>
+            <label for="st-limit">Max rows</label>
+            <input id="st-limit" type="number" min="1" max="200000" step="1" value="100">
+          </div>
+        </div>
+        <button type="button" data-action="strings">Show strings</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">xr</span><b>Who calls whom</b></div>
+        <p class="desc">Cross-references: every direct call, jump and branch between addresses.</p>
+        <div class="tool-opts single">
+          <div>
+            <label for="xr-limit">Max rows</label>
+            <input id="xr-limit" type="number" min="1" max="200000" step="1" value="100">
+          </div>
+        </div>
+        <button type="button" data-action="xrefs">Show xrefs</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">cf</span><b>Code flow</b></div>
+        <p class="desc">A control-flow map of one function &mdash; the blocks it runs and where it branches.</p>
+        <div class="tool-opts">
+          <div class="full mono">
+            <label for="cfg-address">Start address</label>
+            <input id="cfg-address" type="text" spellcheck="false" autocomplete="off" value="0x401000">
+          </div>
+          <div class="full">
+            <label for="cfg-traversal" title="linear walks a whole region; recursive follows only reachable code">Style</label>
+            <div class="selwrap">
+              <select id="cfg-traversal">
+                <option value="linear">linear &mdash; whole region</option>
+                <option value="recursive">recursive &mdash; follow the flow</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <button type="button" data-action="cfg">Show code flow</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">st</span><b>Data layouts</b></div>
+        <p class="desc">Guesses the struct/layout of data at an address, from how the code reads and writes it.</p>
+        <div class="tool-opts">
+          <div class="full mono">
+            <label for="su-address">Address</label>
+            <input id="su-address" type="text" spellcheck="false" autocomplete="off" value="0x401000">
+          </div>
+          <div>
+            <label for="su-max">Max fields</label>
+            <input id="su-max" type="number" min="1" max="512" step="1" value="64">
+          </div>
+          <div>
+            <label for="su-stack">Stack vars</label>
+            <div class="selwrap">
+              <select id="su-stack">
+                <option value="0">exclude</option>
+                <option value="1">include</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <button type="button" data-action="struct">Show layout</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">dc</span><b>Read as C</b></div>
+        <p class="desc">Turns the function at an address back into readable C-like pseudocode &mdash; a heuristic sketch, not the original source.</p>
+        <div class="tool-opts">
+          <div class="full mono">
+            <label for="dc-address">Function address</label>
+            <input id="dc-address" type="text" spellcheck="false" autocomplete="off" value="0x401000">
+          </div>
+          <div class="full">
+            <label for="backend" title="auto picks the best engine installed; built-in always works">Engine</label>
+            <div class="selwrap">
+              <select id="backend">
+                <option value="auto">auto</option>
+                <option value="native">built-in</option>
+                <option value="angr">angr</option>
+                <option value="ghidra">ghidra</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <button type="button" data-action="decompile">Decompile</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">cg</span><b>Call map</b></div>
+        <p class="desc">Which functions call which &mdash; the program's overall structure at a glance.</p>
+        <div class="tool-opts">
+          <div>
+            <label for="cg-limit">Max functions</label>
+            <input id="cg-limit" type="number" min="1" max="200000" step="1" value="100">
+          </div>
+          <div>
+            <label for="cg-edges">Max edges</label>
+            <input id="cg-edges" type="number" min="1" max="200000" step="1" value="5000">
+          </div>
+        </div>
+        <button type="button" data-action="callgraph">Show call map</button>
+      </div>
+
+    </div>
+  </section>
+
+  <details class="diffbox">
+    <summary>Advanced &mdash; compare two versions of the same program</summary>
+    <div class="diffbox-body">
+      <p class="kv-note" style="margin:0 0 12px">
+        Give a baseline and a candidate build; CODEVANTA pairs up functions and shows
+        what changed, was added, or disappeared.
+      </p>
+      <div class="diffgrid">
+        <div class="mono">
+          <label for="left">Baseline (old)</label>
+          <input id="left" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path">
+        </div>
+        <div class="mono">
+          <label for="right">Candidate (new)</label>
+          <input id="right" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path">
+        </div>
+      </div>
+      <div class="diffgrid" style="grid-template-columns: 1fr 1fr; max-width:520px">
+        <div>
+          <label for="semantic">Matching</label>
+          <div class="selwrap">
+            <select id="semantic">
+              <option value="0">structural</option>
+              <option value="1">semantic (fuzzy)</option>
+            </select>
+          </div>
+        </div>
+        <div>
+          <label for="threshold" title="0 pairs everything, 1 demands identical shapes">Strictness</label>
+          <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.5">
+        </div>
+      </div>
+      <div style="max-width:220px; margin-top:14px">
+        <button type="button" data-action="diff" class="primary" style="width:100%">Compare</button>
+      </div>
+    </div>
+  </details>
+
 </main>
 """
 
@@ -550,6 +693,25 @@ _SCRIPT = """
     element.className = isError ? "status error" : "status";
   }
 
+  function showView(name) {
+    var empty = byId("empty");
+    var summary = byId("summary");
+    var codeview = byId("codeview");
+    var tableWrap = document.querySelector(".table-wrap");
+    if (empty) {
+      empty.className = name === "empty" ? "" : "hidden";
+    }
+    if (summary) {
+      summary.className = name === "summary" ? "" : "hidden";
+    }
+    if (codeview) {
+      codeview.className = name === "code" ? "" : "hidden";
+    }
+    if (tableWrap) {
+      tableWrap.className = name === "table" ? "table-wrap" : "table-wrap hidden";
+    }
+  }
+
   function addParam(parts, key, value) {
     if (value === null || value === undefined || value === "") {
       return;
@@ -568,24 +730,26 @@ _SCRIPT = """
     }
     addParam(parts, "path", fieldValue("path"));
     if (action === "info") {
-      addParam(parts, "max_functions", fieldValue("limit"));
-    } else if (action === "functions" || action === "xrefs") {
-      addParam(parts, "limit", fieldValue("limit"));
+      addParam(parts, "max_functions", fieldValue("fn-limit"));
+    } else if (action === "functions") {
+      addParam(parts, "limit", fieldValue("fn-limit"));
+    } else if (action === "xrefs") {
+      addParam(parts, "limit", fieldValue("xr-limit"));
     } else if (action === "strings") {
-      addParam(parts, "limit", fieldValue("limit"));
-      addParam(parts, "min_length", fieldValue("min_length"));
+      addParam(parts, "limit", fieldValue("st-limit"));
+      addParam(parts, "min_length", fieldValue("st-min"));
     } else if (action === "cfg") {
-      addParam(parts, "address", fieldValue("address"));
-      addParam(parts, "traversal", fieldValue("traversal") || "linear");
+      addParam(parts, "address", fieldValue("cfg-address"));
+      addParam(parts, "traversal", fieldValue("cfg-traversal") || "linear");
     } else if (action === "struct") {
-      addParam(parts, "address", fieldValue("address"));
-      addParam(parts, "include_stack", fieldValue("include_stack") || "0");
-      addParam(parts, "max_fields", fieldValue("max_fields"));
+      addParam(parts, "address", fieldValue("su-address"));
+      addParam(parts, "include_stack", fieldValue("su-stack") || "0");
+      addParam(parts, "max_fields", fieldValue("su-max"));
     } else if (action === "callgraph") {
-      addParam(parts, "limit_functions", fieldValue("limit"));
-      addParam(parts, "limit_edges", fieldValue("limit_edges"));
+      addParam(parts, "limit_functions", fieldValue("cg-limit"));
+      addParam(parts, "limit_edges", fieldValue("cg-edges"));
     } else if (action === "decompile") {
-      addParam(parts, "address", fieldValue("address"));
+      addParam(parts, "address", fieldValue("dc-address"));
       addParam(parts, "backend", fieldValue("backend") || "auto");
     }
     return parts;
@@ -712,6 +876,119 @@ _SCRIPT = """
     });
   }
 
+  function humanSize(bytes) {
+    var value = Number(bytes);
+    if (!isFinite(value) || value < 0) {
+      return String(bytes);
+    }
+    if (value < 1024) {
+      return value + " B";
+    }
+    if (value < 1024 * 1024) {
+      return (value / 1024).toFixed(1) + " KB";
+    }
+    return (value / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
+  function chipRow(container, key, value, accent) {
+    var chip = document.createElement("span");
+    chip.className = accent ? "chip acc" : "chip";
+    var k = document.createElement("span");
+    k.className = "k";
+    k.textContent = key;
+    var v = document.createElement("span");
+    v.className = "v";
+    v.textContent = value;
+    chip.appendChild(k);
+    chip.appendChild(v);
+    container.appendChild(chip);
+  }
+
+  function kvRow(container, key, value) {
+    var row = document.createElement("div");
+    row.className = "kv-row";
+    var k = document.createElement("div");
+    k.className = "k";
+    k.textContent = key;
+    var v = document.createElement("div");
+    v.className = "v";
+    v.textContent = value;
+    row.appendChild(k);
+    row.appendChild(v);
+    container.appendChild(row);
+  }
+
+  function renderSummary(payload) {
+    var box = byId("summary");
+    if (!box) {
+      return;
+    }
+    while (box.firstChild) {
+      box.removeChild(box.firstChild);
+    }
+    var binary = payload && payload.binary && typeof payload.binary === "object" ? payload.binary : {};
+
+    var chips = document.createElement("div");
+    chips.className = "chips";
+    var archBits = [binary.format, binary.architecture, binary.bitness ? binary.bitness + "-bit" : ""]
+      .filter(Boolean).join(" · ");
+    chipRow(chips, "file", archBits || "unknown", true);
+    if (binary.sections) {
+      chipRow(chips, "sections", String(binary.sections.length));
+    }
+    if (binary.imports) {
+      chipRow(chips, "imports", String(binary.imports.length));
+    }
+    if (binary.exports) {
+      chipRow(chips, "exports", String(binary.exports.length));
+    }
+    if (binary.symbols) {
+      chipRow(chips, "symbols", String(binary.symbols.length));
+    }
+    if (payload.function_count !== undefined) {
+      chipRow(chips, "functions", String(payload.function_count));
+    }
+    if (payload.string_count !== undefined) {
+      chipRow(chips, "strings", String(payload.string_count));
+    }
+    if (binary.is_stripped !== undefined) {
+      chipRow(chips, "symbols?", binary.is_stripped ? "stripped" : "present");
+    }
+    box.appendChild(chips);
+
+    var kv = document.createElement("div");
+    kv.className = "kv";
+    if (binary.path) {
+      kvRow(kv, "Path", binary.path);
+    }
+    if (binary.entry_point) {
+      kvRow(kv, "Program start (entry point)", binary.entry_point);
+    }
+    if (binary.image_base) {
+      kvRow(kv, "Image base", binary.image_base);
+    }
+    if (binary.file_size !== undefined) {
+      kvRow(kv, "File size", humanSize(binary.file_size));
+    }
+    if (binary.sha256) {
+      kvRow(kv, "SHA-256", binary.sha256);
+    }
+    if (binary.warnings && binary.warnings.length) {
+      kvRow(kv, "Notes", binary.warnings.join("  |  "));
+    }
+    box.appendChild(kv);
+
+    var note = document.createElement("p");
+    note.className = "kv-note";
+    var lead = document.createElement("b");
+    lead.textContent = "Next: ";
+    note.appendChild(lead);
+    note.appendChild(document.createTextNode(
+      "pick any view below to dig deeper \u2014 every result keeps its evidence and confidence level."
+    ));
+    box.appendChild(note);
+  }
+
   function showPayload(payload) {
     var output = byId("out");
     if (!output) {
@@ -747,11 +1024,29 @@ _SCRIPT = """
       .then(function (result) {
         showPayload(result.data);
         if (result.ok) {
-          var rows = pickRows(result.data);
-          renderTable(rows);
-          var shown = Math.min(rows.length, MAX_TABLE_ROWS);
-          var summary = "HTTP " + result.status + (rows.length ? " · " + shown + (rows.length > MAX_TABLE_ROWS ? " of " + rows.length : "") + " rows" : "");
-          setStatus(summary, false);
+          if (action === "decompile" && result.data && typeof result.data.text === "string") {
+            var codeBox = byId("codepre");
+            if (codeBox) {
+              codeBox.textContent = result.data.text;
+            }
+            showView("code");
+            var engineName = result.data.backend ? String(result.data.backend) : "?";
+            var warnCount = result.data.warnings && result.data.warnings.length
+              ? " · " + result.data.warnings.length + " warning(s)"
+              : "";
+            setStatus("HTTP " + result.status + " · engine " + engineName + warnCount, false);
+          } else if (action === "info") {
+            renderSummary(result.data);
+            showView("summary");
+            setStatus("HTTP " + result.status + " · overview", false);
+          } else {
+            var rows = pickRows(result.data);
+            renderTable(rows);
+            showView(rows.length ? "table" : "empty");
+            var shown = Math.min(rows.length, MAX_TABLE_ROWS);
+            var summary = "HTTP " + result.status + (rows.length ? " · " + shown + (rows.length > MAX_TABLE_ROWS ? " of " + rows.length : "") + " rows" : " · no rows");
+            setStatus(summary, false);
+          }
           var resultCard = document.querySelector(".card.result");
           if (resultCard && resultCard.scrollIntoView) {
             resultCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -760,12 +1055,14 @@ _SCRIPT = """
           var detail = result.data && result.data.error ? result.data.error : "request failed";
           setStatus("HTTP " + result.status + " " + detail, true);
           renderTable([]);
+          showView("empty");
         }
       })
       .catch(function (error) {
         showPayload({ error: String(error) });
         setStatus("request failed", true);
         renderTable([]);
+        showView("empty");
       });
   }
 
