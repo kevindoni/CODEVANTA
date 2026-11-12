@@ -47,6 +47,19 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- Type propagation for the pseudo-C decompiler (`codevanta.analysis.type_propagation`):
+  per-argument inference from how each register is used (pointer dereference,
+  sub-width load, arithmetic, comparison against zero, unused), a return type from
+  the last write before `ret`, and every verdict carrying the observation that
+  produced it at a stated confidence. The decompiler signature and
+  `evidence.extra` now say `uint64_t * a0` / `int32_t a1` / `uint32_t` instead of
+  `undefined64` for everything.
+- Decompiler parity job (`decompile-parity` in CI): installs the new
+  `decompilers` extra, prints `scripts/check_decompiler_backends.py`, and runs
+  `tests/test_decompiler_parity.py`, which decompiles a fixture through a real
+  angr backend and asserts the provider layer picked it instead of the native
+  fallback. `scripts/check_decompiler_backends.py` gives the same availability
+  report locally, with `--json` for tooling.
 - MCP: `codevanta_entropy` exposes the entropy triage over MCP (same bounded
   `threshold` / `max_sample_bytes` validation as the CLI), and
   `codevanta_analyze` gains `include_xrefs` / `include_cfg` /
