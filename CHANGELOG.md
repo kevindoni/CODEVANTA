@@ -81,7 +81,6 @@ All notable changes to CODEVANTA are documented here. The format follows
   and six runnable recipes whose printed output is the real output; plus a page
   per sample binary with its SHA-256 and one working command each.
 
->>>>>>> 67ee2c0 (feat(v0.1.0): local web GUI, fat Mach-O, MCP HTTP, samples, tooling, docs)
 - Big-endian UTF-16 string extraction (`codevanta.core.strings`): the UTF-16
   scan now follows the binary's endianness — big-endian targets (e.g. MIPS,
   s390x, PowerPC) yield `utf-16be` strings, little-endian targets keep
