@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import xml.parsers.expat
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -24,6 +25,53 @@ from codevanta.analysis.graph_export import (
 )
 
 EXPORTERS = (to_dot, to_graphml)
+
+
+def _reject_entity(*args: object) -> None:
+    raise ValueError("entity declarations are not accepted by this parser")
+
+
+def _parse_xml(text: str) -> ElementTree.Element:
+    """Parse ``text`` with DTD and entity expansion disabled.
+
+    ``xml.etree`` expands internal entities by default (the "billion laughs"
+    family), and its C ``XMLParser`` does not expose the expat hooks needed to
+    forbid them. This builder goes straight to :mod:`xml.parsers.expat` with
+    parameter-entity parsing off, entity declarations rejected, and external
+    entity references refused — safe by construction even if a fixture ever
+    regressed into parsing untrusted markup. The exporter's own output never
+    carries a DTD, so valid documents parse identically.
+    """
+    parser = xml.parsers.expat.ParserCreate()
+    parser.SetParamEntityParsing(xml.parsers.expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.EntityDeclHandler = _reject_entity
+    parser.ExternalEntityRefHandler = lambda *args: False
+
+    stack: list[ElementTree.Element] = []
+    root: list[ElementTree.Element] = []
+
+    def start(name: str, attributes: dict[str, str]) -> None:
+        element = ElementTree.Element(name, attributes)
+        if stack:
+            stack[-1].append(element)
+        else:
+            root.append(element)
+        stack.append(element)
+
+    def end(name: str) -> None:
+        stack.pop()
+
+    def characters(chunk: str) -> None:
+        if stack and stack[-1].text is None:
+            stack[-1].text = chunk
+        elif stack:
+            stack[-1].text += chunk
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.CharacterDataHandler = characters
+    parser.Parse(text, True)
+    return root[0]
 
 
 def _graph(nodes: list[dict], edges: list[dict]) -> dict:
@@ -186,7 +234,7 @@ def test_dot_empty_graph_is_still_valid_structure() -> None:
 def test_graphml_parses_with_matching_counts_and_labels() -> None:
     """GraphML round-trips node/edge counts and labels through ElementTree."""
     graph = _sample_graph()
-    root = ElementTree.fromstring(to_graphml(graph))
+    root = _parse_xml(to_graphml(graph))
     keys = _key_names(root)
 
     assert to_graphml(graph).startswith("<?xml")
@@ -211,7 +259,7 @@ def test_graphml_parses_with_matching_counts_and_labels() -> None:
 
 def test_graphml_declares_directed_graph_and_desc_title() -> None:
     """The graph element is directed and carries the title in ``desc``."""
-    root = ElementTree.fromstring(to_graphml(_sample_graph(), title="xrefs <sample> & co"))
+    root = _parse_xml(to_graphml(_sample_graph(), title="xrefs <sample> & co"))
 
     graphs = _elements(root, "graph")
     assert len(graphs) == 1
@@ -221,7 +269,7 @@ def test_graphml_declares_directed_graph_and_desc_title() -> None:
 
 def test_graphml_default_title_is_used() -> None:
     """A blank title falls back to the module default in both formats."""
-    root = ElementTree.fromstring(to_graphml(_graph([], []), title="   "))
+    root = _parse_xml(to_graphml(_graph([], []), title="   "))
 
     assert _elements(root, "desc")[0].text == DEFAULT_TITLE
     assert to_dot(_graph([], []), title="").startswith(f'digraph "{DEFAULT_TITLE}"')
@@ -230,7 +278,7 @@ def test_graphml_default_title_is_used() -> None:
 def test_graphml_escapes_xml_special_characters() -> None:
     """Labels containing XML metacharacters survive a parse round-trip."""
     label = 'a<b>&"c"\'\nsecond'
-    root = ElementTree.fromstring(to_graphml(_graph([{"id": "node <1>", "label": label}], [])))
+    root = _parse_xml(to_graphml(_graph([{"id": "node <1>", "label": label}], [])))
 
     node = _elements(root, "node")[0]
     assert node.get("id") == "node <1>"
@@ -247,7 +295,7 @@ def test_graphml_is_deterministic_regardless_of_input_order() -> None:
 
 def test_graphml_edge_label_defaults_to_call() -> None:
     """An unlabeled edge is exported with the default ``call`` label."""
-    root = ElementTree.fromstring(
+    root = _parse_xml(
         to_graphml(_graph([{"id": "a", "label": "a"}], [{"source": "a", "target": "a"}]))
     )
 
@@ -257,14 +305,14 @@ def test_graphml_edge_label_defaults_to_call() -> None:
 
 def test_graphml_omits_kind_data_when_kind_is_absent() -> None:
     """Nodes without a ``kind`` do not emit an empty kind element."""
-    root = ElementTree.fromstring(to_graphml(_graph([{"id": "a", "label": "a"}], [])))
+    root = _parse_xml(to_graphml(_graph([{"id": "a", "label": "a"}], [])))
 
     assert "kind" not in _data(_elements(root, "node")[0], _key_names(root))
 
 
 def test_graphml_empty_graph_round_trips() -> None:
     """An empty graph yields a valid document with no node/edge elements."""
-    root = ElementTree.fromstring(to_graphml(_graph([], [])))
+    root = _parse_xml(to_graphml(_graph([], [])))
 
     assert _elements(root, "node") == []
     assert _elements(root, "edge") == []
