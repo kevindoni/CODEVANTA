@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,7 +12,9 @@ import pytest
 
 from codevanta.core.loader import BinaryInfo
 from codevanta.storage.session import (
+    MAX_NOTE_LENGTH,
     SESSION_ID_LENGTH,
+    Annotation,
     SessionError,
     SessionRecord,
     SessionStore,
@@ -266,3 +269,169 @@ def test_in_memory_store_supported(sample_info: BinaryInfo) -> None:
     with SessionStore(":memory:") as memory_store:
         saved = memory_store.save(sample_info, 1, 2)
         assert memory_store.get(saved.session_id) == saved
+
+
+# ---- annotations ------------------------------------------------------
+
+
+def test_annotate_and_list_annotation(
+    store: SessionStore, sample_info: BinaryInfo
+) -> None:
+    saved = store.save(sample_info, 2, 3)
+
+    annotation = store.annotate(saved.session_id, 0x401000, "entry point")
+
+    assert isinstance(annotation, Annotation)
+    assert annotation.session_id == saved.session_id
+    assert annotation.address == 0x401000
+    assert annotation.note == "entry point"
+    payload = annotation.to_dict()
+    assert payload["address"] == "0x401000"
+    assert payload["note"] == "entry point"
+    assert payload["session_id"] == saved.session_id
+    created = datetime.fromisoformat(annotation.created_at)
+    assert created.utcoffset() == timezone.utc.utcoffset(created)
+
+    listed = store.annotations(saved.session_id)
+    assert listed == [annotation]
+    assert listed[0].to_dict()["address"] == "0x401000"
+
+
+def test_annotation_is_frozen(store: SessionStore, sample_info: BinaryInfo) -> None:
+    saved = store.save(sample_info, 1, 1)
+    annotation = store.annotate(saved.session_id, 0x10, "note")
+
+    with pytest.raises(FrozenInstanceError):
+        annotation.note = "changed"  # type: ignore[misc]
+
+
+def test_annotate_upserts_a_single_row(
+    store: SessionStore, sample_info: BinaryInfo, db_path: Path
+) -> None:
+    saved = store.save(sample_info, 1, 1)
+
+    store.annotate(saved.session_id, 0x401000, "first note")
+    updated = store.annotate(saved.session_id, 0x401000, "second note")
+
+    listed = store.annotations(saved.session_id)
+    assert len(listed) == 1
+    assert listed[0].note == "second note"
+    assert listed[0] == updated
+
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT note FROM annotations WHERE session_id = ?",
+            (saved.session_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [("second note",)]
+
+
+def test_annotations_ordered_by_address_ascending(
+    store: SessionStore, sample_info: BinaryInfo
+) -> None:
+    saved = store.save(sample_info, 1, 1)
+    for address in (0x5000, 0x10, 0x401000, 0):
+        store.annotate(saved.session_id, address, f"note at {address:#x}")
+
+    assert [item.address for item in store.annotations(saved.session_id)] == [
+        0,
+        0x10,
+        0x5000,
+        0x401000,
+    ]
+
+
+def test_annotations_are_scoped_per_session(
+    store: SessionStore, sample_info: BinaryInfo
+) -> None:
+    first = store.save(sample_info, 1, 1)
+    second = store.save(sample_info, 2, 2)
+    store.annotate(first.session_id, 0x401000, "first")
+    store.annotate(second.session_id, 0x401000, "second")
+
+    assert [item.note for item in store.annotations(first.session_id)] == ["first"]
+    assert [item.note for item in store.annotations(second.session_id)] == ["second"]
+
+
+def test_remove_annotation_returns_true_then_false(
+    store: SessionStore, sample_info: BinaryInfo
+) -> None:
+    saved = store.save(sample_info, 1, 1)
+    store.annotate(saved.session_id, 0x401000, "remove me")
+
+    assert store.remove_annotation(saved.session_id, 0x401000) is True
+    assert store.remove_annotation(saved.session_id, 0x401000) is False
+    assert store.annotations(saved.session_id) == []
+
+
+def test_unknown_session_raises_for_annotations(store: SessionStore) -> None:
+    with pytest.raises(SessionError):
+        store.annotate("missing-session", 0x401000, "note")
+    with pytest.raises(SessionError):
+        store.annotations("missing-session")
+    assert store.remove_annotation("missing-session", 0x401000) is False
+
+
+@pytest.mark.parametrize("note", ["", "   ", "\n\t "])
+def test_blank_note_rejected(
+    store: SessionStore, sample_info: BinaryInfo, note: str
+) -> None:
+    saved = store.save(sample_info, 1, 1)
+
+    with pytest.raises(SessionError):
+        store.annotate(saved.session_id, 0x401000, note)
+    assert store.annotations(saved.session_id) == []
+
+
+def test_overlong_note_rejected(
+    store: SessionStore, sample_info: BinaryInfo
+) -> None:
+    saved = store.save(sample_info, 1, 1)
+
+    with pytest.raises(SessionError):
+        store.annotate(saved.session_id, 0x401000, "x" * (MAX_NOTE_LENGTH + 1))
+
+    boundary = "x" * MAX_NOTE_LENGTH
+    stored = store.annotate(saved.session_id, 0x401000, boundary)
+    assert stored.note == boundary
+
+
+def test_negative_address_rejected(store: SessionStore, sample_info: BinaryInfo) -> None:
+    saved = store.save(sample_info, 1, 1)
+
+    with pytest.raises(SessionError):
+        store.annotate(saved.session_id, -1, "note")
+    assert store.annotations(saved.session_id) == []
+
+
+def test_annotations_persist_across_instances(
+    db_path: Path, sample_info: BinaryInfo
+) -> None:
+    with SessionStore(db_path) as first_store:
+        saved = first_store.save(sample_info, 1, 1)
+        first_store.annotate(saved.session_id, 0x401000, "persisted")
+
+    with SessionStore(db_path) as second_store:
+        listed = second_store.annotations(saved.session_id)
+    assert [item.note for item in listed] == ["persisted"]
+    assert listed[0].to_dict()["address"] == "0x401000"
+
+
+def test_schema_creates_annotations_table(db_path: Path, sample_info: BinaryInfo) -> None:
+    with SessionStore(db_path) as schema_store:
+        schema_store.save(sample_info, 1, 1)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'annotations'"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert row is not None
+    assert "PRIMARY KEY (session_id, address)" in row[0]
+

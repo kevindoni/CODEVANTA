@@ -28,14 +28,43 @@ All notable changes to CODEVANTA are documented here. The format follows
   `codevanta cfg` (with `--address`/`--function`, `--max-instructions`,
   `--max-blocks`, `--json`), and `codevanta session save|list|show` (with
   `--db`, defaulting to `$CODEVANTA_DB` or `~/.codevanta/sessions.db`).
+- Direct-call call graph (`codevanta.analysis.callgraph`): `build_call_graph`
+  aggregates the `call` cross references into `CallGraphNode` /
+  `CallGraphEdge` records plus a generic `{nodes, edges}` model. Every call
+  target that is not a known candidate becomes an `external` node, edges are
+  deduplicated by `(source, target, from_address)` and bounded by
+  `max_functions` / `max_edges`. Caller attribution is heuristic — the nearest
+  function candidate at or below the call site inside the same section — so the
+  graph reports `medium` confidence, uses the call address as the source for
+  unattributable sites, and says so in `warnings`.
+- Graph export (`codevanta.analysis.graph_export`): dependency-free `to_dot` and
+  `to_graphml` render the shared graph model with deterministic ordering, strict
+  contract validation (`GraphExportError`), escaped/quoted DOT strings, and a
+  GraphML document with `label`/`kind`/edge-label keys. Output only — nothing is
+  written to disk.
+- Session annotations (`codevanta.storage.session`): `Annotation` records plus
+  `annotate` (one upsertable note per `(session_id, address)`), `annotations`
+  (ordered by address), and `remove_annotation`. Notes are bounded to 4,000
+  characters, blank notes and unknown sessions raise `SessionError`.
+- MCP tools: `codevanta_xrefs`, `codevanta_cfg`, `codevanta_session_save`, and
+  `codevanta_session_list` join the five phase 1 tools, for nine tools total.
+  Bounded arguments, shared database resolution (explicit `db`, then
+  `$CODEVANTA_DB`, then `~/.codevanta/sessions.db`), and the same evidence
+  semantics as the CLI.
+- CLI: `codevanta callgraph` (with `--limit-functions`, `--limit-edges`,
+  `--format json|dot|graphml`, `--output`/`-o`) and
+  `codevanta session annotate SESSION_ID ADDRESS NOTE` /
+  `codevanta session notes SESSION_ID` (decimal or `0x` hex addresses, `--db`).
 
 ### Notes
 
-- Phase 2 is in progress: linear sweep only, direct branch targets only, no
-  recursive traversal, no call-graph recursion, no graph viewer, and no
-  debugger yet. See `docs/phase2.md`.
-- Phase 2 results are not exposed over MCP yet; the server still serves the five
-  phase 1 tools.
+- Phase 2 is in progress: linear sweep only, direct branch targets only, call
+  graph edges from direct calls only, no recursive traversal, no indirect-call
+  resolution, no graph viewer, and no debugger yet. See `docs/phase2.md` and
+  `docs/phase2b.md`.
+- Node boundaries and caller attribution are heuristics, not proven function
+  extents. Sessions and annotations live in one local SQLite file with no schema
+  migrations yet.
 
 ## [0.1.0] - 2026-12-11
 

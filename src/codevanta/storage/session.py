@@ -6,6 +6,11 @@ string counts gathered by later phases. Sessions are additive — saving the
 same binary twice creates two rows with distinct identifiers, which keeps an
 audit trail of repeated analyses.
 
+Sessions can also carry *annotations*: one free-text note per address, kept
+in the ``annotations`` table and keyed by ``(session_id, address)`` so that
+re-annotating an address replaces the previous note instead of appending a
+duplicate row.
+
 The module uses the standard library only (``sqlite3``, ``uuid``,
 ``datetime``, ``pathlib``) and issues parameterized SQL exclusively.
 """
@@ -24,7 +29,9 @@ from codevanta.core.loader import BinaryInfo
 __all__ = [
     "DEFAULT_LIMIT",
     "MAX_LIMIT",
+    "MAX_NOTE_LENGTH",
     "SESSION_ID_LENGTH",
+    "Annotation",
     "SessionError",
     "SessionRecord",
     "SessionStore",
@@ -39,6 +46,9 @@ MAX_LIMIT = 10_000
 
 #: Number of hex characters used for generated session identifiers.
 SESSION_ID_LENGTH = 12
+
+#: Maximum accepted length of a single annotation note, in characters.
+MAX_NOTE_LENGTH = 4000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -56,6 +66,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions (created_at);
+
+CREATE TABLE IF NOT EXISTS annotations (
+    session_id    TEXT NOT NULL,
+    address       INTEGER NOT NULL,
+    note          TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (session_id, address)
+);
+
+CREATE INDEX IF NOT EXISTS idx_annotations_session ON annotations (session_id);
 """
 
 _COLUMNS = (
@@ -67,6 +87,15 @@ _INSERT = (
     "INSERT INTO sessions (session_id, created_at, binary_path, sha256, format, "
     "architecture, bitness, entry_point, functions, strings, notes) "
     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+_ANNOTATION_COLUMNS = "session_id, address, note, created_at"
+
+_ANNOTATION_UPSERT = (
+    "INSERT INTO annotations (session_id, address, note, created_at) "
+    "VALUES (?, ?, ?, ?) "
+    "ON CONFLICT (session_id, address) DO UPDATE SET "
+    "note = excluded.note, created_at = excluded.created_at"
 )
 
 
@@ -104,6 +133,25 @@ class SessionRecord:
             "functions": self.functions,
             "strings": self.strings,
             "notes": self.notes,
+        }
+
+
+@dataclass(frozen=True)
+class Annotation:
+    """A free-text note attached to one address inside a session."""
+
+    session_id: str
+    address: int
+    note: str
+    created_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the annotation, rendering the address as hex."""
+        return {
+            "session_id": self.session_id,
+            "address": f"0x{self.address:x}",
+            "note": self.note,
+            "created_at": self.created_at,
         }
 
 
@@ -264,7 +312,98 @@ class SessionStore:
             raise SessionError(f"cannot delete session {session_id}: {exc}") from exc
         return cursor.rowcount > 0
 
+    # ---- annotations --------------------------------------------------
+
+    def annotate(self, session_id: str, address: int, note: str) -> Annotation:
+        """Attach ``note`` to ``address`` inside ``session_id``.
+
+        Notes are unique per ``(session_id, address)`` pair: annotating an
+        address a second time replaces the stored note (and its timestamp)
+        instead of adding another row.
+        """
+        self._require_open()
+        sid = _require_session_id(session_id)
+        addr = _require_address(address)
+        text = _require_note(note)
+        if not self._session_exists(sid):
+            raise SessionError(f"unknown session {sid}")
+
+        annotation = Annotation(
+            session_id=sid,
+            address=addr,
+            note=text,
+            created_at=_utc_now(),
+        )
+        try:
+            self._conn.execute(
+                _ANNOTATION_UPSERT,
+                (
+                    annotation.session_id,
+                    annotation.address,
+                    annotation.note,
+                    annotation.created_at,
+                ),
+            )
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            self._conn.rollback()
+            raise SessionError(
+                f"cannot annotate address 0x{addr:x} in session {sid}: {exc}"
+            ) from exc
+        return annotation
+
+    def annotations(self, session_id: str) -> list[Annotation]:
+        """Return every annotation of ``session_id``, lowest address first."""
+        self._require_open()
+        sid = _require_session_id(session_id)
+        if not self._session_exists(sid):
+            raise SessionError(f"unknown session {sid}")
+        try:
+            rows = self._conn.execute(
+                f"SELECT {_ANNOTATION_COLUMNS} FROM annotations "
+                "WHERE session_id = ? ORDER BY address ASC",
+                (sid,),
+            ).fetchall()
+        except sqlite3.Error as exc:  # pragma: no cover - defensive
+            raise SessionError(f"cannot list annotations for session {sid}: {exc}") from exc
+        return [_row_to_annotation(row) for row in rows]
+
+    def remove_annotation(self, session_id: str, address: int) -> bool:
+        """Drop the note at ``address`` and return ``True`` when one existed.
+
+        Unknown sessions and unknown addresses simply report ``False`` so the
+        call stays idempotent.
+        """
+        self._require_open()
+        if not _is_usable_id(session_id):
+            return False
+        if isinstance(address, bool) or not isinstance(address, int) or address < 0:
+            return False
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM annotations WHERE session_id = ? AND address = ?",
+                (session_id, address),
+            )
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            self._conn.rollback()
+            raise SessionError(
+                f"cannot remove annotation at 0x{address:x} in session {session_id}: {exc}"
+            ) from exc
+        return cursor.rowcount > 0
+
     # ---- helpers ------------------------------------------------------
+
+    def _session_exists(self, session_id: str) -> bool:
+        """Return ``True`` when a row with ``session_id`` is stored."""
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:  # pragma: no cover - defensive
+            raise SessionError(f"cannot read session {session_id}: {exc}") from exc
+        return row is not None
 
     def _require_open(self) -> None:
         if self._closed:
@@ -320,6 +459,37 @@ def _require_count(value: int, name: str) -> int:
 def _utc_now() -> str:
     """Current UTC time as an ISO-8601 string with a numeric offset."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _require_address(address: Any) -> int:
+    """Validate an annotation address, which must be a non-negative integer."""
+    if isinstance(address, bool) or not isinstance(address, int):
+        raise SessionError("address must be an integer")
+    if address < 0:
+        raise SessionError("address must not be negative")
+    return address
+
+
+def _require_note(note: Any) -> str:
+    """Validate an annotation note: a non-blank string of bounded length."""
+    if not isinstance(note, str):
+        raise SessionError("note must be a string")
+    if not note.strip():
+        raise SessionError("note must not be empty")
+    if len(note) > MAX_NOTE_LENGTH:
+        raise SessionError(
+            f"note must be at most {MAX_NOTE_LENGTH} characters long"
+        )
+    return note
+
+
+def _row_to_annotation(row: sqlite3.Row) -> Annotation:
+    return Annotation(
+        session_id=row["session_id"],
+        address=int(row["address"]),
+        note=row["note"],
+        created_at=row["created_at"],
+    )
 
 
 def _row_to_record(row: sqlite3.Row) -> SessionRecord:

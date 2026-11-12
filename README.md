@@ -44,7 +44,7 @@ Delivered in phase 1:
 - Function candidates from exports, function symbols, and the entry point, each with source and confidence.
 - ASCII and UTF-16LE string extraction with file offset and mapped virtual address.
 - CLI: `info`, `functions`, `strings`, `disasm`, `analyze` (+ JSON report).
-- **MCP server** (`codevanta mcp serve`) exposing the same five tools to coding agents.
+- **MCP server** (`codevanta mcp serve`) exposing the phase 1 tools to coding agents.
 - **Guided setup** (`codevanta setup`) for Claude Code, Cursor, Cline, and VS Code, with plan preview, backups, and verification.
 
 ### Phase 2 (in progress)
@@ -56,14 +56,26 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   evidence and an optional callee name.
 - **Control-flow graphs** (`analysis/cfg.py`) — basic blocks and successor edges
   for one region, built by linear sweep with leader/terminator rules.
+- **Call graph** (`analysis/callgraph.py`) — direct `call` cross-references
+  aggregated into nodes and edges. Caller attribution is heuristic (nearest
+  function candidate at or below the call site in the same section), so the graph
+  reports `medium` confidence and warns when a call site cannot be attributed.
+- **Graph export** (`analysis/graph_export.py`) — the call graph rendered as
+  Graphviz DOT or GraphML by one dependency-free, deterministic exporter.
 - **Session storage** (`storage/session.py`) — additive SQLite records of each
-  analysis run (fingerprint, format, arch, entry point, function/string counts).
-- **CLI:** `codevanta xrefs`, `codevanta cfg`, `codevanta session save|list|show`.
+  analysis run (fingerprint, format, arch, entry point, function/string counts)
+  plus per-address analyst annotations (`annotate`, `annotations`,
+  `remove_annotation`; one replaceable note per address).
+- **MCP tools** — `codevanta_xrefs`, `codevanta_cfg`, `codevanta_session_save`,
+  `codevanta_session_list`, alongside the five phase 1 tools (nine in total).
+- **CLI:** `codevanta xrefs`, `codevanta cfg`, `codevanta callgraph`,
+  `codevanta session save|list|show|annotate|notes`.
 
 Phase 2 is deliberately narrow: linear sweep only, direct branch targets only,
-no recursive traversal or call-graph recursion, no graph viewer, and no debugger
-yet. See [docs/phase2.md](docs/phase2.md) for scope, confidence semantics, and
-limitations.
+call graph edges from direct calls only, no recursive traversal or indirect-call
+resolution, no graph viewer, and no debugger yet. See
+[docs/phase2.md](docs/phase2.md) and [docs/phase2b.md](docs/phase2b.md) for
+scope, confidence semantics, and limitations.
 
 ## Installation
 
@@ -93,9 +105,12 @@ codevanta analyze   samples\elf64_text.bin --output samples\report.json
 # Phase 2
 codevanta xrefs     C:\Windows\System32\notepad.exe --limit 40
 codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000
+codevanta callgraph C:\Windows\System32\notepad.exe --format dot -o callgraph.dot
 codevanta session save C:\Windows\System32\notepad.exe --notes "baseline triage"
 codevanta session list --limit 10
 codevanta session show 4f9c1a7b2d3e
+codevanta session annotate 4f9c1a7b2d3e 0x401000 "decrypts config with XOR 0x5a"
+codevanta session notes 4f9c1a7b2d3e
 ```
 
 All addresses in reports are absolute virtual addresses (VA). Function
@@ -104,9 +119,12 @@ candidates always state their detection source (`export`, `symbol`,
 
 Phase 2 results carry their own evidence: xrefs are `certain` (the target is
 read directly from the decoded operand), CFG blocks are `medium` (block
-boundaries come from mnemonic heuristics). `codevanta cfg` defaults to the entry
-point and sessions default to `$env:CODEVANTA_DB` or
-`~/.codevanta/sessions.db`.
+boundaries come from mnemonic heuristics), and the call graph is `medium`
+(calls are decoded, but caller attribution is a nearest-candidate heuristic).
+`codevanta callgraph` defaults to `--format json` and can emit `dot` or
+`graphml`; `codevanta cfg` defaults to the entry point; sessions default to
+`$env:CODEVANTA_DB` or `~/.codevanta/sessions.db`, and `session annotate` accepts
+decimal or `0x` hex addresses.
 
 ## Coding agent setup (MCP)
 
@@ -129,8 +147,10 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools: `codevanta_info`, `codevanta_functions`, `codevanta_strings`,
-`codevanta_disasm`, `codevanta_analyze`.
+MCP tools (nine): `codevanta_info`, `codevanta_functions`,
+`codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
+`codevanta_xrefs`, `codevanta_cfg`, `codevanta_session_save`,
+`codevanta_session_list`.
 
 Prompt you can paste into a coding agent:
 
@@ -146,10 +166,10 @@ src/codevanta/
 ├── ir/          # backend-neutral instruction model + adapter registry
 ├── mcp_server/  # MCP tools and stdio server for coding agents
 ├── setup/       # client config planning, apply, verify (claude/cursor/cline/vscode)
-├── analysis/    # cross-references and linear-sweep CFG (phase 2)
+├── analysis/    # cross-references, call graph, linear-sweep CFG, DOT/GraphML export (phase 2)
 ├── api/         # HTTP API (phase 2+)
 ├── cli/         # Typer command line surface
-├── storage/     # SQLite session storage (phase 2)
+├── storage/     # SQLite session storage and annotations (phase 2)
 └── plugins/     # plugin system (phase 5)
 tests/           # unit and integration tests
 docs/            # architecture and install notes
@@ -168,6 +188,7 @@ ruff check src tests
 - [Project specification](PROJECT_SPEC.md)
 - [Architecture](docs/architecture.md)
 - [Phase 2 — cross-references, CFGs, sessions](docs/phase2.md)
+- [Phase 2b — call graphs, graph export, session annotations](docs/phase2b.md)
 
 ## Roadmap
 

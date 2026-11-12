@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from rich.console import Console
@@ -13,7 +13,14 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
+from codevanta.analysis.callgraph import (
+    DEFAULT_MAX_EDGES,
+    DEFAULT_MAX_FUNCTIONS,
+    CallGraph,
+    build_call_graph,
+)
 from codevanta.analysis.cfg import FunctionCFG, build_cfg
+from codevanta.analysis.graph_export import GraphExportError, to_dot, to_graphml
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
@@ -324,6 +331,75 @@ def cfg(
     _print_cfg(graph)
 
 
+#: Output formats accepted by ``codevanta callgraph``.
+CallGraphFormat = Literal["json", "dot", "graphml"]
+
+
+def _render_call_graph(graph: CallGraph, output_format: CallGraphFormat, path: Path) -> str:
+    """Render ``graph`` as JSON, DOT or GraphML text.
+
+    ``json`` serializes the analysis payload itself (:meth:`CallGraph.to_dict`);
+    ``dot`` and ``graphml`` render the generic graph model so the shared exporter
+    in :mod:`codevanta.analysis.graph_export` stays the only serializer.
+    """
+    if output_format == "dot":
+        return to_dot(graph.to_graph_model(), title=f"callgraph {path.name}")
+    if output_format == "graphml":
+        return to_graphml(graph.to_graph_model(), title=f"callgraph {path.name}")
+    return json.dumps(graph.to_dict(), indent=2)
+
+
+@app.command()
+def callgraph(
+    path: Path,
+    limit_functions: Annotated[
+        int,
+        typer.Option("--limit-functions", help="Maximum function candidates kept as nodes"),
+    ] = DEFAULT_MAX_FUNCTIONS,
+    limit_edges: Annotated[
+        int, typer.Option("--limit-edges", help="Maximum call edges reported")
+    ] = DEFAULT_MAX_EDGES,
+    output_format: Annotated[
+        CallGraphFormat,
+        typer.Option("--format", help="Output format: json (analysis payload), dot or graphml"),
+    ] = "json",
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write the graph to this path instead of stdout"),
+    ] = None,
+) -> None:
+    """Build the direct-call call graph and emit it as JSON, DOT or GraphML."""
+    loaded = _load(path)
+    try:
+        graph = build_call_graph(
+            path,
+            loaded,
+            functions=discover_functions(loaded),
+            max_functions=limit_functions,
+            max_edges=limit_edges,
+        )
+        payload = _render_call_graph(graph, output_format, path)
+    except (AnalysisError, GraphExportError) as exc:
+        _fail(str(exc), 2)
+    if output is not None:
+        try:
+            output.write_text(payload, encoding="utf-8")
+        except OSError as exc:
+            _fail(f"cannot write {output}: {exc}", 2)
+        console.print(f"[green]graph written:[/] {escape(str(output))}")
+    else:
+        # markup=False keeps DOT/GraphML brackets intact; soft_wrap avoids
+        # inserting line breaks that would corrupt the serialized payload.
+        console.print(payload, markup=False, soft_wrap=True)
+    console.print(
+        f"[dim]nodes: {len(graph.nodes)} · edges: {len(graph.edges)}"
+        f" · truncated: {'yes' if graph.truncated else 'no'}"
+        f" · format: {escape(output_format)}[/]"
+    )
+    for warning in graph.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
 mcp_app = typer.Typer(help="Model Context Protocol server commands")
 app.add_typer(mcp_app, name="mcp")
 
@@ -580,6 +656,70 @@ def session_show(
     for key, value in rows:
         grid.add_row(key, escape(value))
     console.print(Panel(grid, title="CODEVANTA · session", subtitle=escape(record.session_id)))
+
+
+def _parse_address(text: str) -> int:
+    """Parse an address given on the command line.
+
+    ``int(text, 0)`` is used so decimal (``4198400``), hexadecimal (``0x401000``),
+    octal (``0o...``) and binary (``0b...``) literals are all accepted. Anything
+    that does not parse, or parses to a negative value, exits with code 2.
+    """
+    try:
+        address = int(text, 0)
+    except ValueError:
+        _fail(f"invalid address {text!r}; use decimal or 0x-prefixed hex", 2)
+    if address < 0:
+        _fail(f"invalid address {text!r}; addresses must not be negative", 2)
+    return address
+
+
+@session_app.command("annotate")
+def session_annotate(
+    session_id: str,
+    address: str,
+    note: str,
+    db: Annotated[Path | None, typer.Option("--db", help="Session database file")] = None,
+) -> None:
+    """Attach NOTE to ADDRESS (decimal or 0x hex) inside a stored session."""
+    parsed = _parse_address(address)
+    try:
+        with SessionStore(_session_db(db)) as store:
+            annotation = store.annotate(session_id, parsed, note)
+    except SessionError as exc:
+        _fail(str(exc), 2)
+    console.print(
+        f"[green]annotation saved:[/] {escape(annotation.session_id)}"
+        f" · 0x{annotation.address:x}"
+    )
+    console.print(f"[dim]{escape(annotation.note)} · {escape(annotation.created_at)}[/]")
+
+
+@session_app.command("notes")
+def session_notes(
+    session_id: str,
+    db: Annotated[Path | None, typer.Option("--db", help="Session database file")] = None,
+) -> None:
+    """List the annotations stored for one session, lowest address first."""
+    try:
+        with SessionStore(_session_db(db)) as store:
+            annotations = store.annotations(session_id)
+    except SessionError as exc:
+        _fail(str(exc), 2)
+    if not annotations:
+        console.print(f"[yellow]no notes for session {escape(session_id)}[/]")
+        return
+    table = Table(title=escape(f"Notes ({len(annotations)})"))
+    table.add_column("Address", justify="right")
+    table.add_column("Note")
+    table.add_column("Created")
+    for annotation in annotations:
+        table.add_row(
+            f"0x{annotation.address:x}",
+            escape(annotation.note),
+            escape(annotation.created_at),
+        )
+    console.print(table)
 
 
 def main() -> None:
