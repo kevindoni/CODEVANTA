@@ -1,0 +1,96 @@
+name: Bug report
+description: Report a defect in CODEVANTA (loader, disassembler, CLI, MCP, setup)
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Do not attach binaries you are not authorized to
+        analyze or share.** A minimal synthetic sample is usually enough.
+        For security issues, use private reporting instead (see SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: CODEVANTA version
+      description: Output of `codevanta --version`, or the commit SHA.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.13.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where does the problem occur?
+      options:
+        - CLI (`codevanta info/functions/strings/disasm/analyze`)
+        - MCP server (`codevanta mcp serve`)
+        - Setup / uninstall
+        - Packaging or install
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: target
+    attributes:
+      label: Target format and architecture
+      description: For example PE x64, ELF x86_64, stripped, firmware blob.
+      placeholder: "PE x64 (stripped)"
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the exact command and flags.
+      placeholder: |
+        1. codevanta info sample.exe
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Paste the traceback or JSON output if available.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmation
+      options:
+        - label: I own this software or have written permission to analyze it.
+          required: true
+        - label: I searched existing issues and this is not a duplicate.
+          required: true

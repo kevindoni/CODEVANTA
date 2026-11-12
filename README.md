@@ -83,6 +83,7 @@ CODEVANTA exposes the same analysis as MCP tools, so coding agents can call it
 directly:
 
 ```powershell
+codevanta setup --list                          # status per client and scope
 codevanta setup --dry-run --client cursor        # show the plan, write nothing
 codevanta setup --client cursor --yes --verify   # apply and verify
 codevanta setup --client claude --scope user
@@ -169,6 +170,14 @@ ruff check src tests
 Contributions, design discussions, and bug reports are welcome. Before opening a
 pull request, describe the change context, compatibility risks, and validation
 steps.
+
+## Community
+
+- [Contributing](CONTRIBUTING.md) — development setup, checks, and conventions
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md) — report vulnerabilities privately
+- [Repository settings checklist](docs/repository-settings.md) — maintainers
+- [Changelog](CHANGELOG.md)
 
 ## License
 

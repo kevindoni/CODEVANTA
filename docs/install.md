@@ -49,6 +49,7 @@ Until the first PyPI release is published, use the GitHub one-liners above.
 ## Connect a coding agent
 
 ```powershell
+codevanta setup --list                      # status per client and scope
 codevanta setup --client claude --dry-run   # plan + diff, nothing written
 codevanta setup --client claude --yes --verify
 codevanta setup --client cursor --scope user

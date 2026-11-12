@@ -155,6 +155,20 @@ def test_cli_setup_dry_run_writes_nothing(tmp_path: Path, monkeypatch: pytest.Mo
     assert not (home / ".cursor" / "mcp.json").exists()
 
 
+def test_cli_setup_list_reports_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("CODEVANTA_HOME", str(home))
+    before = runner.invoke(app, ["setup", "--list"])
+    assert before.exit_code == 0, before.stdout
+    assert "claude" in before.stdout
+    assert "missing" in before.stdout
+
+    applied = runner.invoke(app, ["setup", "--client", "cursor", "--yes"])
+    assert applied.exit_code == 0, applied.stdout
+    after = runner.invoke(app, ["setup", "--list"])
+    assert "registered" in after.stdout
+
+
 def test_cli_setup_apply_then_uninstall(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("CODEVANTA_HOME", str(home))

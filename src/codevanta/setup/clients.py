@@ -245,3 +245,41 @@ def detected_clients(ctx: SetupContext) -> list[ClientAdapter]:
     """Return adapters whose configuration files already exist."""
     return [cls() for cls in CLIENTS.values() if cls().detected(ctx)]
 
+
+def describe_clients(ctx: SetupContext) -> list[dict[str, Any]]:
+    """Return a status row for every supported client and scope."""
+    rows: list[dict[str, Any]] = []
+    for cls in CLIENTS.values():
+        adapter = cls()
+        for scope in ("user", "project"):
+            if scope == "user" and not adapter.supports_user_scope:
+                continue
+            if scope == "project" and not adapter.supports_project_scope:
+                continue
+            path = adapter.config_path(ctx, scope)
+            status = "missing"
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    status = "invalid JSON"
+                else:
+                    servers = data.get(adapter.container_key) if isinstance(data, dict) else None
+                    if isinstance(servers, dict) and servers.get(SERVER_KEY) == adapter.build_entry():
+                        status = "registered"
+                    elif isinstance(servers, dict) and SERVER_KEY in servers:
+                        status = "different entry"
+                    else:
+                        status = "not registered"
+            rows.append(
+                {
+                    "client": adapter.name,
+                    "display": adapter.display_name,
+                    "scope": scope,
+                    "path": str(path),
+                    "status": status,
+                }
+            )
+    return rows
+
+

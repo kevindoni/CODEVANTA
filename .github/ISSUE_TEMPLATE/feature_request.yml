@@ -1,0 +1,72 @@
+name: Feature request
+description: Suggest a capability or improvement for CODEVANTA
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        CODEVANTA ships in phases. Please say which phase you think the request
+        belongs to, and keep it within authorized analysis use.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What analysis task is hard or impossible today?
+      placeholder: "When analyzing stripped ELF binaries, ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, commands, or output you expect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing tools, workarounds, or designs you evaluated.
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Suggested phase
+      options:
+        - Phase 1 (loader, disassembly, strings, functions, evidence)
+        - Phase 2 (xrefs, CFG views, sessions, debugger)
+        - Phase 3 (type recovery, binary diff, scripting)
+        - Phase 4 (emulation, IR lifting, symbolic execution)
+        - Phase 5 (plugins, AI layer, multi-user, CI/CD)
+        - Unsure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Area
+      options:
+        - Core analysis
+        - Evidence / confidence
+        - CLI
+        - MCP server
+        - Setup / install
+        - Documentation
+        - Packaging / CI
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmation
+      options:
+        - label: This request is for authorized analysis use only.
+          required: true
+        - label: I searched existing issues and discussions.
+          required: true

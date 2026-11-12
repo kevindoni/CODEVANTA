@@ -224,6 +224,25 @@ def _adapters_for(ctx, names: list[str] | None):
         raise typer.Exit(code=2) from exc
 
 
+def _print_client_status(ctx) -> None:
+    from codevanta.setup.clients import describe_clients
+
+    table = Table(title="Coding agent MCP status")
+    table.add_column("Client")
+    table.add_column("Scope")
+    table.add_column("Status")
+    table.add_column("Config path")
+    for row in describe_clients(ctx):
+        status_style = "green" if row["status"] == "registered" else "yellow"
+        table.add_row(
+            escape(row["client"]),
+            row["scope"],
+            f"[{status_style}]{escape(row['status'])}[/]",
+            escape(row["path"]),
+        )
+    console.print(table)
+
+
 @app.command()
 def setup(
     client: Annotated[
@@ -237,6 +256,9 @@ def setup(
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Show the plan only")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Apply without confirmation")] = False,
     verify: Annotated[bool, typer.Option("--verify", help="Verify after applying")] = False,
+    list_clients: Annotated[
+        bool, typer.Option("--list", help="Show configuration status for every client and exit")
+    ] = False,
 ) -> None:
     """Register CODEVANTA as an MCP server for coding agents."""
     from codevanta.setup.apply import apply_plan
@@ -244,6 +266,9 @@ def setup(
     from codevanta.setup.verify import verify_entry, verify_tools
 
     ctx = SetupContext.from_environment(project)
+    if list_clients:
+        _print_client_status(ctx)
+        return
     adapters = _adapters_for(ctx, client)
     if not adapters:
         console.print("[yellow]no coding agents detected[/]; pass --client claude|cursor|cline|vscode")

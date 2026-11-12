@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/kevindoni/CODEVANTA/security/advisories/new
+    about: Report vulnerabilities privately. Please do not open a public issue.
+  - name: Installation and setup
+    url: https://github.com/kevindoni/CODEVANTA/blob/main/docs/install.md
+    about: One-line installers, manual install, and coding-agent setup.
+  - name: Contributing guide
+    url: https://github.com/kevindoni/CODEVANTA/blob/main/CONTRIBUTING.md
+    about: Development setup, checks, and conventions.
