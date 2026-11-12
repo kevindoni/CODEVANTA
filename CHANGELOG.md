@@ -28,14 +28,20 @@ All notable changes to CODEVANTA are documented here. The format follows
   `codevanta cfg` (with `--address`/`--function`, `--max-instructions`,
   `--max-blocks`, `--json`), and `codevanta session save|list|show` (with
   `--db`, defaulting to `$CODEVANTA_DB` or `~/.codevanta/sessions.db`).
+- MCP server: `codevanta_xrefs` and `codevanta_cfg` expose the phase 2
+  cross-reference scanner and CFG builder to coding agents. Inputs are bounded
+  and validated (`limit`, `max_bytes`, `max_instructions`, `max_blocks`), every
+  result keeps its evidence records and warnings, and binaries without
+  executable sections return a structured result with warnings instead of
+  failing.
 
 ### Notes
 
 - Phase 2 is in progress: linear sweep only, direct branch targets only, no
   recursive traversal, no call-graph recursion, no graph viewer, and no
   debugger yet. See `docs/phase2.md`.
-- Phase 2 results are not exposed over MCP yet; the server still serves the five
-  phase 1 tools.
+- Phase 2 xrefs and CFG results are exposed over MCP (`codevanta_xrefs`,
+  `codevanta_cfg`); session storage remains CLI-only for now.
 
 ## [0.1.0] - 2026-12-11
 

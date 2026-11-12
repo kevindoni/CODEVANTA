@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from codevanta.analysis.cfg import build_cfg
+from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.functions import discover_functions
 from codevanta.core.report import (
     MAX_DISASSEMBLY_COUNT,
@@ -87,3 +89,54 @@ def disasm(
 def analyze(path: str, string_limit: int = 5000) -> dict[str, Any]:
     """Return the full phase 1 report with provenance and evidence."""
     return build_report(_validate_path(path), string_limit=string_limit)
+
+
+def xrefs(
+    path: str,
+    limit: int = 100,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+) -> dict[str, Any]:
+    """Return direct-branch cross references with evidence and callee names."""
+    if limit < 1 or limit > 100_000:
+        raise AnalysisError("limit must be between 1 and 100000")
+    if max_bytes < 1:
+        raise AnalysisError("max_bytes must be >= 1")
+    target = _validate_path(path)
+    info = load_binary(target)
+    result = find_xrefs(target, info, max_bytes=max_bytes)
+    kept = result.xrefs[:limit]
+    return {
+        "count": len(result.xrefs),
+        "returned": len(kept),
+        "truncated": len(kept) < len(result.xrefs),
+        "xrefs": [xref.to_dict() for xref in kept],
+        "scanned_sections": list(result.scanned_sections),
+        "scanned_bytes": result.scanned_bytes,
+        "scan_truncated": result.truncated,
+        "warnings": list(result.warnings),
+        "evidence": result.evidence.to_dict(),
+    }
+
+
+def cfg(
+    path: str,
+    address: int | None = None,
+    function: str | None = None,
+    max_instructions: int = 2000,
+    max_blocks: int = 500,
+) -> dict[str, Any]:
+    """Build a control-flow graph for the entry point, a virtual address, or a named function."""
+    if max_instructions < 1 or max_instructions > MAX_DISASSEMBLY_COUNT:
+        raise AnalysisError(f"max_instructions must be between 1 and {MAX_DISASSEMBLY_COUNT}")
+    if max_blocks < 1 or max_blocks > MAX_DISASSEMBLY_COUNT:
+        raise AnalysisError(f"max_blocks must be between 1 and {MAX_DISASSEMBLY_COUNT}")
+    target = _validate_path(path)
+    info = load_binary(target)
+    start = resolve_target(info, address, function)
+    return build_cfg(
+        target,
+        info,
+        start,
+        max_instructions=max_instructions,
+        max_blocks=max_blocks,
+    ).to_dict()

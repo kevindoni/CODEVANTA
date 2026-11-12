@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from mcp.server.mcpserver import MCPServer
 
+from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES
+
 from . import tools
 
 SERVER_NAME = "CODEVANTA"
@@ -19,7 +21,7 @@ INSTRUCTIONS = (
 
 
 def build_server() -> MCPServer:
-    """Create the MCP server and register the phase 1 tools."""
+    """Create the MCP server and register the phase 1 and phase 2 tools."""
     server = MCPServer(
         name=SERVER_NAME,
         version=SERVER_VERSION,
@@ -66,6 +68,42 @@ def build_server() -> MCPServer:
     )
     def codevanta_analyze(path: str, string_limit: int = 5000) -> dict:
         return tools.analyze(path, string_limit=string_limit)
+
+    @server.tool(
+        description=(
+            "List direct-branch cross references (call/jump/branch) recovered from "
+            "executable sections, each with evidence and an optional callee name; "
+            "indirect targets are skipped rather than guessed."
+        )
+    )
+    def codevanta_xrefs(
+        path: str,
+        limit: int = 100,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> dict:
+        return tools.xrefs(path, limit=limit, max_bytes=max_bytes)
+
+    @server.tool(
+        description=(
+            "Build a linear-sweep control-flow graph (basic blocks and successor "
+            "edges) for the entry point, a virtual address, or a named function; "
+            "block boundaries are heuristic and carry medium-confidence evidence."
+        )
+    )
+    def codevanta_cfg(
+        path: str,
+        address: int | None = None,
+        function: str | None = None,
+        max_instructions: int = 2000,
+        max_blocks: int = 500,
+    ) -> dict:
+        return tools.cfg(
+            path,
+            address=address,
+            function=function,
+            max_instructions=max_instructions,
+            max_blocks=max_blocks,
+        )
 
     return server
 

@@ -39,7 +39,7 @@ IR layer     Evidence layer
 | `src/codevanta/core/functions.py` | Discover function candidates with provenance |
 | `src/codevanta/core/report.py` | Shared report/disassembly helpers for CLI and MCP |
 | `src/codevanta/mcp_server/tools.py` | MCP tool functions (plain, testable) |
-| `src/codevanta/mcp_server/server.py` | MCP stdio server (`MCPServer`, five tools) |
+| `src/codevanta/mcp_server/server.py` | MCP stdio server (`MCPServer`, seven tools) |
 | `src/codevanta/setup/clients.py` | Per-client config adapters (claude/cursor/cline/vscode) |
 | `src/codevanta/setup/plan.py` | Setup plans, unified diffs, create/update/noop classification |
 | `src/codevanta/setup/apply.py` | Idempotent writes with `*.codevanta.bak` backups |

@@ -147,8 +147,9 @@ embedded in code sections.
   schema migration yet.
 - **Single-user, local.** The SQLite file is a local artifact with no locking
   strategy beyond SQLite defaults and no concurrency model.
-- **Phase 2 tools are not exposed over MCP yet.** The MCP server still offers
-  the five phase 1 tools.
+- **Sessions are not exposed over MCP.** The MCP server offers
+  `codevanta_xrefs` and `codevanta_cfg` alongside the five phase 1 tools;
+  `session` commands remain CLI-only.
 
 ## Next steps
 
@@ -161,8 +162,8 @@ embedded in code sections.
 4. Persist xrefs and CFG blocks into sessions, and store analyst annotations
    next to them.
 5. Schema versioning and migrations for the session database.
-6. MCP tools for xrefs, CFGs, and sessions, so coding agents see the same
-   surface as the CLI.
+6. MCP tools for sessions, so coding agents see the same surface as the CLI
+   (the xrefs and CFG tools already shipped).
 7. Debugger backend and a graph-oriented viewer — both are later-phase work,
    not part of what is delivered here.
 

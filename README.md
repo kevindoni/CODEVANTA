@@ -44,7 +44,7 @@ Delivered in phase 1:
 - Function candidates from exports, function symbols, and the entry point, each with source and confidence.
 - ASCII and UTF-16LE string extraction with file offset and mapped virtual address.
 - CLI: `info`, `functions`, `strings`, `disasm`, `analyze` (+ JSON report).
-- **MCP server** (`codevanta mcp serve`) exposing the same five tools to coding agents.
+- **MCP server** (`codevanta mcp serve`) exposing the analysis tools to coding agents.
 - **Guided setup** (`codevanta setup`) for Claude Code, Cursor, Cline, and VS Code, with plan preview, backups, and verification.
 
 ### Phase 2 (in progress)
@@ -59,6 +59,8 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
 - **Session storage** (`storage/session.py`) — additive SQLite records of each
   analysis run (fingerprint, format, arch, entry point, function/string counts).
 - **CLI:** `codevanta xrefs`, `codevanta cfg`, `codevanta session save|list|show`.
+- **MCP:** `codevanta_xrefs` and `codevanta_cfg` expose the phase 2 views to
+  coding agents (sessions are CLI-only for now).
 
 Phase 2 is deliberately narrow: linear sweep only, direct branch targets only,
 no recursive traversal or call-graph recursion, no graph viewer, and no debugger
@@ -130,7 +132,7 @@ is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
 MCP tools: `codevanta_info`, `codevanta_functions`, `codevanta_strings`,
-`codevanta_disasm`, `codevanta_analyze`.
+`codevanta_disasm`, `codevanta_analyze`, `codevanta_xrefs`, `codevanta_cfg`.
 
 Prompt you can paste into a coding agent:
 
