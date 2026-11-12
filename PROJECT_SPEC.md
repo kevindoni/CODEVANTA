@@ -5,8 +5,8 @@
 ## Vision
 
 A local-first, vendor-agnostic reverse engineering platform that reads,
-disassembles, and explains PE and ELF binaries accurately. Every claim is
-backed by evidence, so the engine (and, later, an AI layer) can be audited.
+disassembles, and explains PE, ELF, and Mach-O binaries accurately. Every claim
+is backed by evidence, so the engine (and, later, an AI layer) can be audited.
 
 ## Architecture principles
 
@@ -23,7 +23,7 @@ backed by evidence, so the engine (and, later, an AI layer) can be audited.
 | Component | Technology | Role |
 |-----------|------------|------|
 | Language | Python 3.10+ | orchestration, CLI, API, scripting |
-| Binary parser | LIEF | PE and ELF metadata |
+| Binary parser | LIEF | PE, ELF, and Mach-O metadata |
 | Disassembler | Capstone | multi-architecture decoding |
 | CLI | Typer + Rich | command line interface |
 | IR abstraction | internal adapters (`src/ir`) | VEX/P-Code ready |
@@ -33,30 +33,62 @@ Deferred to later phases: PyVEX/angr, Z3, Unicorn, symbolic execution, advanced
 taint analysis, automatic unpacking, reverse debugging, advanced type recovery,
 multi-user collaboration, AI binary modification.
 
-## Phase 1 scope (current)
+## Phase 1 scope (delivered)
 
-- PE and ELF loaders with format/arch/bitness/endianness/entry/image base.
+- PE, ELF, and Mach-O loaders with format/arch/bitness/endianness/entry/image
+  base.
 - Sections/segments, imports, exports, symbol extraction.
 - x86/x64 disassembly of executable sections and the entry point.
 - Function discovery from exports, function symbols, and the entry point —
-  never claiming heuristic boundaries it cannot prove.
-- ASCII and UTF-16LE string extraction with file offset and mapped VA.
+  never claiming heuristic boundaries it cannot prove. Mach-O symbol entries
+  do not encode kind, so `is_function` there is derived from executable-section
+  membership and reported at medium confidence.
+- ASCII and UTF-16 string extraction with file offset and mapped VA; the UTF-16
+  byte order follows the binary's endianness (little-endian targets UTF-16LE,
+  big-endian targets UTF-16BE, no metadata means no byte-swap guessing).
 - CLI: `info`, `functions`, `strings`, `disasm`, `analyze` (+ JSON export).
 
 ## Phase 1.5 scope (delivered)
 
-- MCP server (`codevanta mcp serve`, stdio) exposing five tools:
+- MCP server (`codevanta mcp serve`, stdio) exposing fifteen tools:
   `codevanta_info`, `codevanta_functions`, `codevanta_strings`,
-  `codevanta_disasm`, `codevanta_analyze`.
+  `codevanta_disasm`, `codevanta_analyze`, `codevanta_xrefs`,
+  `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
+  `codevanta_jump_table`, `codevanta_function_hash`,
+  `codevanta_similarity`, `codevanta_struct`, `codevanta_session_save`,
+  `codevanta_session_list`.
 - Guided setup (`codevanta setup`) for Claude Code, Cursor, Cline, and VS Code:
   plan preview with unified diff, explicit approval, `*.codevanta.bak` backups,
   idempotent writes, post-apply verification, and `codevanta uninstall`.
 - Shared analysis helpers (`src/core/report.py`) so the CLI and MCP tools cannot
   drift apart.
 
+## Phase 2 scope (delivered)
+
+- Cross-references: `call`/`jump`/`branch` recovered from direct branch
+  operands in executable sections (register/memory targets skipped rather than
+  guessed), with callee naming and scan budgets.
+- Control-flow graphs: linear sweep and recursive traversal
+  (`cfg --traversal linear|recursive`) with leader/terminator block rules;
+  recursive walks follow statically known direct transfers and flag discovered
+  function boundaries at medium confidence. Indirect jumps can be resolved
+  through jump tables (`--resolve-indirect`).
+- Call graphs over direct calls, exportable to DOT, GraphML, and an interactive
+  standalone HTML view (pan/zoom/search/filter, no server required).
+- Jump-table resolution in absolute and relative (`--base`) modes.
+- Struct/field recovery (`codevanta struct`) from access patterns, with
+  alignment and array-candidate hints.
+- Function fingerprints, shape similarity, and binary diff
+  (structural / `--deep` normalized-shape / `--semantic` pairing).
+- SQLite session storage (`session save|list|show|annotate|notes`) for triage
+  snapshots and analyst notes; parameterized SQL, bounded queries.
+- `analyze` JSON report integration: xrefs, CFG, and callgraph sections with
+  provenance steps, degrading to warning-carrying empty results when a binary
+  has nothing to decode.
+
 ## Phase 1 acceptance criteria
 
-1. Reads PE and ELF files.
+1. Reads PE, ELF, and Mach-O files.
 2. Reports binary metadata correctly.
 3. Exposes section information.
 4. Shows imports and exports.
@@ -78,13 +110,14 @@ multi-user collaboration, AI binary modification.
 
 ## Roadmap
 
-| Phase | Focus | Estimate |
-|-------|-------|----------|
-| 1 | Foundation (loader, disassembler, strings, functions, CLI, JSON) | current |
-| 2 | CFG/DFG visualization, session save/load, basic debugger | 5–7 weeks |
-| 3 | Basic type recovery, binary diff, Python scripting | 6–8 weeks |
-| 4 | Unicorn emulation, IR lifting, symbolic execution (optional) | 8–10 weeks |
-| 5 | Plugin system, full AI layer, multi-user, CI/CD | 10–12 weeks |
+| Phase | Focus | Status |
+|-------|-------|--------|
+| 1 | Foundation (loader, disassembler, strings, functions, CLI, JSON) | delivered |
+| 1.5 | MCP server + guided agent setup | delivered |
+| 2 | Cross-references, CFG (linear + recursive), call graphs, jump tables, sessions | delivered — debugger and graph-oriented *viewer application* remain open |
+| 3 | Type recovery, binary diff, Python scripting | largely delivered (struct recovery, diff, fingerprints, similarity) — embedded Python scripting remains open |
+| 4 | Unicorn emulation, IR lifting, symbolic execution (optional) | open |
+| 5 | Plugin system, full AI layer, multi-user, CI/CD | open |
 
 ## Responsible use
 
