@@ -18,6 +18,7 @@ reimplemented here:
 * ``/api/struct`` -- :func:`codevanta.analysis.type_recovery.suggest_struct`
 * ``/api/callgraph`` -- :func:`codevanta.analysis.callgraph.build_call_graph`
 * ``/api/diff`` -- :func:`codevanta.analysis.binary_diff.diff_binaries`
+* ``/api/decompile`` -- :func:`codevanta.analysis.decompilers.decompile_function`
 
 Contract:
 
@@ -78,6 +79,20 @@ from codevanta.analysis.callgraph import (
     build_call_graph,
 )
 from codevanta.analysis.cfg import build_cfg, build_recursive_cfg
+from codevanta.analysis.decompile import (
+    DEFAULT_MAX_BLOCKS as DEFAULT_DECOMPILE_MAX_BLOCKS,
+)
+from codevanta.analysis.decompile import (
+    DEFAULT_MAX_INSTRUCTIONS as DEFAULT_DECOMPILE_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.decompile import MAX_MAX_BLOCKS as MAX_DECOMPILE_MAX_BLOCKS
+from codevanta.analysis.decompile import (
+    MAX_MAX_INSTRUCTIONS as MAX_DECOMPILE_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.decompilers import BackendResult, supported_backends
+from codevanta.analysis.decompilers import (
+    decompile_function as decompile_with_backend,
+)
 from codevanta.analysis.type_recovery import (
     DEFAULT_MAX_FIELDS,
     MAX_MAX_FIELDS,
@@ -125,6 +140,17 @@ DEFAULT_STRINGS_LIMIT = 200
 DEFAULT_MIN_STRING_LENGTH = 4
 DEFAULT_CFG_INSTRUCTIONS = 2_000
 DEFAULT_CFG_BLOCKS = 500
+
+#: Backend ``/api/decompile`` uses when the query parameter is absent.
+DEFAULT_DECOMPILE_BACKEND = "auto"
+
+#: Backends ``/api/decompile`` accepts: ``auto`` plus every registered provider.
+DECOMPILE_BACKENDS: frozenset[str] = frozenset(
+    {DEFAULT_DECOMPILE_BACKEND, *supported_backends()}
+)
+
+#: Prefix of the block-coverage line the native renderer writes in its header.
+_HEADER_BLOCKS_PREFIX = " * blocks: "
 
 #: Content types used by the two response kinds.
 _JSON_CONTENT_TYPE = "application/json; charset=utf-8"
@@ -562,6 +588,77 @@ def _api_diff(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
     return payload
 
 
+def _decompiled_block_count(result: BackendResult) -> int | None:
+    """Return how many basic blocks the rendering covered, when it says so.
+
+    Mirrors :func:`codevanta.mcp_server.tools.decompile`'s helper so the API and
+    the MCP tool publish the same JSON: the external backends record their block
+    count in ``evidence.extra``, while the native renderer publishes it in the
+    pseudo-C header comment (`` * blocks: N  instructions: M``). ``None`` means
+    the backend reported no coverage.
+    """
+    recorded = result.evidence.extra.get("block_count")
+    if isinstance(recorded, int) and not isinstance(recorded, bool):
+        return recorded
+    for line in result.text.splitlines():
+        if line == " */":
+            break
+        if not line.startswith(_HEADER_BLOCKS_PREFIX):
+            continue
+        field = line[len(_HEADER_BLOCKS_PREFIX) :].split(" ", 1)[0]
+        if field.isdigit():
+            return int(field)
+    return None
+
+
+def _api_decompile(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return one function rendered as C-like text by the chosen backend.
+
+    ``backend=auto`` (the default) prefers an installed external decompiler and
+    falls back to the built-in renderer, listing every skipped backend in
+    ``warnings``; ``angr`` and ``ghidra`` are strict and answer ``400`` with a
+    message naming the backend when it is unavailable, so a missing optional
+    dependency never becomes a ``500`` or an ``ImportError``.
+    """
+    path = _query_path(params, "path", allow_paths)
+    address = _query_address(params, "address")
+    backend = (_first(params, "backend") or DEFAULT_DECOMPILE_BACKEND).lower()
+    if backend not in DECOMPILE_BACKENDS:
+        supported = ", ".join(sorted(DECOMPILE_BACKENDS))
+        raise _RouteError(f"backend must be one of {supported}, got {backend!r}")
+    max_instructions = _query_int(
+        params,
+        "max_instructions",
+        DEFAULT_DECOMPILE_MAX_INSTRUCTIONS,
+        1,
+        MAX_DECOMPILE_MAX_INSTRUCTIONS,
+    )
+    max_blocks = _query_int(
+        params,
+        "max_blocks",
+        DEFAULT_DECOMPILE_MAX_BLOCKS,
+        1,
+        MAX_DECOMPILE_MAX_BLOCKS,
+    )
+    info = _load(path)
+    start = address if address is not None else info.entry_point
+    if start is None:
+        raise _RouteError("address is required: the binary has no entry point")
+    result = decompile_with_backend(
+        path,
+        info,
+        start,
+        backend=backend,
+        max_instructions=max_instructions,
+        max_blocks=max_blocks,
+    )
+    payload = result.to_dict()
+    payload["path"] = str(info.path)
+    payload["address"] = f"0x{start:x}"
+    payload["blocks"] = _decompiled_block_count(result)
+    return payload
+
+
 #: Route table: request path -> payload builder. Builders take the query
 #: parameters and the handler's ``paths_allowed`` flag.
 ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
@@ -574,6 +671,7 @@ ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
     "/api/struct": _api_struct,
     "/api/callgraph": _api_callgraph,
     "/api/diff": _api_diff,
+    "/api/decompile": _api_decompile,
 }
 
 def _json_default(value: Any) -> Any:
