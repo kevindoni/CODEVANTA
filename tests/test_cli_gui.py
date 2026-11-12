@@ -9,6 +9,7 @@ failure is reported as exit ``2`` instead of a traceback or uvicorn's exit ``3``
 
 from __future__ import annotations
 
+import re
 import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -20,10 +21,23 @@ from codevanta.cli.main import app
 
 runner = CliRunner()
 
+#: ANSI escape sequences Rich emits when the captured console reports a TTY.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
 
 def _output(result: Result) -> str:
     """Return stdout and stderr, so an assertion sees everything the CLI printed."""
     return result.output + (result.stderr or "")
+
+
+def _squeeze(text: str) -> str:
+    """Return ``text`` without ANSI escapes or whitespace.
+
+    Rich wraps its option table at the terminal width, which differs between a
+    local Windows console and the narrow Linux runners, so help-text assertions
+    compare the squeezed form instead of a layout-dependent one.
+    """
+    return re.sub(r"\s+", "", _ANSI.sub("", text))
 
 
 @contextmanager
@@ -39,8 +53,9 @@ def test_gui_is_listed_in_the_top_level_help() -> None:
     result = runner.invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    assert "gui" in result.stdout
-    assert "web dashboard" in result.stdout.lower()
+    flat = _squeeze(result.stdout)
+    assert "gui" in flat
+    assert "webdashboard" in flat
 
 
 def test_gui_rejects_a_port_outside_the_tcp_range() -> None:
@@ -61,8 +76,18 @@ def test_mcp_serve_exposes_the_transport_flags() -> None:
     result = runner.invoke(app, ["mcp", "serve", "--help"])
 
     assert result.exit_code == 0
-    for option in ("--transport", "--host", "--port", "--allow-remote"):
-        assert option in result.stdout
+    # Rich wraps the options table at the terminal width, so compare against the
+    # help text with ANSI escapes and all whitespace removed: "--transport" may be
+    # split across lines or padded on a narrow CI terminal.
+    flat = _squeeze(result.stdout)
+    for option in (
+        "--transport",
+        "--host",
+        "--port",
+        "--allow-remote",
+        "streamable-http",
+    ):
+        assert option in flat, flat
 
 
 @pytest.mark.parametrize("transport", ["bogus", "http", ""])
