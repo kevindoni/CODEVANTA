@@ -6,6 +6,20 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- DEX loader (`codevanta.core.loader`): Android DEX containers (magic
+  `dex\n`) now load through LIEF's dedicated DEX parser with format, version
+  endianness, and Dalvik method extraction. Defined methods become
+  `high`-confidence function symbols from `dex.method_ids` with
+  smali-style names (`LMain;->add`); referenced-but-undefined methods become
+  imports carrying the defining class as `library`. DEX has no virtual
+  address space, so symbol addresses are **file offsets** — stated in a
+  loader warning and in every finding's evidence. Disassembly stays
+  unsupported (`dalvik` is not a Capstone target) and fails with the usual
+  typed error. A real 952-byte `samples/hello.dex` (built with the Android
+  SDK's `d8`) backs the test suite.
+
 ### Changed
 
 - Dashboard usability pass (`codevanta gui`): the workflow is now guided

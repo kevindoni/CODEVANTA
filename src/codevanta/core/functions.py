@@ -62,6 +62,7 @@ _SYMBOL_SOURCES: dict[str, str] = {
     "PE": "pe.coff_symbols",
     "ELF": "elf.symtab",
     "MachO": "macho.symbol_table",
+    "DEX": "dex.method_ids",
 }
 
 #: Discovery confidence for symbol-table candidates, by binary format. Mach-O

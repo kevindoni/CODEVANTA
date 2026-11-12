@@ -38,7 +38,7 @@ extraction, function discovery, and JSON export are working and tested.
 
 Delivered in phase 1:
 
-- PE, ELF, and Mach-O loaders (format, architecture, bitness, endianness, entry point, image base).
+- PE, ELF, Mach-O, and DEX loaders (format, architecture, bitness, endianness, entry point, image base).
 - Sections, imports, exports, and symbol extraction — every finding carries evidence.
 - x86/x64 disassembly of executable sections and the entry point.
 - Function candidates from exports, function symbols, and the entry point, each with source and confidence.
@@ -534,7 +534,7 @@ plus smoke-tests the wheel on 3.13.
 
 ## Roadmap
 
-- [x] Phase 1 — core engine foundation: PE/ELF/Mach-O loading, disassembly, strings, functions, CLI, JSON evidence reports
+- [x] Phase 1 — core engine foundation: PE/ELF/Mach-O/DEX loading, disassembly, strings, functions, CLI, JSON evidence reports
 - [ ] Phase 2 — cross-references, CFG views, session storage, basic debugger
 - [ ] Phase 3 — basic type recovery, binary diff, Python scripting
 - [ ] Phase 4 — emulation (Unicorn), IR lifting, symbolic execution (optional)

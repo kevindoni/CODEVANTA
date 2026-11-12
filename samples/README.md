@@ -103,6 +103,32 @@ codevanta disasm samples/macho64_text.bin --count 10
 The code body is intentionally ten instructions long: the ASCII payload starts
 at `0x1a5`, so `--count 10` stops exactly at the end of the real code.
 
+## `hello.dex` — Android DEX
+
+A real 952-byte DEX 035 container built with the Android SDK's `d8` from a
+two-method `Main.java` (`add`, `main`, plus the compiler-generated
+`<init>`). Unlike the image formats, DEX has no virtual address space: method
+addresses are **file offsets**, and the loader says so in a warning. Defined
+methods become `high`-confidence function symbols from `dex.method_ids`;
+referenced-but-undefined methods (here `println` and `Object.<init>`) become
+imports with the defining class as their `library`.
+
+| Property | Value |
+| --- | --- |
+| Format | DEX 035, little-endian |
+| Architecture | `dalvik` (disassembly not supported yet) |
+| Entry point / image base | none / `0x0` |
+| Sections | none (bytecode container) |
+| Symbols | `LMain;->add` @ `0x160`, `LMain;-><init>` @ `0x174`, `LMain;->main` @ `0x18c` |
+| Imports | `Ljava/io/PrintStream;->println`, `Ljava/lang/Object;-><init>` |
+| Size | 952 bytes |
+| SHA-256 | `029c6933bcad5885b8015ce043c95a29a07049ac14ea5dc6f1f85d268c639c27` |
+
+```powershell
+codevanta functions samples/hello.dex
+codevanta strings samples/hello.dex --min-length 6
+```
+
 ## Shared code body
 
 Both samples execute the same hand-assembled x86_64 sequence

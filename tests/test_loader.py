@@ -501,3 +501,83 @@ def test_fat_container_evidence_caps_available_slices() -> None:
         range(MAX_FAT_SLICES)
     )
 
+
+# ---- DEX -------------------------------------------------------------------
+
+SAMPLES = Path(__file__).resolve().parent.parent / "samples"
+HELLO_DEX = SAMPLES / "hello.dex"
+
+
+def _skip_if_no_dex_sample() -> None:
+    if not HELLO_DEX.exists():
+        pytest.skip("samples/hello.dex is not checked out")
+
+
+def test_load_real_dex_sample() -> None:
+    _skip_if_no_dex_sample()
+    info = BinaryLoader().load(HELLO_DEX)
+    assert info.format == "DEX"
+    assert info.architecture == "dalvik"
+    assert info.bitness == 0
+    assert info.endianness == "little"
+    assert info.entry_point is None
+    assert info.image_base == 0
+    assert info.sections == []
+    assert info.exports == []
+    assert info.is_stripped is False
+    assert info.sha256
+    assert info.file_size == HELLO_DEX.stat().st_size
+    assert any("file offsets" in w for w in info.warnings)
+
+
+def test_dex_defined_methods_become_function_symbols() -> None:
+    _skip_if_no_dex_sample()
+    info = BinaryLoader().load(HELLO_DEX)
+    names = {s.name: s for s in info.symbols}
+    assert set(names) == {"LMain;-><init>", "LMain;->add", "LMain;->main"}
+    add = names["LMain;->add"]
+    assert add.address == 0x160
+    assert add.is_function is True
+    assert add.kind == "method"
+    assert add.evidence.source == "dex.method_ids"
+    assert add.evidence.confidence.value == "high"
+    assert "file offset 0x160" in add.evidence.detail
+
+
+def test_dex_external_methods_become_imports() -> None:
+    _skip_if_no_dex_sample()
+    info = BinaryLoader().load(HELLO_DEX)
+    by_name = {i.name: i for i in info.imports}
+    assert set(by_name) == {
+        "Ljava/io/PrintStream;->println",
+        "Ljava/lang/Object;-><init>",
+    }
+    println = by_name["Ljava/io/PrintStream;->println"]
+    assert println.library == "Ljava/io/PrintStream;"
+    assert println.address is None
+    assert println.evidence.source == "dex.method_ids"
+    assert "not defined in this container" in println.evidence.detail
+
+
+def test_dex_function_discovery_uses_dex_sources() -> None:
+    _skip_if_no_dex_sample()
+    from codevanta.core.functions import discover_functions
+
+    info = BinaryLoader().load(HELLO_DEX)
+    candidates = discover_functions(info)
+    assert [c.source for c in candidates] == ["dex.method_ids"] * 3
+    assert all(c.confidence.value == "high" for c in candidates)
+    by_name = {c.name: c for c in candidates}
+    assert by_name["LMain;->add"].address == 0x160
+
+
+def test_dex_magic_short_circuits_before_generic_parse(tmp_path: Path) -> None:
+    # A file with a DEX magic must load as DEX even when the rest is garbage:
+    # the dedicated parser decides, not the generic one.
+    sample = tmp_path / "stub.dex"
+    sample.write_bytes(b"dex\n035\x00" + b"\x00" * 0x68)
+    info = BinaryLoader().load(sample)
+    assert info.format == "DEX"
+    assert info.symbols == []
+    assert info.imports == []
+

@@ -88,7 +88,7 @@ multi-user collaboration, AI binary modification.
 
 ## Phase 1 acceptance criteria
 
-1. Reads PE, ELF, and Mach-O files.
+1. Reads PE, ELF, Mach-O, and DEX files.
 2. Reports binary metadata correctly.
 3. Exposes section information.
 4. Shows imports and exports.

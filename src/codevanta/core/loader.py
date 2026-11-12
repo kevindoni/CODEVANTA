@@ -360,7 +360,7 @@ class BinaryInfo:
 
 
 class BinaryLoader:
-    """Loads PE, ELF, and Mach-O binaries and extracts structural metadata."""
+    """Loads PE, ELF, Mach-O, and DEX binaries and extracts structural metadata."""
 
     MAX_FILE_SIZE = 512 * 1024 * 1024  # 512 MiB safety guard
 
@@ -370,6 +370,16 @@ class BinaryLoader:
         self._validate(file_path)
         raw = file_path.read_bytes()
         sha256 = hashlib.sha256(raw).hexdigest()
+
+        # DEX is a bytecode container, not an executable image: LIEF only
+        # reaches it through the dedicated DEX parser, and the generic
+        # ``lief.parse`` answers None for it. The magic cannot collide with
+        # any fat/thin image magic, so checking it first is safe.
+        if raw[:4] == b"dex\n":
+            info = self._load_dex(file_path, raw)
+            info.sha256 = sha256
+            info.file_size = len(raw)
+            return info
 
         # A fat (universal) container must be unwrapped before any of the thin
         # parsers run: LIEF would only ever see the container magic.
@@ -1206,6 +1216,96 @@ class BinaryLoader:
                 )
             )
         return symbols
+
+    # ---- DEX ---------------------------------------------------------------
+
+    @staticmethod
+    def _load_dex(path: Path, raw: bytes) -> BinaryInfo:
+        """Normalize a DEX bytecode container into :class:`BinaryInfo`.
+
+        DEX has no virtual address space and no sections: method addresses are
+        **file offsets**, stated in a loader warning and in every method's
+        evidence. Defined methods (with bytecode) become function symbols;
+        referenced-but-undefined methods (external APIs like ``println``)
+        become imports with the defining class as their ``library``.
+        """
+        try:
+            dex = lief.DEX.parse(str(path))
+        except Exception as exc:
+            raise BinaryLoadError(f"LIEF could not parse DEX {path}: {exc}") from exc
+        if dex is None:
+            raise BinaryLoadError(f"Unsupported or unreadable DEX: {path}")
+
+        # The endianness lives in the header's endian_tag at offset 0x28
+        # (0x12345678 = little-endian, byte-swapped = big-endian).
+        endian_tag = int.from_bytes(raw[0x28:0x2C], "little")
+        endianness = "big" if endian_tag == 0x78563412 else "little"
+
+        warnings: list[str] = [
+            "DEX container: no virtual address space; symbol addresses are file offsets",
+            "Dalvik bytecode disassembly is not supported yet",
+        ]
+
+        symbols: list[SymbolInfo] = []
+        imports: list[ImportInfo] = []
+        for method in dex.methods:
+            class_name = ""
+            if method.has_class and method.cls is not None:
+                class_name = str(method.cls.fullname)
+            qualified = f"{class_name}->{method.name}" if class_name else str(method.name)
+            code_offset = int(getattr(method, "code_offset", 0) or 0)
+            if code_offset > 0:
+                symbols.append(
+                    SymbolInfo(
+                        name=qualified,
+                        address=code_offset,
+                        kind="method",
+                        is_function=True,
+                        evidence=Evidence(
+                            source="dex.method_ids",
+                            method="class_data",
+                            confidence=Confidence.HIGH,
+                            address=code_offset,
+                            detail=(
+                                f"{qualified}: code at file offset 0x{code_offset:x} "
+                                "(DEX addresses are file offsets, not VA)"
+                            ),
+                        ),
+                    )
+                )
+            else:
+                imports.append(
+                    ImportInfo(
+                        name=qualified,
+                        library=class_name or None,
+                        evidence=Evidence(
+                            source="dex.method_ids",
+                            method="method_reference",
+                            confidence=Confidence.HIGH,
+                            detail=(
+                                f"{qualified}: referenced but not defined in this container"
+                            ),
+                        ),
+                    )
+                )
+
+        return BinaryInfo(
+            path=path,
+            format="DEX",
+            architecture="dalvik",
+            bitness=0,
+            endianness=endianness,
+            entry_point=None,
+            image_base=0,
+            sha256="",
+            file_size=0,
+            sections=[],
+            imports=imports,
+            exports=[],
+            symbols=symbols,
+            is_stripped=not symbols,
+            warnings=warnings,
+        )
 
     # ---- helpers ----------------------------------------------------------
 
