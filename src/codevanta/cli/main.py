@@ -16,7 +16,7 @@ from rich.table import Table
 from codevanta.analysis.binary_diff import (
     DEFAULT_MAX_FUNCTIONS as DIFF_MAX_FUNCTIONS,
 )
-from codevanta.analysis.binary_diff import BinaryDiff, diff_binaries
+from codevanta.analysis.binary_diff import BinaryDiff, FunctionDelta, diff_binaries
 from codevanta.analysis.callgraph import (
     DEFAULT_MAX_EDGES,
     DEFAULT_MAX_FUNCTIONS,
@@ -39,7 +39,13 @@ from codevanta.analysis.html_view import to_html
 from codevanta.analysis.jump_tables import (
     DEFAULT_MAX_ENTRIES as JUMP_TABLE_MAX_ENTRIES,
 )
-from codevanta.analysis.jump_tables import JumpTableResult, resolve_jump_table
+from codevanta.analysis.jump_tables import (
+    MODE_ABSOLUTE,
+    MODE_RELATIVE,
+    MODES,
+    JumpTableResult,
+    resolve_jump_table,
+)
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
@@ -432,13 +438,30 @@ def cfg(
     _print_cfg(graph)
 
 
+#: Number of leading hex characters of a content fingerprint shown in a table.
+_DIGEST_PREVIEW = 12
+
+
+def _digest_cell(delta: FunctionDelta) -> str:
+    """Return the fingerprint cell for one function delta.
+
+    Deep mode fingerprints only address-matched pairs, so ``added``/``removed``
+    deltas -- and matched pairs beyond the deep-mode ceiling -- carry no digest
+    and render as ``-`` rather than as an empty cell.
+    """
+    if delta.left_digest is None or delta.right_digest is None:
+        return "-"
+    return f"{delta.left_digest[:_DIGEST_PREVIEW]} -> {delta.right_digest[:_DIGEST_PREVIEW]}"
+
+
 def _print_binary_diff(result: BinaryDiff) -> None:
     """Print a :class:`BinaryDiff` as an identity panel plus two tables.
 
     The first table is the added/removed/changed count matrix for functions,
     sections, imports and exports; the second lists the individual name deltas.
     The function delta table then carries the address, name and change of every
-    candidate the comparison could not match.
+    candidate the comparison could not match, plus -- when deep mode
+    fingerprinted the pair -- the truncated content digests of both sides.
     """
     header = Table.grid(padding=(0, 2))
     header.add_column(style="bold cyan")
@@ -489,17 +512,31 @@ def _print_binary_diff(result: BinaryDiff) -> None:
         key=lambda delta: (delta.address, delta.change),
     )
     if deltas:
+        show_digests = any(
+            delta.left_digest is not None or delta.right_digest is not None for delta in deltas
+        )
         functions = Table(title=f"Function deltas ({len(deltas)})")
         functions.add_column("Address", justify="right")
         functions.add_column("Name")
         functions.add_column("Change")
+        if show_digests:
+            functions.add_column("Digest (left -> right)")
         for delta in deltas:
-            functions.add_row(
+            row = [
                 f"0x{delta.address:x}",
                 escape(delta.name or "<unknown>"),
                 escape(delta.change),
-            )
+            ]
+            if show_digests:
+                row.append(escape(_digest_cell(delta)))
+            functions.add_row(*row)
         console.print(functions)
+        if show_digests:
+            console.print(
+                "[dim]digests are the first "
+                f"{_DIGEST_PREVIEW} hex characters of the normalized shape SHA-256; "
+                "equal digests are not byte equality[/]"
+            )
     else:
         console.print("[dim]no function deltas[/]")
     for warning in result.warnings:
@@ -516,6 +553,13 @@ def diff(
             "--max-functions", help="Per-side ceiling on compared function candidates"
         ),
     ] = DIFF_MAX_FUNCTIONS,
+    deep: Annotated[
+        bool,
+        typer.Option(
+            "--deep",
+            help="Also compare the normalized content of address-matched functions",
+        ),
+    ] = False,
     json_output: Annotated[
         bool, typer.Option("--json", help="Emit the JSON result instead of tables")
     ] = False,
@@ -527,9 +571,17 @@ def diff(
     never "the machine code is equivalent". A difference is the successful
     outcome, so the command exits 0 whether or not the binaries differ; only load
     and input errors exit non-zero (2).
+
+    ``--deep`` adds a shape fingerprint of every address-matched function: its
+    bytes are read (never executed) and their normalized instructions are hashed
+    with SHA-256, so immediates and branch targets are masked out. A differing
+    digest turns the pair into ``changed`` and both digests are shown;
+    ``added``/``removed`` pairs are not fingerprinted and keep ``-``. Equal
+    digests are not byte equality and different digests are not a semantic
+    difference, so the metadata verdict is never upgraded to "equivalent".
     """
     try:
-        result = diff_binaries(left, right, max_functions=max_functions)
+        result = diff_binaries(left, right, max_functions=max_functions, deep=deep)
     except BinaryLoadError as exc:
         _fail(str(exc), 2)
     if json_output:
@@ -538,8 +590,38 @@ def diff(
     _print_binary_diff(result)
 
 
-def _print_jump_table(result: JumpTableResult) -> None:
-    """Print one :class:`JumpTableResult` as an index/target table plus a footer."""
+def _jump_table_mode(mode: str | None) -> str | None:
+    """Validate ``--mode`` and return it normalised, or ``None`` when omitted.
+
+    Case and surrounding whitespace are folded exactly like
+    :func:`codevanta.analysis.jump_tables.resolve_jump_table`, so
+    ``--mode Relative`` works; an unknown layout exits 2 before any file is
+    loaded, and ``None`` (flag omitted) keeps the historical absolute default
+    without changing the printed footer.
+    """
+    if mode is None:
+        return None
+    text = mode.strip().lower()
+    if text not in MODES:
+        _fail(f"invalid mode {mode!r}; expected one of {', '.join(MODES)}", 2)
+    return text
+
+
+def _print_jump_table(
+    result: JumpTableResult,
+    *,
+    mode: str | None = None,
+    base_address: int | None = None,
+) -> None:
+    """Print one :class:`JumpTableResult` as an index/target table plus a footer.
+
+    The first footer line is identical to what earlier releases printed. When
+    the caller asked for a layout explicitly, a second dim line names the mode
+    and -- in relative mode -- the base: every target of such a table is
+    ``base + signed offset`` and is meaningless without it. Keeping that on its
+    own line also stops a narrow console from wrapping the base away from its
+    label.
+    """
     table = Table(title=escape(f"Jump table at 0x{result.table_address:x}"))
     table.add_column("Index", justify="right")
     table.add_column("Target", justify="right")
@@ -553,6 +635,13 @@ def _print_jump_table(result: JumpTableResult) -> None:
         f" · entries: {len(result.entries)}"
         f" · truncated: {'yes' if result.truncated else 'no'}[/]"
     )
+    layout: list[str] = []
+    if mode is not None:
+        layout.append(f"mode: {mode}")
+    if base_address is not None:
+        layout.append(f"base: 0x{base_address:x}")
+    if layout:
+        console.print(f"[dim]{' · '.join(layout)}[/]")
     for warning in result.warnings:
         console.print(f"[yellow]warning:[/] {escape(warning)}")
 
@@ -578,21 +667,49 @@ def jump_table(
             help="Stop the scan at pointers into non-executable sections",
         ),
     ] = True,
+    mode: Annotated[
+        str | None,
+        typer.Option(
+            "--mode",
+            help="Table layout: 'absolute' pointer slots (default) or 'relative' "
+            "signed 32-bit offsets from --base",
+        ),
+    ] = None,
+    base: Annotated[
+        str | None,
+        typer.Option(
+            "--base",
+            help="Origin that relative offsets are added to (decimal or 0x hex); "
+            "required with --mode relative",
+        ),
+    ] = None,
     json_output: Annotated[
         bool, typer.Option("--json", help="Emit the JSON result instead of a table")
     ] = False,
 ) -> None:
-    """Decode a jump table (absolute pointer array) starting at ADDRESS.
+    """Decode a jump table starting at ADDRESS.
+
+    With ``--mode absolute`` (the default) each slot is a pointer-sized absolute
+    virtual address; with ``--mode relative`` each slot is a signed 32-bit offset
+    and the target is ``--base + offset``, which is the shape position-independent
+    switch tables use. Relative mode without a usable ``--base`` exits 2 instead
+    of inventing an origin, because every target would otherwise be wrong.
 
     Slots are read exclusively from the containing section's file bytes and
     decoded with the binary's endianness and pointer width (8 bytes for a 64-bit
-    binary, 4 for a 32-bit one). The scan stops at the first slot that cannot be
-    a target, namely a zero terminator, an address no section maps, or a pointer
-    into a non-executable section while --executable-only is in effect, and every
-    such stop is reported as a warning. Decoded pointers are evidence of a
-    dispatch table, not proof that a dispatcher indexes it.
+    binary, 4 for a 32-bit one; always 4 in relative mode). The scan stops at the
+    first slot that cannot be a target, namely an address no section maps, or a
+    pointer into a non-executable section while --executable-only is in effect,
+    and every such stop is reported as a warning. In absolute mode a zero pointer
+    also terminates the table. Decoded pointers are evidence of a dispatch table,
+    not proof that a dispatcher indexes it.
     """
     table_address = _parse_address(address)
+    explicit_mode = _jump_table_mode(mode)
+    resolved_mode = explicit_mode or MODE_ABSOLUTE
+    base_address = None if base is None else _parse_address(base, label="base")
+    if resolved_mode == MODE_RELATIVE and base_address is None:
+        _fail("--mode relative requires --base (e.g. --base 0x401000)", 2)
     loaded = _load(path)
     try:
         result = resolve_jump_table(
@@ -601,13 +718,19 @@ def jump_table(
             table_address,
             max_entries=entries,
             executable_only=executable_only,
+            mode=resolved_mode,
+            base_address=base_address if resolved_mode == MODE_RELATIVE else None,
         )
     except AnalysisError as exc:
         _fail(str(exc), 2)
     if json_output:
         console.print_json(json.dumps(result.to_dict()))
         return
-    _print_jump_table(result)
+    _print_jump_table(
+        result,
+        mode=explicit_mode,
+        base_address=base_address if resolved_mode == MODE_RELATIVE else None,
+    )
 
 
 #: Output formats accepted by ``codevanta callgraph``.
@@ -954,19 +1077,22 @@ def session_show(
     console.print(Panel(grid, title="CODEVANTA · session", subtitle=escape(record.session_id)))
 
 
-def _parse_address(text: str) -> int:
+def _parse_address(text: str, *, label: str = "address") -> int:
     """Parse an address given on the command line.
 
     ``int(text, 0)`` is used so decimal (``4198400``), hexadecimal (``0x401000``),
     octal (``0o...``) and binary (``0b...``) literals are all accepted. Anything
     that does not parse, or parses to a negative value, exits with code 2.
+
+    ``label`` only names the value in those error messages, so ``--base`` can
+    report ``invalid base ...`` while every other address keeps its own wording.
     """
     try:
         address = int(text, 0)
     except ValueError:
-        _fail(f"invalid address {text!r}; use decimal or 0x-prefixed hex", 2)
+        _fail(f"invalid {label} {text!r}; use decimal or 0x-prefixed hex", 2)
     if address < 0:
-        _fail(f"invalid address {text!r}; addresses must not be negative", 2)
+        _fail(f"invalid {label} {text!r}; addresses must not be negative", 2)
     return address
 
 

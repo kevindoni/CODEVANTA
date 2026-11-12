@@ -192,19 +192,85 @@ All notable changes to CODEVANTA are documented here. The format follows
   rules, CFG opt-in resolution and its warnings, the interactive viewer, the
   structural diff and its matching rules, the CLI surface, confidence, limits,
   and next steps.
+- Relative jump tables (`codevanta.analysis.jump_tables`): `resolve_jump_table`
+  gained `mode="absolute"|"relative"` (case-insensitive, `MODE_RELATIVE`) plus
+  `base_address`. Relative mode reads each 4-byte slot as a *signed* 32-bit
+  offset and resolves `target = base_address + offset`, so position-independent
+  switch tables work; an explicit `pointer_size` other than 4 is rejected, and a
+  missing base raises `AnalysisError` instead of guessing one. A zero offset is a
+  real entry pointing at the base and no longer terminates anything — only the
+  shared stop rules (target outside `min_target`/`max_target`, unmapped target,
+  or a non-executable target under `executable_only`) end the scan, and each is
+  reported in `warnings` exactly as in absolute mode. `truncated` still requires
+  the entry ceiling plus a further usable slot. Evidence uses
+  `jump_table.relative_offsets` / `signed_offsets` at `medium` confidence and
+  records the base on every record; absolute mode keeps
+  `jump_table.pointer_array` / `absolute_pointers` and byte-identical output.
+- Function fingerprints (`codevanta.analysis.function_hash`, new):
+  `normalize_instruction` renders one instruction as `"<mnemonic> <operands>"`
+  with a lower-cased mnemonic and every numeric literal masked to `#` (hex before
+  bare decimals, digit-bearing register/operand names preserved, consecutive
+  masks collapsed, whitespace normalized). `function_fingerprint` disassembles a
+  bounded linear sweep from an address and returns a `FunctionFingerprint` whose
+  `digest` is the SHA-256 of the newline-joined normalized stream. The budget is
+  `max_instructions` (default 2000, accepted 1..100000) and the read window is
+  `max_instructions * 16` bytes clipped to the section, so `truncated` reports a
+  prefix-only digest. Evidence uses `function_hash.normalized` /
+  `normalized_linear_disassembly` at `medium` confidence and states the caveat:
+  this is a shape fingerprint, so equal digests are not byte equality and
+  different digests are not a semantic difference.
+- Deep diff (`codevanta.analysis.binary_diff`): `deep=False` is now an explicit
+  argument on `diff_infos` and `diff_binaries`. When true, every
+  address-matched function pair is fingerprinted on both sides
+  (`DEEP_MAX_INSTRUCTIONS` = 2000, equal to the standalone default); a differing
+  digest makes the entry `changed` with a content note and both digests, a
+  metadata-only change whose digests match says so, and `FunctionDelta` gained
+  `left_digest` / `right_digest` (always both set or both `None`, serialized by
+  `to_dict()` when present). Matching rules, structural-only output, and the
+  `added`/`removed`/`changed` semantics are unchanged; relocated (name-matched)
+  and one-sided functions are not fingerprinted. Deep mode is bounded by
+  `MAX_DEEP_FINGERPRINTS=1000` address-matched pairs per side (lowest addresses)
+  and reports truncated, capped, and failed fingerprints through `warnings`
+  instead of raising; its top-level evidence switches to the content caveat and
+  records `deep`, `deep_instructions`, and `max_deep_fingerprints`.
+- CLI: `codevanta jump-table --mode absolute|relative --base ADDR`.
+  `--mode` is optional, case-insensitive, and validated before the file loads
+  (an unknown layout exits `2`); omitting it keeps the phase 2f absolute
+  behaviour and the unchanged footer. `--base` uses the same decimal/`0x` parser
+  as `--address` and rejects unparsable or negative values with `invalid base`.
+  `--mode relative` without `--base` exits `2` instead of inventing an origin,
+  and the footer gains `mode: <layout>` only when `--mode` was given plus
+  `base: 0x…` only for relative tables. `--json` output is the resolver's
+  `to_dict()` unchanged.
+- CLI: `codevanta diff --deep` passes `deep=True` to `diff_binaries`. The
+  function-delta table gains a `Digest (left -> right)` column only when a delta
+  carries digests, showing the first 12 hex characters of each side's SHA-256
+  joined by ` -> ` and `-` for `added`/`removed` or over-ceiling pairs; a dim
+  footer states that equal digests are not byte equality. `--json` keeps the
+  existing document shape with `left_digest`/`right_digest` inside
+  `functions_changed` and `evidence.extra.deep`, and exit codes are unchanged.
+- Documentation: `docs/phase2g.md` covers the relative table layout and its
+  zero-offset rule, the shared stop rules, fingerprint normalization, digests,
+  bounds and caveats, deep-diff behaviour and bounds, the `--mode`/`--base` and
+  `--deep` CLI reference, confidence, limits, and next steps.
 
 ### Notes
 
 - Phase 2 is in progress: the CFG uses a linear sweep by default and an optional
   bounded recursive traversal (`--traversal recursive`), with direct branch
   targets plus absolute and RIP-relative pointer slots only; jump tables are
-  absolute 4/8-byte pointer arrays reached from a `jmp` memory operand, so
-  register and indexed dispatch stay unresolved; no call following, no
-  cross-function analysis, no slot dereferencing, and no debugger yet. The HTML
+  absolute 4/8-byte pointer arrays, or signed 32-bit offset tables once a base is
+  supplied through the API (CFG indirect resolution still uses the absolute
+  layout), so register and indexed dispatch stay unresolved; no call following,
+  no cross-function analysis, no slot dereferencing, and no debugger yet. The HTML
   export is interactive but still a single offline file, and the binary diff is
-  structural (metadata) only, with no byte-level or semantic comparison. See
-  `docs/phase2.md`, `docs/phase2b.md`, `docs/phase2c.md`, `docs/phase2d.md`,
-  `docs/phase2e.md`, and `docs/phase2f.md`.
+  structural (metadata) by default with an opt-in normalized-shape fingerprint
+  comparison for address-matched functions — still no byte-level or semantic
+  equivalence claim. The phase 2g switches are `jump-table --mode
+  absolute|relative --base ADDR`, the new `function_fingerprint` API, and
+  `diff --deep`; the CFG's indirect resolution still uses the absolute layout.
+  See `docs/phase2.md`, `docs/phase2b.md`, `docs/phase2c.md`,
+  `docs/phase2d.md`, `docs/phase2e.md`, `docs/phase2f.md`, and `docs/phase2g.md`.
 - Node boundaries and caller attribution are heuristics, not proven function
   extents. Sessions and annotations live in one local SQLite file with no schema
   migrations yet.

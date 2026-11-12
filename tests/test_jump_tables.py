@@ -2,7 +2,9 @@
 
 Every sample is assembled byte-by-byte with :mod:`struct` in this module (its
 own section-header builder), so the tests stay self-contained: no shared
-fixtures, no real binaries and nothing is ever executed.
+fixtures, no real binaries and nothing is ever executed. Both layouts are
+covered: absolute 8-byte pointer arrays (``mode="absolute"``, the default) and
+signed 4-byte offset tables resolved against a base (``mode="relative"``).
 """
 
 from __future__ import annotations
@@ -25,6 +27,17 @@ from codevanta.evidence.confidence import Confidence
 TEXT_VA = 0x401000
 RODATA_VA = 0x402000
 UNMAPPED_VA = 0x500000
+
+#: Relative offset from :data:`TEXT_VA` that still lands inside .text.
+TEXT_DELTA = 0x10
+
+#: Relative offset from :data:`TEXT_VA` that lands in .rodata (mapped, not
+#: executable): ``0x401000 + 0x1000 == 0x402000``.
+DATA_DELTA = 0x1000
+
+#: Relative offset from :data:`TEXT_VA` that lands past every mapped section:
+#: ``0x401000 + 0x2000 == 0x403000``.
+OUT_OF_TEXT_DELTA = 0x2000
 
 SHF_ALLOC = 0x2
 SHF_EXECINSTR = 0x4
@@ -62,6 +75,37 @@ def _write_elf64_jump_table(
     table = b"".join(struct.pack("<Q", value & 0xFFFFFFFFFFFFFFFF) for value in pointers)
     if terminator:
         table += bytes(8)
+    return _write_elf64_rodata_table(path, table)
+
+
+def _write_elf64_relative_table(path: Path, offsets: list[int]) -> Path:
+    """Write an ELF64 file holding ``offsets`` as signed 4-byte slots in .rodata.
+
+    The remaining .rodata bytes stay zero, and a zero offset is *not* a
+    terminator in this layout, so samples that need a clean stop place a final
+    offset that resolves outside .text.
+
+    Args:
+        path: Destination file.
+        offsets: Signed 32-bit deltas stored back-to-back at :data:`RODATA_VA`.
+
+    Returns:
+        ``path``, written to disk.
+    """
+    table = b"".join(struct.pack("<i", value) for value in offsets)
+    return _write_elf64_rodata_table(path, table)
+
+
+def _write_elf64_rodata_table(path: Path, table: bytes) -> Path:
+    """Write an ELF64 file whose .rodata starts with ``table``, zero-padded.
+
+    Args:
+        path: Destination file.
+        table: Raw bytes to place at :data:`RODATA_VA`.
+
+    Returns:
+        ``path``, written to disk.
+    """
     if len(table) > _RODATA_SIZE:
         raise AssertionError("test table does not fit in the synthetic .rodata")
     rodata = table.ljust(_RODATA_SIZE, b"\x00")
@@ -146,6 +190,14 @@ def _three_target_sample(tmp_path: Path) -> Path:
     """Write the canonical sample: three .text pointers plus a terminator."""
     return _write_elf64_jump_table(
         tmp_path / "jump_table.bin", [TEXT_VA, TEXT_VA + 0x10, TEXT_VA + 0x20]
+    )
+
+
+def _relative_sample(tmp_path: Path) -> Path:
+    """Write the canonical relative sample: two .text deltas plus a stop slot."""
+    return _write_elf64_relative_table(
+        tmp_path / "jump_table_relative.bin",
+        [TEXT_DELTA, 0x20, OUT_OF_TEXT_DELTA],
     )
 
 
@@ -363,3 +415,182 @@ def test_explicit_pointer_size_is_honoured(tmp_path: Path) -> None:
         TEXT_VA + 0x10,
         TEXT_VA + 0x20,
     ]
+
+
+# ---------------------------------------------------------------------------
+# Relative mode: signed 32-bit offsets resolved against an explicit base
+# ---------------------------------------------------------------------------
+
+
+def test_relative_offsets_resolve_against_the_base_address(tmp_path: Path) -> None:
+    path = _relative_sample(tmp_path)
+    info = _load(path)
+
+    result = resolve_jump_table(path, info, RODATA_VA, mode="relative", base_address=TEXT_VA)
+
+    assert result.table_address == RODATA_VA
+    assert result.pointer_size == 4
+    assert [entry.index for entry in result.entries] == [0, 1]
+    assert [entry.target for entry in result.entries] == [0x401010, 0x401020]
+    assert result.truncated is False
+    # The third slot resolves to 0x403000, which no section maps.
+    assert len(result.warnings) == 1
+    assert "0x403000" in result.warnings[0]
+    assert "not mapped" in result.warnings[0]
+
+
+def test_relative_evidence_labels_and_base_address(tmp_path: Path) -> None:
+    path = _relative_sample(tmp_path)
+    info = _load(path)
+
+    result = resolve_jump_table(path, info, RODATA_VA, mode="relative", base_address=TEXT_VA)
+    first = result.entries[0]
+
+    assert first.evidence.source == "jump_table.relative_offsets"
+    assert first.evidence.method == "signed_offsets"
+    assert first.evidence.confidence is Confidence.MEDIUM
+    assert first.evidence.address == RODATA_VA
+    assert "0x401000" in (first.evidence.detail or "")
+    assert first.evidence.extra["base"] == "0x401000"
+    assert result.evidence.source == "jump_table.relative_offsets"
+    assert result.evidence.method == "signed_offsets"
+    assert result.evidence.confidence is Confidence.MEDIUM
+    assert result.evidence.address == RODATA_VA
+    assert "0x401000" in (result.evidence.detail or "")
+    assert result.evidence.extra["base"] == "0x401000"
+    assert result.evidence.extra["pointer_size"] == 4
+
+
+def test_relative_offset_outside_text_stops_with_warning(tmp_path: Path) -> None:
+    """An offset that lands in .rodata is mapped but not executable."""
+    path = _write_elf64_relative_table(
+        tmp_path / "jump_table_relative_data.bin", [TEXT_DELTA, DATA_DELTA]
+    )
+    info = _load(path)
+
+    result = resolve_jump_table(path, info, RODATA_VA, mode="relative", base_address=TEXT_VA)
+
+    assert [entry.target for entry in result.entries] == [TEXT_VA + TEXT_DELTA]
+    assert result.truncated is False
+    assert len(result.warnings) == 1
+    assert f"0x{RODATA_VA:x}" in result.warnings[0]
+    assert "non-executable" in result.warnings[0]
+    assert ".rodata" in result.warnings[0]
+
+
+def test_relative_max_entries_one_is_truncated(tmp_path: Path) -> None:
+    path = _relative_sample(tmp_path)
+    info = _load(path)
+
+    result = resolve_jump_table(
+        path, info, RODATA_VA, max_entries=1, mode="relative", base_address=TEXT_VA
+    )
+
+    assert [entry.target for entry in result.entries] == [0x401010]
+    assert result.truncated is True
+    assert result.warnings == ()
+
+
+def test_relative_zero_offset_is_not_a_terminator(tmp_path: Path) -> None:
+    path = _write_elf64_relative_table(
+        tmp_path / "jump_table_relative_zero.bin", [TEXT_DELTA, 0, OUT_OF_TEXT_DELTA]
+    )
+    info = _load(path)
+
+    result = resolve_jump_table(path, info, RODATA_VA, mode="relative", base_address=TEXT_VA)
+
+    # The zero delta is a real entry pointing at the base address.
+    assert [entry.target for entry in result.entries] == [TEXT_VA + TEXT_DELTA, TEXT_VA]
+    assert all("zero pointer" not in warning for warning in result.warnings)
+    assert len(result.warnings) == 1
+    assert "0x403000" in result.warnings[0]
+
+
+def test_relative_negative_offsets_are_decoded_as_signed(tmp_path: Path) -> None:
+    path = _write_elf64_relative_table(
+        tmp_path / "jump_table_relative_negative.bin",
+        [-0x20, -0x10, OUT_OF_TEXT_DELTA],
+    )
+    info = _load(path)
+
+    result = resolve_jump_table(
+        path, info, RODATA_VA, mode="relative", base_address=TEXT_VA + 0x30
+    )
+
+    assert [entry.target for entry in result.entries] == [0x401010, 0x401020]
+
+
+def test_relative_target_bounds_stop_the_scan(tmp_path: Path) -> None:
+    path = _relative_sample(tmp_path)
+    info = _load(path)
+
+    result = resolve_jump_table(
+        path,
+        info,
+        RODATA_VA,
+        mode="relative",
+        base_address=TEXT_VA,
+        min_target=TEXT_VA,
+        max_target=TEXT_VA + TEXT_DELTA,
+    )
+
+    assert [entry.target for entry in result.entries] == [0x401010]
+    assert len(result.warnings) == 1
+    assert "max_target" in result.warnings[0]
+
+
+def test_relative_mode_requires_a_base_address(tmp_path: Path) -> None:
+    path = _relative_sample(tmp_path)
+    info = _load(path)
+
+    with pytest.raises(AnalysisError):
+        resolve_jump_table(path, info, RODATA_VA, mode="relative")
+
+
+@pytest.mark.parametrize("pointer_size", [2, 8])
+def test_relative_mode_rejects_other_pointer_sizes(
+    tmp_path: Path, pointer_size: int
+) -> None:
+    path = _relative_sample(tmp_path)
+    info = _load(path)
+
+    with pytest.raises(AnalysisError):
+        resolve_jump_table(
+            path,
+            info,
+            RODATA_VA,
+            pointer_size=pointer_size,
+            mode="relative",
+            base_address=TEXT_VA,
+        )
+
+
+def test_unknown_mode_raises(tmp_path: Path) -> None:
+    path = _relative_sample(tmp_path)
+    info = _load(path)
+
+    with pytest.raises(AnalysisError):
+        resolve_jump_table(path, info, RODATA_VA, mode="offset")
+
+
+def test_absolute_mode_is_unchanged(tmp_path: Path) -> None:
+    path = _three_target_sample(tmp_path)
+    info = _load(path)
+
+    default = resolve_jump_table(path, info, RODATA_VA)
+    explicit = resolve_jump_table(path, info, RODATA_VA, mode="absolute")
+
+    assert explicit.to_dict() == default.to_dict()
+    assert default.pointer_size == 8
+    assert default.evidence.source == "jump_table.pointer_array"
+    assert default.evidence.method == "absolute_pointers"
+
+
+def test_absolute_mode_ignores_base_address(tmp_path: Path) -> None:
+    path = _three_target_sample(tmp_path)
+    info = _load(path)
+
+    baseline = resolve_jump_table(path, info, RODATA_VA)
+    with_base = resolve_jump_table(path, info, RODATA_VA, base_address=TEXT_VA)
+
+    assert with_base.to_dict() == baseline.to_dict()
