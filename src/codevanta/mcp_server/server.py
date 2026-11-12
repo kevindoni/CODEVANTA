@@ -105,6 +105,30 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Build an inter-function call graph. Edges come from direct calls "
+            "only, plus calls through a pointer slot that resolves to a known "
+            "import (the target node is labelled with the import name) or to a "
+            "statically known slot whose callee is unknown. Jumps, conditional "
+            "branches, and unresolved indirect calls produce no edges. The "
+            "caller of a call site is attributed heuristically to the nearest "
+            "function candidate at or below the call address in the same "
+            "section, so caller attribution is not proven. Check 'truncated' "
+            "and 'warnings' before assuming the graph is complete."
+        )
+    )
+    def codevanta_callgraph(
+        path: str,
+        limit_functions: int = 1000,
+        limit_edges: int = 5000,
+    ) -> dict:
+        return tools.callgraph(
+            path,
+            limit_functions=limit_functions,
+            limit_edges=limit_edges,
+        )
+
+    @server.tool(
+        description=(
             "Analyze a binary and persist its fingerprint, function count, and "
             "string count as a new session in the local SQLite session database."
         )

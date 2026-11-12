@@ -53,11 +53,12 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
     assert report["disassembly"]["instruction_count"] == 3
 
 
-def test_server_lists_nine_tools() -> None:
+def test_server_lists_ten_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
     assert names == [
         "codevanta_analyze",
+        "codevanta_callgraph",
         "codevanta_cfg",
         "codevanta_disasm",
         "codevanta_functions",
@@ -221,6 +222,50 @@ def test_cfg_rejects_out_of_range_bounds(branchy_elf_path: Path) -> None:
 def test_cfg_unknown_function_is_an_analysis_error(branchy_elf_path: Path) -> None:
     with pytest.raises(AnalysisError, match="not found"):
         tools.cfg(str(branchy_elf_path), function="no_such_function")
+
+
+def test_callgraph_reports_nodes_and_edges(call_elf_path: Path) -> None:
+    payload = tools.callgraph(str(call_elf_path))
+
+    assert "nodes" in payload
+    assert "edges" in payload
+    assert payload["node_count"] == len(payload["nodes"]) >= 1
+    assert payload["edge_count"] == len(payload["edges"]) >= 1
+    assert payload["truncated"] is False
+    edge = payload["edges"][0]
+    assert edge["source"] == "0x401000"
+    assert edge["target"] == "0x401010"
+    assert edge["from_address"] == "0x401000"
+    assert payload["evidence"]["source"] == "callgraph.direct_calls"
+
+
+def test_server_call_tool_callgraph_returns_nodes_and_edges(
+    call_elf_path: Path,
+) -> None:
+    result = asyncio.run(
+        build_server().call_tool("codevanta_callgraph", {"path": str(call_elf_path)})
+    )
+    payload = _payload(result)
+
+    assert "nodes" in payload
+    assert "edges" in payload
+    assert payload["edges"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"limit_functions": 0}, "limit_functions"),
+        ({"limit_functions": tools.MAX_CALLGRAPH_LIMIT + 1}, "limit_functions"),
+        ({"limit_edges": 0}, "limit_edges"),
+        ({"limit_edges": tools.MAX_CALLGRAPH_LIMIT + 1}, "limit_edges"),
+    ],
+)
+def test_callgraph_rejects_out_of_range_bounds(
+    call_elf_path: Path, kwargs: dict[str, int], match: str
+) -> None:
+    with pytest.raises(AnalysisError, match=match):
+        tools.callgraph(str(call_elf_path), **kwargs)
 
 
 def test_session_save_and_list(

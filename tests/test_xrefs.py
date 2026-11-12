@@ -14,7 +14,7 @@ import pytest
 
 from codevanta.analysis.xrefs import Xref, XrefResult, find_xrefs
 from codevanta.core.functions import FunctionCandidate
-from codevanta.core.loader import BinaryInfo, BinaryLoader
+from codevanta.core.loader import BinaryInfo, BinaryLoader, ImportInfo
 from codevanta.core.report import AnalysisError
 from codevanta.evidence.confidence import Confidence
 from codevanta.evidence.models import Evidence
@@ -321,4 +321,186 @@ def test_unsupported_architecture_returns_warning(tmp_path: Path) -> None:
     assert result.xrefs == []
     assert result.scanned_bytes == 0
     assert any("disassembly unavailable" in warning for warning in result.warnings)
+
+
+
+# --- indirect (pointer-slot) calls -------------------------------------------
+#
+# The samples below cover the two statically resolvable indirect call shapes:
+# absolute ``call qword ptr [0x...]`` and RIP-relative
+# ``call qword ptr [rip +/- 0x...]``. Import entries are appended to
+# ``info.imports`` after loading because the synthetic ELF has no dynamic
+# symbol table to derive them from.
+
+
+def _import(name: str, address: int | None) -> ImportInfo:
+    """Build a hand-made import entry for indirect-call naming tests."""
+    return ImportInfo(name=name, address=address)
+
+
+def test_rip_relative_call_through_import_slot_is_call_import(tmp_path: Path) -> None:
+    # call qword ptr [rip + 0xa] ; ret  ->  slot at 0x401000 + 6 + 0xa
+    path = _write_elf64(tmp_path / "rip_import.bin", bytes.fromhex("ff150a000000c3"))
+    info = _load(path)
+    info.imports.append(_import("Sleep", 0x401010))
+
+    result = find_xrefs(path, info)
+
+    assert len(result.xrefs) == 1
+    xref = result.xrefs[0]
+    assert (xref.from_address, xref.to_address) == (0x401000, 0x401010)
+    assert xref.kind == "call_import"
+    assert xref.target_name == "Sleep"
+    assert xref.source == "capstone.import_call"
+    assert xref.instruction == "call qword ptr [rip + 0xa]"
+    assert xref.evidence.source == "capstone.import_call"
+    assert xref.evidence.address == 0x401000
+    assert xref.evidence.confidence is Confidence.CERTAIN
+    assert result.indirect_skipped == 0
+
+
+def test_absolute_call_through_import_slot_is_call_import(tmp_path: Path) -> None:
+    # call qword ptr [0x401000] ; ret
+    path = _write_elf64(tmp_path / "abs_import.bin", bytes.fromhex("ff142500104000c3"))
+    info = _load(path)
+    info.imports.append(_import("Sleep", 0x401000))
+
+    result = find_xrefs(path, info)
+
+    assert len(result.xrefs) == 1
+    xref = result.xrefs[0]
+    assert (xref.from_address, xref.to_address) == (0x401000, 0x401000)
+    assert xref.kind == "call_import"
+    assert xref.target_name == "Sleep"
+    assert xref.source == "capstone.import_call"
+    assert xref.instruction == "call qword ptr [0x401000]"
+    assert result.indirect_skipped == 0
+
+
+def test_rip_relative_negative_displacement_resolves_backwards(tmp_path: Path) -> None:
+    # call qword ptr [rip - 0xa] ; ret  ->  slot at 0x401006 - 0xa
+    path = _write_elf64(tmp_path / "rip_back.bin", bytes.fromhex("ff15f6ffffffc3"))
+    info = _load(path)
+
+    result = find_xrefs(path, info)
+
+    assert len(result.xrefs) == 1
+    xref = result.xrefs[0]
+    assert xref.to_address == 0x400FFC
+    assert xref.kind == "call_indirect"
+    assert xref.instruction == "call qword ptr [rip - 0xa]"
+
+
+def test_unmapped_absolute_slot_is_call_indirect(tmp_path: Path) -> None:
+    path = _write_elf64(tmp_path / "abs_indirect.bin", bytes.fromhex("ff150a000000c3"))
+    info = _load(path)
+    info.imports.append(_import("Sleep", 0x4010F0))  # different address on purpose
+
+    result = find_xrefs(path, info)
+
+    assert len(result.xrefs) == 1
+    xref = result.xrefs[0]
+    assert (xref.from_address, xref.to_address) == (0x401000, 0x401010)
+    assert xref.kind == "call_indirect"
+    assert xref.target_name is None
+    assert xref.source == "capstone.indirect_call"
+    assert xref.evidence.source == "capstone.indirect_call"
+    # The slot address is certain, the callee it points at is not.
+    assert xref.evidence.confidence is Confidence.HIGH
+    assert result.indirect_skipped == 0
+
+
+def test_import_without_address_is_not_matched(tmp_path: Path) -> None:
+    path = _write_elf64(tmp_path / "no_addr.bin", bytes.fromhex("ff150a000000c3"))
+    info = _load(path)
+    info.imports.append(_import("Unresolved", None))
+
+    result = find_xrefs(path, info)
+
+    assert result.xrefs[0].kind == "call_indirect"
+    assert result.xrefs[0].target_name is None
+
+
+def test_register_call_is_skipped_and_counted(tmp_path: Path) -> None:
+    # call rax ; ret
+    path = _write_elf64(tmp_path / "call_rax.bin", bytes.fromhex("ffd0c3"))
+    info = _load(path)
+
+    result = find_xrefs(path, info)
+
+    assert result.xrefs == []
+    assert result.indirect_skipped == 1
+    assert result.scanned_sections == [".text"]
+    assert result.scanned_bytes == 3
+
+
+def test_indexed_memory_call_is_skipped_and_counted(tmp_path: Path) -> None:
+    # call qword ptr [rax + 8] ; call qword ptr [rax] ; ret
+    path = _write_elf64(tmp_path / "call_rax8.bin", bytes.fromhex("ff5008ff10c3"))
+    info = _load(path)
+
+    result = find_xrefs(path, info)
+
+    assert result.xrefs == []
+    assert result.indirect_skipped == 2
+
+
+def test_multiple_skipped_indirect_calls_are_counted(tmp_path: Path) -> None:
+    # call rax x3 ; ret
+    path = _write_elf64(tmp_path / "call_rax3.bin", bytes.fromhex("ffd0ffd0ffd0c3"))
+    info = _load(path)
+
+    result = find_xrefs(path, info)
+
+    assert result.xrefs == []
+    assert result.indirect_skipped == 3
+
+
+def test_indirect_jump_is_not_counted_as_skipped_call(tmp_path: Path) -> None:
+    # jmp qword ptr [rax] ; jmp qword ptr [0x401000] ; jmp rax ; ret
+    path = _write_elf64(tmp_path / "jmp_indirect.bin", bytes.fromhex("ff20ff2500104000ffe0c3"))
+    info = _load(path)
+
+    result = find_xrefs(path, info)
+
+    assert result.xrefs == []
+    assert result.indirect_skipped == 0  # only *calls* are counted
+
+
+def test_direct_call_is_preferred_over_import_matching(tmp_path: Path) -> None:
+    # call 0x401010 with an import registered at the very same address
+    path = _write_elf64(tmp_path / "direct_wins.bin", bytes.fromhex("e80b000000c3"))
+    info = _load(path)
+    info.imports.append(_import("Sleep", 0x401010))
+
+    result = find_xrefs(path, info)
+
+    assert result.xrefs[0].kind == "call"
+    assert result.xrefs[0].target_name is None
+    assert result.indirect_skipped == 0
+
+
+def test_to_dict_includes_indirect_skipped_and_target_name(tmp_path: Path) -> None:
+    path = _write_elf64(tmp_path / "dict_indirect.bin", bytes.fromhex("ff150a000000ffd0c3"))
+    info = _load(path)
+    info.imports.append(_import("Sleep", 0x401010))
+
+    data = find_xrefs(path, info).to_dict()
+
+    assert data["indirect_skipped"] == 1
+    assert data["xref_count"] == 1
+    assert data["xrefs"][0]["kind"] == "call_import"
+    assert data["xrefs"][0]["to_address"] == "0x401010"
+    assert data["xrefs"][0]["target_name"] == "Sleep"
+    assert data["xrefs"][0]["source"] == "capstone.import_call"
+
+
+def test_to_dict_omits_absent_target_name(tmp_path: Path) -> None:
+    path = _write_elf64(tmp_path / "dict_notarget.bin", bytes.fromhex("ff150a000000c3"))
+    info = _load(path)
+
+    data = find_xrefs(path, info).to_dict()
+
+    assert data["indirect_skipped"] == 0
+    assert "target_name" not in data["xrefs"][0]
 

@@ -53,29 +53,39 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
 
 - **Cross-references** (`analysis/xrefs.py`) — `call`/`jump`/`branch` references
   recovered from direct branch operands in executable sections, each with
-  evidence and an optional callee name.
+  evidence and an optional callee name. Calls through an absolute or RIP-relative
+  pointer slot (`call qword ptr [0x402000]`, `call qword ptr [rip + 0xa]`) now
+  resolve to the slot: known imports become `call_import` with a `target_name`,
+  other slots become `call_indirect`, and register/indexed calls that cannot be
+  resolved are skipped and counted (`indirect_skipped`).
 - **Control-flow graphs** (`analysis/cfg.py`) — basic blocks and successor edges
   for one region, built by linear sweep with leader/terminator rules.
-- **Call graph** (`analysis/callgraph.py`) — direct `call` cross-references
-  aggregated into nodes and edges. Caller attribution is heuristic (nearest
-  function candidate at or below the call site in the same section), so the graph
-  reports `medium` confidence and warns when a call site cannot be attributed.
+- **Call graph** (`analysis/callgraph.py`) — `call`, `call_import`, and
+  `call_indirect` cross-references aggregated into nodes and edges. Import slots
+  become `import` nodes labelled from the import table; unresolved callees stay
+  `external`. Caller attribution is heuristic (nearest function candidate at or
+  below the call site in the same section), so the graph reports `medium`
+  confidence and warns when a call site cannot be attributed.
 - **Graph export** (`analysis/graph_export.py`) — the call graph rendered as
   Graphviz DOT or GraphML by one dependency-free, deterministic exporter.
 - **Session storage** (`storage/session.py`) — additive SQLite records of each
   analysis run (fingerprint, format, arch, entry point, function/string counts)
   plus per-address analyst annotations (`annotate`, `annotations`,
   `remove_annotation`; one replaceable note per address).
-- **MCP tools** — `codevanta_xrefs`, `codevanta_cfg`, `codevanta_session_save`,
-  `codevanta_session_list`, alongside the five phase 1 tools (nine in total).
+- **MCP tools** — `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`,
+  `codevanta_session_save`, `codevanta_session_list`, alongside the five phase 1
+  tools (ten in total).
 - **CLI:** `codevanta xrefs`, `codevanta cfg`, `codevanta callgraph`,
-  `codevanta session save|list|show|annotate|notes`.
+  `codevanta analyze --callgraph`, plus the
+  `session save|list|show|annotate|notes` subcommands.
 
-Phase 2 is deliberately narrow: linear sweep only, direct branch targets only,
-call graph edges from direct calls only, no recursive traversal or indirect-call
-resolution, no graph viewer, and no debugger yet. See
-[docs/phase2.md](docs/phase2.md) and [docs/phase2b.md](docs/phase2b.md) for
-scope, confidence semantics, and limitations.
+Phase 2 is deliberately narrow: linear sweep only, direct branch targets plus
+absolute/RIP-relative pointer slots only, call graph edges from `call` /
+`call_import` / `call_indirect` only, no register-target resolution, no recursive
+traversal, no graph viewer, and no debugger yet. See
+[docs/phase2.md](docs/phase2.md), [docs/phase2b.md](docs/phase2b.md), and
+[docs/phase2c.md](docs/phase2c.md) for scope, confidence semantics, and
+limitations.
 
 ## Installation
 
@@ -106,6 +116,7 @@ codevanta analyze   samples\elf64_text.bin --output samples\report.json
 codevanta xrefs     C:\Windows\System32\notepad.exe --limit 40
 codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000
 codevanta callgraph C:\Windows\System32\notepad.exe --format dot -o callgraph.dot
+codevanta analyze   C:\Windows\System32\notepad.exe --callgraph -o report.json
 codevanta session save C:\Windows\System32\notepad.exe --notes "baseline triage"
 codevanta session list --limit 10
 codevanta session show 4f9c1a7b2d3e
@@ -125,6 +136,15 @@ boundaries come from mnemonic heuristics), and the call graph is `medium`
 `graphml`; `codevanta cfg` defaults to the entry point; sessions default to
 `$env:CODEVANTA_DB` or `~/.codevanta/sessions.db`, and `session annotate` accepts
 decimal or `0x` hex addresses.
+
+Calls through a pointer slot report the **slot** address, not the callee: the
+pointer is read at run time, so the code behind it is unknown here. A slot that
+matches the import table becomes `call_import` with a `target_name`; any other
+absolute or RIP-relative slot becomes `call_indirect` (`high` confidence — the
+slot is proven, the callee is not); register and indexed operands are skipped and
+counted in `indirect_skipped`, which `codevanta xrefs --json` prints.
+`codevanta analyze --callgraph` embeds the graph in the report, bounded to 1000
+functions and 5000 edges, and marks it `truncated` when a cap cuts it short.
 
 ## Coding agent setup (MCP)
 
@@ -147,10 +167,16 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools (nine): `codevanta_info`, `codevanta_functions`,
+MCP tools (ten): `codevanta_info`, `codevanta_functions`,
 `codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
-`codevanta_xrefs`, `codevanta_cfg`, `codevanta_session_save`,
-`codevanta_session_list`.
+`codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`,
+`codevanta_session_save`, `codevanta_session_list`.
+
+`codevanta_callgraph` takes the same bounded limits as the CLI
+(`limit_functions`, `limit_edges`, defaulting to 1000 and 5000) and returns nodes,
+edges, `truncated`, `warnings`, and evidence. Import targets arrive as `import`
+nodes labelled from the import table; unresolved callees stay `external`.
+`codevanta_analyze` remains the phase 1 report and has no call-graph flag.
 
 Prompt you can paste into a coding agent:
 
@@ -189,6 +215,7 @@ ruff check src tests
 - [Architecture](docs/architecture.md)
 - [Phase 2 — cross-references, CFGs, sessions](docs/phase2.md)
 - [Phase 2b — call graphs, graph export, session annotations](docs/phase2b.md)
+- [Phase 2c — import/indirect calls, embedded call graphs, MCP call graph](docs/phase2c.md)
 
 ## Roadmap
 
@@ -227,6 +254,7 @@ steps.
 ## Community
 
 - [Contributing](CONTRIBUTING.md) — development setup, checks, and conventions
+- [Contributors](CONTRIBUTORS.md) — maintainer, agent workstreams, and how to be listed
 - [Code of conduct](CODE_OF_CONDUCT.md)
 - [Security policy](SECURITY.md) — report vulnerabilities privately
 - [Repository settings checklist](docs/repository-settings.md) — maintainers

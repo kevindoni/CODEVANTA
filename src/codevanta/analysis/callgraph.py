@@ -1,4 +1,4 @@
-"""Inter-function call graph assembled from direct call cross references (phase 2).
+"""Inter-function call graph assembled from resolved call cross references (phase 2).
 
 The graph is an *aggregate* view over the cross references produced by
 :mod:`codevanta.analysis.xrefs`. Nothing is disassembled here; this module only
@@ -6,11 +6,21 @@ filters, attributes, and deduplicates what the xref scan already proved.
 
 Two rules keep the result honest:
 
-1. **Direct calls only.** Only cross references whose ``kind`` is ``"call"``
-   become edges. ``jump`` and ``branch`` references, indirect transfers
-   (``call rax``, ``call qword ptr [...]``), and imports resolved through a
-   thunk are out of scope, so ``to_dict()`` never implies a completeness it does
-   not have.
+1. **Resolved transfers only.** Exactly three cross-reference kinds become
+   edges:
+
+   * ``"call"`` -- a direct call to a literal address. The target is the callee.
+   * ``"call_import"`` -- a call through a pointer slot that matches a known
+     import. The target is the *slot* address, so the node is an ``import``
+     node labelled with the import name and marked ``high`` confidence.
+   * ``"call_indirect"`` -- a call through a pointer slot that matches no
+     import. The slot address is certain, the callee it holds is not, so the
+     target is an ``external`` node of ``unknown`` confidence.
+
+   ``jump`` and ``branch`` references, and indirect calls whose slot address is
+   not statically known (``call rax``, ``call qword ptr [rax + 8]``), emit no
+   edge -- the xref layer does not report them -- so ``to_dict()`` never
+   implies a completeness it does not have.
 2. **Caller attribution is a heuristic.** The xref layer records the address of
    the calling *instruction*, not the enclosing function (no function boundary
    data is trusted here). A call site is therefore attributed to the **nearest
@@ -33,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from codevanta.analysis.xrefs import XrefResult, find_xrefs
+from codevanta.analysis.xrefs import Xref, XrefResult, find_xrefs
 from codevanta.core.functions import FunctionCandidate, discover_functions
 from codevanta.core.loader import BinaryInfo
 from codevanta.core.report import AnalysisError
@@ -59,19 +69,39 @@ DEFAULT_MAX_FUNCTIONS = 2_000
 #: Default ceiling on how many call edges are reported.
 DEFAULT_MAX_EDGES = 20_000
 
-#: Node kinds. ``external`` marks a call target that is not a known candidate.
+#: Xref kind of a direct call to a literal address.
+_XREF_CALL = "call"
+
+#: Xref kind of a call through a pointer slot that matched a known import.
+_XREF_CALL_IMPORT = "call_import"
+
+#: Xref kind of a call through a resolvable pointer slot with no matching import.
+_XREF_CALL_INDIRECT = "call_indirect"
+
+#: Node kinds. ``external`` marks a call target that is not a known candidate
+#: and whose callee is unknown; ``import`` marks a pointer slot that matched a
+#: known import.
 _KIND_ENTRY_POINT = "entry_point"
 _KIND_FUNCTION = "function"
 _KIND_EXTERNAL = "external"
+_KIND_IMPORT = "import"
 _KIND_CALL_SITE = "call_site"
+
+#: Cross-reference kinds that become graph edges.
+_INCLUDED_XREF_KINDS = frozenset({_XREF_CALL, _XREF_CALL_IMPORT, _XREF_CALL_INDIRECT})
 
 #: Prefix used by :meth:`CallGraph.to_graph_model` node ids for external nodes.
 _EXTERNAL_PREFIX = "external:"
 
+#: Prefix used by :meth:`CallGraph.to_graph_model` node ids for import nodes.
+_IMPORT_PREFIX = "import:"
+
 #: Fallback id for an address that could not be resolved to any node.
 _UNRESOLVED_ID = "unresolved"
 
-#: Evidence describing how the graph as a whole was produced.
+#: Evidence describing how the graph as a whole was produced. The label keeps
+#: its historical value (``callgraph.direct_calls``) so existing report consumers
+#: and snapshots stay stable; the detail text states the extra coverage.
 _EVIDENCE_SOURCE = "callgraph.direct_calls"
 _EVIDENCE_METHOD = "xref_aggregation"
 
@@ -89,12 +119,16 @@ class CallGraphNode:
     """One vertex of the call graph.
 
     Attributes:
-        address: Virtual address of the node, or ``None`` when unresolved.
-        label: Display name -- the candidate name, or a synthesized ``sub_*`` /
-            ``external_*`` placeholder when no name is known.
-        kind: ``"entry_point"``, ``"function"`` or ``"external"``.
+        address: Virtual address of the node, or ``None`` when unresolved. For
+            an ``import`` node this is the address of the import stub / IAT slot
+            the call goes through, not the address of the imported code.
+        label: Display name -- the candidate name, the import name, or a
+            synthesized ``sub_*`` / ``external_*`` placeholder when no name is
+            known.
+        kind: ``"entry_point"``, ``"function"``, ``"external"`` or ``"import"``.
         confidence: Confidence value as a plain string, e.g. ``"high"``. Nodes
-            for unknown targets always report ``"unknown"``.
+            for unknown targets always report ``"unknown"``; nodes for resolved
+            imports report ``"high"``.
     """
 
     address: int | None
@@ -119,9 +153,11 @@ class CallGraphEdge:
     Attributes:
         source: Attributed caller address, or the call address itself when no
             candidate covers the call site.
-        target: Callee address as encoded by the direct call operand.
+        target: Address the call refers to: the callee for a direct call, or the
+            pointer slot / import slot for an import or indirect call.
         from_address: Virtual address of the calling instruction.
-        label: Edge kind label; ``"call"`` for every edge produced here.
+        label: Edge kind label; ``"call"`` for every edge produced here. Import
+            naming is carried by the target node's ``label``, not by the edge.
     """
 
     source: int | None
@@ -160,12 +196,41 @@ class CallGraph:
     evidence: Evidence
     warnings: tuple[str, ...] = ()
 
+    def _nodes_with_endpoints(self) -> list[CallGraphNode]:
+        """Return the nodes plus synthetic nodes for every edge endpoint.
+
+        Caller attribution is heuristic, so an edge can start at a call site that
+        is not a candidate, and an indirect target need not be one either. Adding
+        a ``call_site`` / ``external`` node for each missing endpoint keeps both
+        ``to_dict()`` and ``to_graph_model()`` internally consistent.
+        """
+        nodes = list(self.nodes)
+        known_addresses = {node.address for node in nodes}
+        for edge in self.edges:
+            for address, kind in (
+                (edge.source, _KIND_CALL_SITE),
+                (edge.target, _KIND_EXTERNAL),
+            ):
+                if address in known_addresses:
+                    continue
+                known_addresses.add(address)
+                nodes.append(
+                    CallGraphNode(
+                        address=address,
+                        label=_hex(address) if address is not None else "unresolved",
+                        kind=kind,
+                        confidence="unknown",
+                    )
+                )
+        return nodes
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize the graph for the JSON report."""
+        nodes = self._nodes_with_endpoints()
         return {
-            "node_count": len(self.nodes),
+            "node_count": len(nodes),
             "edge_count": len(self.edges),
-            "nodes": [node.to_dict() for node in self.nodes],
+            "nodes": [node.to_dict() for node in nodes],
             "edges": [edge.to_dict() for edge in self.edges],
             "truncated": self.truncated,
             "warnings": list(self.warnings),
@@ -175,18 +240,20 @@ class CallGraph:
     def to_graph_model(self) -> dict[str, Any]:
         """Serialize the graph as a generic ``{nodes, edges}`` graph model.
 
-        Node ids are strings: ``"0x<addr>"`` for a candidate node and
-        ``"external:0x<addr>"`` for a node that only exists because some direct
-        call targeted an address that is not a known candidate. Edge endpoints
-        reuse those ids so consumers can join them to the node list.
+        Node ids are strings: ``"0x<addr>"`` for a candidate node,
+        ``"import:0x<addr>"`` for a resolved import node and
+        ``"external:0x<addr>"`` for a node that only exists because some call
+        targeted an address that is not a known candidate. Edge endpoints reuse
+        those ids so consumers can join them to the node list.
 
         Caller attribution is heuristic, so an edge can start at a call site that
         is not a known candidate. Every endpoint without a node gets a synthetic
         node (``call_site`` for a source, ``external`` for a target), so DOT and
         GraphML consumers always see edges that reference existing node ids.
         """
+        base_nodes = self._nodes_with_endpoints()
         ids_by_address = {
-            node.address: _node_id(node) for node in self.nodes if node.address is not None
+            node.address: _node_id(node) for node in base_nodes if node.address is not None
         }
         nodes: list[dict[str, Any]] = [
             {
@@ -196,7 +263,7 @@ class CallGraph:
                 "kind": node.kind,
                 "confidence": node.confidence,
             }
-            for node in self.nodes
+            for node in base_nodes
         ]
         known_ids = {node["id"] for node in nodes}
 
@@ -235,9 +302,15 @@ class CallGraph:
 
 
 def _node_id(node: CallGraphNode) -> str:
-    """Return the stable graph-model id of ``node``."""
+    """Return the stable graph-model id of ``node``.
+
+    Import nodes are namespaced so a slot address can never be confused with a
+    candidate or external node that happens to share the same address.
+    """
     if node.address is None:
         return _UNRESOLVED_ID
+    if node.kind == _KIND_IMPORT:
+        return f"{_IMPORT_PREFIX}0x{node.address:x}"
     if node.kind == _KIND_EXTERNAL:
         return f"{_EXTERNAL_PREFIX}0x{node.address:x}"
     return f"0x{node.address:x}"
@@ -315,6 +388,33 @@ def _caller_for(
     return addresses[position - 1] if position else None
 
 
+def _target_node(xref: Xref) -> CallGraphNode:
+    """Synthesize the node for a call target that is not a known candidate.
+
+    ``call_import`` references name a pointer slot that matched an import, so the
+    node is an ``import`` node labelled with the import name (or the slot hex when
+    the name is missing) and marked ``high`` confidence: the slot address comes
+    straight from the decoded operand and the import table corroborates it.
+
+    Every other included kind (``call`` to an unknown address, ``call_indirect``)
+    keeps the historical ``external`` node with ``unknown`` confidence, because
+    the callee behind the target is genuinely unknown.
+    """
+    if xref.kind == _XREF_CALL_IMPORT:
+        return CallGraphNode(
+            address=xref.to_address,
+            label=xref.target_name or f"0x{xref.to_address:x}",
+            kind=_KIND_IMPORT,
+            confidence=Confidence.HIGH.value,
+        )
+    return CallGraphNode(
+        address=xref.to_address,
+        label=f"external_{xref.to_address:x}",
+        kind=_KIND_EXTERNAL,
+        confidence=Confidence.UNKNOWN.value,
+    )
+
+
 def build_call_graph(
     path: str | Path,
     info: BinaryInfo,
@@ -322,11 +422,16 @@ def build_call_graph(
     max_functions: int = DEFAULT_MAX_FUNCTIONS,
     max_edges: int = DEFAULT_MAX_EDGES,
 ) -> CallGraph:
-    """Build the direct-call call graph for ``info``.
+    """Build the call graph for ``info``.
+
+    Edges come from ``call``, ``call_import`` and ``call_indirect`` cross
+    references; ``jump``/``branch`` references and unresolved indirect calls are
+    ignored (see the module docstring).
 
     Args:
         path: File the bytes are read from (read-only; never executed).
-        info: Loaded binary metadata used for section lookups and scanning.
+        info: Loaded binary metadata used for section lookups, scanning and
+            import matching.
         functions: Pre-computed function candidates. When omitted,
             :func:`~codevanta.core.functions.discover_functions` is used.
         max_functions: Candidate budget (1 .. :data:`MAX_LIMIT`). When more
@@ -375,37 +480,40 @@ def build_call_graph(
         truncated = True
     warnings.extend(f"xrefs: {warning}" for warning in xrefs.warnings)
 
-    edges: dict[tuple[int | None, int | None, int], CallGraphEdge] = {}
+    edges: dict[tuple[int | None, int | None, int], tuple[CallGraphEdge, str]] = {}
     unattributed = 0
     for xref in xrefs.xrefs:
-        if xref.kind != "call":  # jumps and conditional branches are not calls
-            continue
+        if xref.kind not in _INCLUDED_XREF_KINDS:
+            continue  # jumps and conditional branches are never call edges
         target = xref.to_address
         source = _caller_for(grouped, info, xref.from_address)
         if source is None:
             source = xref.from_address
             unattributed += 1
+        # A candidate at the target address wins over a synthesized node: the
+        # xref scan proves the address, the candidate proves it is code.
         if target not in nodes:
-            nodes[target] = CallGraphNode(
-                address=target,
-                label=f"external_{target:x}",
-                kind=_KIND_EXTERNAL,
-                confidence=Confidence.UNKNOWN.value,
-            )
+            nodes[target] = _target_node(xref)
         key = (source, target, xref.from_address)
         if key not in edges:
-            edges[key] = CallGraphEdge(
-                source=source,
-                target=target,
-                from_address=xref.from_address,
-                label=_EDGE_LABEL,
+            edges[key] = (
+                CallGraphEdge(
+                    source=source,
+                    target=target,
+                    from_address=xref.from_address,
+                    label=_EDGE_LABEL,
+                ),
+                xref.kind,
             )
 
-    ordered_edges = sorted(edges.values(), key=_edge_sort_key)
-    if len(ordered_edges) > max_edges:
-        ordered_edges = ordered_edges[:max_edges]
+    ordered = sorted(edges.values(), key=lambda item: _edge_sort_key(item[0]))
+    if len(ordered) > max_edges:
+        ordered = ordered[:max_edges]
         truncated = True
         warnings.append(f"edge limit reached (max_edges={max_edges}); later edges were dropped")
+    ordered_edges = [edge for edge, _kind in ordered]
+    import_edges = sum(1 for _edge, kind in ordered if kind == _XREF_CALL_IMPORT)
+    indirect_edges = sum(1 for _edge, kind in ordered if kind == _XREF_CALL_INDIRECT)
     if unattributed:
         warnings.append(
             f"caller attribution failed for {unattributed} call site(s); the call "
@@ -418,9 +526,11 @@ def build_call_graph(
         method=_EVIDENCE_METHOD,
         confidence=Confidence.MEDIUM,
         detail=(
-            f"{len(ordered_nodes)} nodes and {len(ordered_edges)} direct call edges; "
-            "caller attribution is heuristic (nearest candidate at or below the call "
-            "site) and only direct calls are included"
+            f"{len(ordered_nodes)} nodes and {len(ordered_edges)} edges from direct "
+            f"calls plus resolved import and indirect memory calls "
+            f"({import_edges} import, {indirect_edges} indirect); caller attribution "
+            "is heuristic (nearest candidate at or below the call site) and unresolved "
+            "indirect calls are not represented"
         ),
     )
     return CallGraph(

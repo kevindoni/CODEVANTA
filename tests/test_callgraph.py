@@ -11,6 +11,7 @@ import inspect
 import struct
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -24,7 +25,7 @@ from codevanta.analysis.callgraph import (
     build_call_graph,
 )
 from codevanta.core.functions import FunctionCandidate
-from codevanta.core.loader import BinaryInfo, BinaryLoader
+from codevanta.core.loader import BinaryInfo, BinaryLoader, ImportInfo
 from codevanta.core.report import AnalysisError
 from codevanta.evidence.confidence import Confidence
 from codevanta.evidence.models import Evidence
@@ -36,6 +37,19 @@ FAR_VA = 0x500005
 SHF_ALLOC = 0x2
 SHF_EXECINSTR = 0x4
 
+#: Pointer slot used by the import tests (``.text`` VA + 6 + 0xa).
+SLOT_VA = 0x401010
+
+#: Slot addressed absolutely by the import-less indirect test.
+ABS_SLOT_VA = 0x401000
+
+#: Slot addressed absolutely by the import-less indirect call in the mixed sample.
+MIXED_SLOT_VA = 0x401020
+
+#: ``.text`` VA of the sample whose call slots point *back* at 0x401000, so the
+#: slot address can never coincide with the calling candidate.
+INDIRECT_TEXT_VA = 0x402000
+
 #: ``a``: call 0x401010 ; ret ; nop padding ; ``b``: call 0x401010 ; ret.
 PAIR_CODE = bytes.fromhex("e80b000000c3") + b"\x90" * 10 + bytes.fromhex("e8fbffffffc3")
 
@@ -44,6 +58,16 @@ FAR_CALL_CODE = bytes.fromhex("e800f00f00c3")
 
 #: ``jmp 0x401002`` ; ``je 0x401004`` ; ``call 0x401000`` ; ``ret``.
 MIXED_CODE = bytes.fromhex("eb007400e8f7ffffffc3")
+
+#: ``call qword ptr [rip + 0xa]`` ; ret -- the slot lands on 0x401010.
+RIP_IMPORT_CALL_CODE = bytes.fromhex("ff150a000000c3")
+
+#: ``call qword ptr [0x401000]`` ; ret -- absolute slot, no import registered.
+ABS_INDIRECT_CALL_CODE = bytes.fromhex("ff142500104000c3")
+
+#: ``call qword ptr [rip + 0xa]`` (slot 0x401010) ; ``call qword ptr [0x401020]``
+#: ; ret -- one import call plus one import-less indirect call.
+MIXED_MEMORY_CALL_CODE = bytes.fromhex("ff150a000000" "ff142520104000") + b"\xc3"
 
 
 def _write_elf64(
@@ -141,6 +165,23 @@ def _edges(graph: CallGraph) -> list[tuple[int | None, int | None, int]]:
     return [(edge.source, edge.target, edge.from_address) for edge in graph.edges]
 
 
+def _import(name: str, address: int | None) -> ImportInfo:
+    """Build a hand-made import entry for indirect-call naming tests."""
+    return ImportInfo(name=name, address=address)
+
+
+def _assert_endpoints_resolve(model: dict[str, Any]) -> None:
+    """Assert the graph model is closed: every edge endpoint is a node id."""
+    nodes = model["nodes"]
+    ids = {node["id"] for node in nodes}
+    assert len(ids) == len(nodes)  # ids are unique
+    for edge in model["edges"]:
+        assert isinstance(edge["source"], str)
+        assert isinstance(edge["target"], str)
+        assert edge["source"] in ids
+        assert edge["target"] in ids
+
+
 def test_both_direct_calls_produce_edges(tmp_path: Path) -> None:
     path = _write_elf64(tmp_path / "pair.bin", PAIR_CODE)
     info = _load(path)
@@ -212,6 +253,84 @@ def test_jump_and_branch_references_are_ignored(tmp_path: Path) -> None:
     # The jmp/je cross references (0x401002, 0x401004) never become edges.
     assert _edges(graph) == [(A_VA, A_VA, 0x401004)]
     assert all(edge.label == "call" for edge in graph.edges)
+
+
+def test_rip_relative_import_call_creates_import_node(tmp_path: Path) -> None:
+    # call qword ptr [rip + 0xa] at 0x401000 -> import slot 0x401000 + 6 + 0xa.
+    path = _write_elf64(tmp_path / "import.bin", RIP_IMPORT_CALL_CODE)
+    info = _load(path)
+    info.imports.append(_import("Sleep", SLOT_VA))
+
+    graph = build_call_graph(path, info, functions=[_function(A_VA, "a")])
+
+    assert _edges(graph) == [(A_VA, SLOT_VA, A_VA)]
+    node = next(node for node in graph.nodes if node.address == SLOT_VA)
+    assert node.kind == "import"
+    assert node.label == "Sleep"
+    assert node.confidence == Confidence.HIGH.value
+
+    model = graph.to_graph_model()
+    assert {node["id"] for node in model["nodes"]} == {"0x401000", "import:0x401010"}
+    assert model["edges"][0]["target"] == "import:0x401010"
+    _assert_endpoints_resolve(model)
+
+
+def test_absolute_indirect_call_without_import_is_external(tmp_path: Path) -> None:
+    # call qword ptr [0x401000] from 0x402000: the slot back-references the old
+    # ``.text`` VA, so it can never coincide with the calling candidate.
+    path = _write_elf64(
+        tmp_path / "indirect.bin", ABS_INDIRECT_CALL_CODE, text_va=INDIRECT_TEXT_VA
+    )
+    info = _load(path)
+    assert info.imports == []
+
+    graph = build_call_graph(path, info, functions=[_function(INDIRECT_TEXT_VA, "a")])
+
+    assert _edges(graph) == [(INDIRECT_TEXT_VA, ABS_SLOT_VA, INDIRECT_TEXT_VA)]
+    node = next(node for node in graph.nodes if node.address == ABS_SLOT_VA)
+    assert node.kind == "external"
+    assert node.confidence == Confidence.UNKNOWN.value
+
+    model = graph.to_graph_model()
+    assert {node["id"] for node in model["nodes"]} == {
+        "0x402000",
+        "external:0x401000",
+    }
+    assert model["edges"][0]["target"] == "external:0x401000"
+    _assert_endpoints_resolve(model)
+
+
+def test_import_and_indirect_calls_share_the_edge_sorting(tmp_path: Path) -> None:
+    path = _write_elf64(tmp_path / "memory.bin", MIXED_MEMORY_CALL_CODE)
+    info = _load(path)
+    info.imports.append(_import("Sleep", SLOT_VA))
+
+    graph = build_call_graph(path, info, functions=[_function(A_VA, "a")])
+
+    assert _edges(graph) == [
+        (A_VA, SLOT_VA, A_VA),           # call qword ptr [rip + 0xa]  -> import
+        (A_VA, MIXED_SLOT_VA, 0x401006),  # call qword ptr [0x401020]   -> external
+    ]
+    assert {node.address: node.kind for node in graph.nodes} == {
+        A_VA: "entry_point",
+        SLOT_VA: "import",
+        MIXED_SLOT_VA: "external",
+    }
+    assert all(edge.label == "call" for edge in graph.edges)
+    _assert_endpoints_resolve(graph.to_graph_model())
+
+
+def test_max_edges_keeps_import_and_indirect_edges_first(tmp_path: Path) -> None:
+    path = _write_elf64(tmp_path / "memory_cut.bin", MIXED_MEMORY_CALL_CODE)
+    info = _load(path)
+    info.imports.append(_import("Sleep", SLOT_VA))
+
+    graph = build_call_graph(path, info, functions=[_function(A_VA, "a")], max_edges=1)
+
+    assert graph.truncated is True
+    assert _edges(graph) == [(A_VA, SLOT_VA, A_VA)]
+    # The evidence detail counts only the edges that survived the cut.
+    assert "(1 import, 0 indirect)" in (graph.evidence.detail or "")
 
 
 def test_max_edges_marks_graph_truncated(tmp_path: Path) -> None:
@@ -344,6 +463,22 @@ def test_graph_evidence_states_limits(tmp_path: Path) -> None:
     assert "direct calls" in (graph.evidence.detail or "")
 
 
+def test_evidence_detail_mentions_import_and_indirect_calls(tmp_path: Path) -> None:
+    path = _write_elf64(tmp_path / "evidence_memory.bin", MIXED_MEMORY_CALL_CODE)
+    info = _load(path)
+    info.imports.append(_import("Sleep", SLOT_VA))
+
+    graph = build_call_graph(path, info, functions=[_function(A_VA, "a")])
+
+    detail = graph.evidence.detail or ""
+    assert "direct calls" in detail
+    assert "resolved import and indirect memory calls" in detail
+    assert "(1 import, 1 indirect)" in detail
+    assert "heuristic" in detail
+    assert graph.evidence.source == "callgraph.direct_calls"
+    assert graph.evidence.method == "xref_aggregation"
+
+
 def test_to_dict_serializes_hex_addresses(tmp_path: Path) -> None:
     path = _write_elf64(tmp_path / "dict.bin", FAR_CALL_CODE)
     info = _load(path)
@@ -418,6 +553,19 @@ def test_graph_model_adds_nodes_for_unattributed_call_sites(tmp_path: Path) -> N
     for edge in model["edges"]:
         assert edge["source"] in ids
         assert edge["target"] in ids
+
+
+def test_to_dict_edges_resolve_to_listed_addresses(tmp_path: Path) -> None:
+    path = _write_elf64(tmp_path / "dict2.bin", PAIR_CODE)
+    info = _load(path)
+
+    data = build_call_graph(path, info, functions=[_function(B_VA, "b")]).to_dict()
+
+    addresses = {node["address"] for node in data["nodes"]}
+    assert any(node["kind"] == "call_site" for node in data["nodes"])
+    for edge in data["edges"]:
+        assert edge["source"] in addresses
+        assert edge["target"] in addresses
 
 
 def test_dataclasses_are_frozen_and_defaults_hold() -> None:

@@ -8,7 +8,7 @@ SQLite sessions) into analyst-facing capabilities:
 | `src/codevanta/analysis/callgraph.py` | Aggregates direct `call` cross-references into a node/edge call graph |
 | `src/codevanta/analysis/graph_export.py` | Renders the generic graph model as Graphviz DOT or GraphML |
 | `src/codevanta/storage/session.py` | Adds per-address annotations to stored sessions |
-| `src/codevanta/mcp_server/tools.py`, `server.py` | Exposes xrefs, CFG, and session save/list over MCP (nine tools total) |
+| `src/codevanta/mcp_server/tools.py`, `server.py` | Exposes xrefs, CFG, and session save/list over MCP (nine tools at the end of phase 2b; phase 2c adds `codevanta_callgraph` for ten) |
 | `src/codevanta/cli/main.py` | Adds `callgraph` and `session annotate|notes` |
 
 Everything here remains read-only with respect to the analysed target: bytes are

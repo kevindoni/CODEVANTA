@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import typer
 from rich.console import Console
@@ -20,7 +20,17 @@ from codevanta.analysis.callgraph import (
     build_call_graph,
 )
 from codevanta.analysis.cfg import FunctionCFG, build_cfg
-from codevanta.analysis.graph_export import GraphExportError, to_dot, to_graphml
+from codevanta.analysis.graph_export import (
+    DEFAULT_MAX_EDGES as EXPORT_MAX_EDGES,
+)
+from codevanta.analysis.graph_export import (
+    DEFAULT_MAX_NODES as EXPORT_MAX_NODES,
+)
+from codevanta.analysis.graph_export import (
+    GraphExportError,
+    to_dot,
+    to_graphml,
+)
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
@@ -199,10 +209,20 @@ def analyze(
         Path | None, typer.Option("--output", "-o", help="Write the JSON report to this path")
     ] = None,
     string_limit: Annotated[int, typer.Option(help="Maximum strings kept in the report")] = 5000,
+    callgraph: Annotated[
+        bool,
+        typer.Option("--callgraph", help="Embed the direct-call call graph in the report"),
+    ] = False,
 ) -> None:
-    """Run the phase 1 analysis and emit a JSON report."""
+    """Run the phase 1 analysis and emit a JSON report.
+
+    ``--callgraph`` adds a ``callgraph`` section (bounded to 1000 nodes and 5000
+    edges) built by the analysis layer; without the flag the report contains no
+    such key. When ``--output`` is used a dim one-line graph summary
+    (nodes/edges/truncation) is printed after the file is written.
+    """
     try:
-        report = build_report(path, string_limit=string_limit)
+        report = build_report(path, string_limit=string_limit, include_callgraph=callgraph)
     except (AnalysisError, BinaryLoadError) as exc:
         console.print(f"[bold red]error:[/] {exc}")
         raise typer.Exit(code=2) from exc
@@ -210,8 +230,22 @@ def analyze(
     if output is not None:
         output.write_text(payload, encoding="utf-8")
         console.print(f"[green]report written:[/] {output}")
+        if callgraph:
+            _print_report_callgraph_summary(report)
         return
     console.print_json(payload)
+
+
+def _print_report_callgraph_summary(report: dict[str, Any]) -> None:
+    """Print a dim nodes/edges/truncation summary for an embedded call graph."""
+    graph = report.get("callgraph")
+    if not isinstance(graph, dict):
+        return
+    console.print(
+        f"[dim]callgraph: {graph.get('node_count', 0)} nodes"
+        f" · {graph.get('edge_count', 0)} edges"
+        f" · truncated: {'yes' if graph.get('truncated') else 'no'}[/]"
+    )
 
 
 @app.command()
@@ -343,9 +377,21 @@ def _render_call_graph(graph: CallGraph, output_format: CallGraphFormat, path: P
     in :mod:`codevanta.analysis.graph_export` stays the only serializer.
     """
     if output_format == "dot":
-        return to_dot(graph.to_graph_model(), title=f"callgraph {path.name}")
+        model = graph.to_graph_model()
+        return to_dot(
+            model,
+            title=f"callgraph {path.name}",
+            max_nodes=max(EXPORT_MAX_NODES, len(model["nodes"])),
+            max_edges=max(EXPORT_MAX_EDGES, len(model["edges"])),
+        )
     if output_format == "graphml":
-        return to_graphml(graph.to_graph_model(), title=f"callgraph {path.name}")
+        model = graph.to_graph_model()
+        return to_graphml(
+            model,
+            title=f"callgraph {path.name}",
+            max_nodes=max(EXPORT_MAX_NODES, len(model["nodes"])),
+            max_edges=max(EXPORT_MAX_EDGES, len(model["edges"])),
+        )
     return json.dumps(graph.to_dict(), indent=2)
 
 

@@ -55,13 +55,53 @@ All notable changes to CODEVANTA are documented here. The format follows
   `--format json|dot|graphml`, `--output`/`-o`) and
   `codevanta session annotate SESSION_ID ADDRESS NOTE` /
   `codevanta session notes SESSION_ID` (decimal or `0x` hex addresses, `--db`).
+- Import and indirect call resolution (`codevanta.analysis.xrefs`): `call`
+  instructions through an absolute or RIP-relative pointer slot
+  (`call qword ptr [0x402000]`, `call qword ptr [rip + 0xa]`) now resolve to the
+  slot address — RIP-relative operands are biased by the instruction length, so
+  negative displacements work. A slot that matches an `info.imports` address
+  becomes `call_import` with `target_name` set to the import name and confidence
+  `certain`; any other resolved slot becomes `call_indirect` with confidence
+  `high` (the slot is proven, the callee is not). The reported `to_address` is
+  always the slot, never the code behind it. Register and indexed operands
+  (`call rax`, `call qword ptr [rax + 8]`) are skipped and counted in the new
+  `XrefResult.indirect_skipped` field, which `to_dict()` exposes; indirect jumps
+  and conditional branches are not counted. Direct literal operands still take
+  precedence, and the scan stays bounded by `max_bytes`.
+- Call graph coverage (`codevanta.analysis.callgraph`): edges now come from
+  `call`, `call_import`, and `call_indirect` cross references. A resolved import
+  slot becomes an `import` node labelled from the import table (`high`
+  confidence, namespaced `import:0x<addr>` in the generic graph model), a
+  `call_indirect` slot stays an `external` node (`unknown` confidence), and
+  `jump`/`branch` references plus unresolved indirect calls still produce no
+  edges. Edge deduplication, ordering, limits, and the heuristic caller
+  attribution (nearest candidate at or below the call site in the same section,
+  with one aggregated warning for unattributable sites) are unchanged.
+- `codevanta analyze --callgraph`: embeds `report["callgraph"]` when the flag is
+  passed and omits the key entirely when it is not. The embedded graph is bounded
+  to 1000 functions and 5000 edges
+  (`REPORT_MAX_CALLGRAPH_FUNCTIONS` / `REPORT_MAX_CALLGRAPH_EDGES`), reuses the
+  pre-computed candidates, sets `truncated` when a cap cuts it short, and prints
+  a one-line node/edge/truncation summary alongside `--output`. The analysis
+  layer is imported lazily, so `codevanta.core.report` gains no import-time
+  dependency on `codevanta.analysis`.
+- MCP tool `codevanta_callgraph` (`limit_functions`, `limit_edges`, defaulting to
+  1000 and 5000, accepted range 1..200000) joins the server, bringing it to ten
+  tools. It returns `CallGraph.to_dict()` with nodes, edges, `truncated`,
+  `warnings`, and evidence, and rejects non-integer or out-of-range limits with
+  `AnalysisError`.
+- Documentation: `docs/phase2c.md` covers import/indirect resolution, import
+  nodes, the embedded report graph, the ten MCP tools, CLI examples, remaining
+  limits, and next steps; the README now links `CONTRIBUTORS.md` from its
+  Community section.
 
 ### Notes
 
-- Phase 2 is in progress: linear sweep only, direct branch targets only, call
-  graph edges from direct calls only, no recursive traversal, no indirect-call
-  resolution, no graph viewer, and no debugger yet. See `docs/phase2.md` and
-  `docs/phase2b.md`.
+- Phase 2 is in progress: linear sweep only, direct branch targets plus absolute
+  and RIP-relative pointer slots only, no register-target or indexed-memory
+  resolution, no slot dereferencing, no recursive traversal, no graph viewer, and
+  no debugger yet. See `docs/phase2.md`, `docs/phase2b.md`, and
+  `docs/phase2c.md`.
 - Node boundaries and caller attribution are heuristics, not proven function
   extents. Sessions and annotations live in one local SQLite file with no schema
   migrations yet.

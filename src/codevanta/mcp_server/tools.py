@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from codevanta.analysis.callgraph import MAX_LIMIT as MAX_CALLGRAPH_LIMIT
+from codevanta.analysis.callgraph import build_call_graph
 from codevanta.analysis.cfg import build_cfg
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.functions import discover_functions
@@ -181,6 +183,57 @@ def cfg(
         "truncated": graph.truncated,
         "warnings": list(graph.warnings),
     }
+
+
+def _check_callgraph_limit(name: str, value: int) -> None:
+    """Raise :class:`AnalysisError` unless ``value`` is a limit in 1..MAX_LIMIT."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AnalysisError(f"{name} must be an integer")
+    if value < 1 or value > MAX_CALLGRAPH_LIMIT:
+        raise AnalysisError(f"{name} must be between 1 and {MAX_CALLGRAPH_LIMIT}")
+
+
+def callgraph(
+    path: str,
+    limit_functions: int = 1000,
+    limit_edges: int = 5000,
+) -> dict[str, Any]:
+    """Build an inter-function call graph from resolved call cross references.
+
+    Edges come from direct calls only, plus calls through a pointer slot that
+    resolves to a known import (the node is labelled with the import name) or
+    to a statically known slot with an unknown callee. Jumps, conditional
+    branches, and indirect calls whose slot is not known statically produce no
+    edges. The caller of a call site is attributed heuristically to the nearest
+    function candidate at or below the call address in the same section, so
+    caller attribution is not proven.
+
+    Args:
+        path: PE or ELF file to analyse; it is read, never executed.
+        limit_functions: Maximum number of function candidates kept as nodes
+            (1 .. 200000). Dropping candidates marks the graph truncated.
+        limit_edges: Maximum number of deduplicated call edges reported
+            (1 .. 200000).
+
+    Returns:
+        The serialized graph with ``nodes``, ``edges``, ``truncated``,
+        ``evidence``, and ``warnings``.
+
+    Raises:
+        AnalysisError: If the file is missing or a limit is out of range.
+    """
+    _check_callgraph_limit("limit_functions", limit_functions)
+    _check_callgraph_limit("limit_edges", limit_edges)
+    target = _validate_path(path)
+    info = load_binary(target)
+    graph = build_call_graph(
+        target,
+        info,
+        functions=discover_functions(info),
+        max_functions=limit_functions,
+        max_edges=limit_edges,
+    )
+    return graph.to_dict()
 
 
 def session_save(

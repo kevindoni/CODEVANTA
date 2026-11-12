@@ -20,6 +20,12 @@ class AnalysisError(Exception):
 MAX_DISASSEMBLY_COUNT = 100_000
 MAX_STRING_LIMIT = 200_000
 
+#: Ceiling on call-graph nodes embedded in a report (bounded work).
+REPORT_MAX_CALLGRAPH_FUNCTIONS = 1000
+
+#: Ceiling on call-graph edges embedded in a report (bounded work).
+REPORT_MAX_CALLGRAPH_EDGES = 5000
+
 
 def load_binary(path: str | Path) -> BinaryInfo:
     """Load a binary and return normalized metadata."""
@@ -73,8 +79,52 @@ def disassemble_region(
     return disassembler.disassemble(code, base_address=start, max_instructions=count)
 
 
-def build_report(path: str | Path, string_limit: int = 5000) -> dict[str, Any]:
-    """Build the phase 1 JSON report for ``path``."""
+def build_report(
+    path: str | Path,
+    string_limit: int = 5000,
+    include_callgraph: bool = False,
+) -> dict[str, Any]:
+    """Build the phase 1 JSON report for ``path``.
+
+    The report always contains ``provenance``, ``binary``, ``functions``,
+    ``strings`` and ``disassembly``. Nothing more than the file bytes is read and
+    nothing is executed.
+
+    Args:
+        path: Binary to analyse.
+        string_limit: Maximum strings kept under ``report["strings"]``
+            (``0 .. MAX_STRING_LIMIT``).
+        include_callgraph: When true, a ``"callgraph"`` section holding
+            :meth:`~codevanta.analysis.callgraph.CallGraph.to_dict` is added.
+            When false the key is omitted entirely, so the payload is unchanged
+            for callers that do not ask for a graph.
+
+    Returns:
+        The JSON-serializable report.
+
+    Raises:
+        AnalysisError: If ``string_limit`` is out of range, or -- when
+            ``include_callgraph`` is true -- if the graph cannot be built.
+
+    Note:
+        **Layering.** :mod:`codevanta.core.report` is a *core* module and must not
+        import :mod:`codevanta.analysis` at import time: that package imports
+        :class:`AnalysisError` from here, so a module-level import would create a
+        cycle and would also drag the analysis layer into every core consumer.
+        The dependency is therefore resolved with a **lazy import of**
+        :func:`~codevanta.analysis.callgraph.build_call_graph` **inside this
+        function**, executed only when ``include_callgraph`` is true.
+
+    Note:
+        **Bounded work.** The embedded graph is capped at
+        ``REPORT_MAX_CALLGRAPH_FUNCTIONS`` (1000) nodes and
+        ``REPORT_MAX_CALLGRAPH_EDGES`` (5000) edges, which are well below the
+        call-graph defaults (:data:`~codevanta.analysis.callgraph.DEFAULT_MAX_FUNCTIONS`
+        / ``DEFAULT_MAX_EDGES``) so a report stays a bounded payload. When either
+        cap cuts the result short, ``report["callgraph"]["truncated"]`` is true.
+        The pre-computed function candidates are reused instead of rediscovering
+        them, so the report never scans the binary twice for candidates.
+    """
     if string_limit < 0:
         raise AnalysisError("string_limit must be >= 0")
     if string_limit > MAX_STRING_LIMIT:
@@ -95,7 +145,7 @@ def build_report(path: str | Path, string_limit: int = 5000) -> dict[str, Any]:
             disassembly = disassemble_region(path, info, info.entry_point, count=32).to_dict()
         except (AnalysisError, DisassemblyError):
             disassembly = None
-    return {
+    report: dict[str, Any] = {
         "provenance": provenance.to_dict(),
         "binary": info.to_dict(),
         "functions": [c.to_dict() for c in candidates],
@@ -107,3 +157,17 @@ def build_report(path: str | Path, string_limit: int = 5000) -> dict[str, Any]:
         },
         "disassembly": disassembly,
     }
+    if include_callgraph:
+        # Lazy import on purpose: core must not import the analysis package at
+        # module import time (analysis imports AnalysisError from this module).
+        from codevanta.analysis.callgraph import build_call_graph
+
+        graph = build_call_graph(
+            path,
+            info,
+            functions=candidates,
+            max_functions=REPORT_MAX_CALLGRAPH_FUNCTIONS,
+            max_edges=REPORT_MAX_CALLGRAPH_EDGES,
+        )
+        report["callgraph"] = graph.to_dict()
+    return report
