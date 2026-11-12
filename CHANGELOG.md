@@ -8,6 +8,13 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- Big-endian UTF-16 string extraction (`codevanta.core.strings`): the UTF-16
+  scan now follows the binary's endianness — big-endian targets (e.g. MIPS,
+  s390x, PowerPC) yield `utf-16be` strings, little-endian targets keep
+  `utf-16le`. Without binary metadata the scan stays UTF-16LE rather than
+  guessing a byte swap, so shifted cross-byte-order matches are never
+  fabricated. Evidence labels follow the existing scheme
+  (`string_scanner` / `utf-16be_scan`).
 - Mach-O loader support (`codevanta.core.loader`): Mach-O 32/64 binaries now
   load with format, architecture (x86_64, aarch64, x86, arm, ppc), bitness,
   endianness, image base, entry point, sections, imports (undefined symbols),
