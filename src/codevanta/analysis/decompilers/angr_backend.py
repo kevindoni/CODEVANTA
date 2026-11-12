@@ -215,20 +215,20 @@ def _recover_cfg(project: Any, address: int) -> Any:
     """Recover a CFG bounded to the one function start at ``address``.
 
     Indirect-jump resolution and data-reference discovery are switched off
-    because both widen the scan without helping a single function; older angr
-    builds reject some of these keywords, so the call falls back to the two
-    options that do the actual bounding.
+    because both widen the scan without helping a single function. The keyword set
+    differs across angr releases and angr rejects an unknown arch-specific option
+    with ``KeyError`` (not ``TypeError``), so both are treated as "try the minimal
+    call": ``function_starts`` alone is the option that does the actual bounding.
     """
     try:
         return project.analyses.CFGFast(
-            starts=[address],
             function_starts=[address],
             resolve_indirect_jumps=False,
             data_references=False,
             normalize=True,
         )
-    except TypeError:
-        return project.analyses.CFGFast(starts=[address], function_starts=[address])
+    except (TypeError, KeyError):
+        return project.analyses.CFGFast(function_starts=[address])
 
 
 def _lookup_function(cfg: Any, address: int) -> Any:
