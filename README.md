@@ -1,17 +1,49 @@
 # CODEVANTA
 
-**ADVANCED CODE INTELLIGENCE**
+> **Advanced Code Intelligence** — Decode. Analyze. Understand.
 
-> Decode. Analyze. Understand.
+CODEVANTA is an AI-powered code intelligence, reverse engineering, and binary
+analysis platform. It helps engineers, security researchers, and analysts
+understand software faster — from source code to executables with missing
+symbols or incomplete documentation.
 
-AI-Powered Reverse Engineering & Binary Analysis Platform — a local-first,
-vendor-agnostic analysis engine that reads, disassembles, and explains PE and
-ELF binaries. Every finding carries its evidence source and a confidence level.
+## Vision
 
-## Status
+Build a unified workspace for unpacking software complexity by bringing
+disassembly, decompilation, static analysis, binary inspection, and AI-assisted
+reasoning into one clear, auditable, and extensible experience.
 
-🚧 Phase 1 (foundation) in progress: binary loading, disassembly, string
-extraction, function discovery, and JSON export.
+## Core focus
+
+- **Binary analysis** — inspect executables, libraries, metadata, sections, symbols, and binary formats.
+- **Reverse engineering** — navigate functions, call graphs, data flow, cross-references, and program behavior.
+- **AI code intelligence** — explain functions, summarize modules, detect patterns, and ask context-aware questions.
+- **Static analysis** — identify suspicious behavior, dependencies, API usage, and risk indicators.
+- **Analyst workflow** — manage workspaces, annotations, findings, evidence, and shareable reports.
+
+## Target workflow
+
+```text
+Import target → Index & normalize → Disassemble/decompile → Analyze → Ask AI → Review evidence → Export report
+```
+
+CODEVANTA prioritizes insights that can be traced back to technical evidence.
+AI acts as a copilot to accelerate analysis, not as a replacement for analyst
+verification.
+
+## Project status
+
+🚧 **Phase 1 (foundation) implemented** — binary loading, disassembly, string
+extraction, function discovery, and JSON export are working and tested.
+
+Delivered in phase 1:
+
+- PE and ELF loaders (format, architecture, bitness, endianness, entry point, image base).
+- Sections, imports, exports, and symbol extraction — every finding carries evidence.
+- x86/x64 disassembly of executable sections and the entry point.
+- Function candidates from exports, function symbols, and the entry point, each with source and confidence.
+- ASCII and UTF-16LE string extraction with file offset and mapped virtual address.
+- CLI: `info`, `functions`, `strings`, `disasm`, `analyze` (+ JSON report).
 
 ## Installation
 
@@ -23,16 +55,32 @@ python -m pip install -e ".[dev]"
 ## Usage
 
 ```powershell
-codevanta info      samples\app.exe
-codevanta functions samples\app.exe
-codevanta strings   samples\app.exe --min-length 6
-codevanta disasm    samples\app.exe --count 80
-codevanta analyze   samples\app.exe --output report.json
+codevanta info      C:\Windows\System32\notepad.exe
+codevanta functions C:\Windows\System32\kernel32.dll --limit 8
+codevanta strings   C:\Windows\System32\notepad.exe --min-length 8
+codevanta disasm    C:\Windows\System32\notepad.exe --count 40
+codevanta analyze   samples\elf64_text.bin --output samples\report.json
 ```
 
-All addresses in the report are absolute virtual addresses (VA). Function
+All addresses in reports are absolute virtual addresses (VA). Function
 candidates always state their detection source (`export`, `symbol`,
 `entry_point`) and confidence (`high`, `medium`, `low`, `unknown`).
+
+## Project layout
+
+```text
+src/
+├── core/       # loader (LIEF), disassembler (Capstone), strings, functions
+├── evidence/   # evidence records, provenance, confidence scoring
+├── ir/         # backend-neutral instruction model + adapter registry
+├── analysis/   # cross-references and CFG (phase 2+)
+├── api/        # HTTP API (phase 2+)
+├── cli/        # Typer command line surface
+├── storage/    # session storage (phase 2+)
+└── plugins/    # plugin system (phase 5)
+tests/          # unit and integration tests
+docs/           # architecture notes
+```
 
 ## Testing
 
@@ -46,12 +94,40 @@ ruff check src tests
 - [Project specification](PROJECT_SPEC.md)
 - [Architecture](docs/architecture.md)
 
-## Responsible use
+## Roadmap
 
-CODEVANTA is intended for authorized analysis only: software you own, systems
-you have written permission to inspect, security research, interoperability,
-and education. It performs static analysis and never executes the target.
+- [x] Phase 1 — core engine foundation: PE/ELF loading, disassembly, strings, functions, CLI, JSON evidence reports
+- [ ] Phase 2 — cross-references, CFG views, session storage, basic debugger
+- [ ] Phase 3 — basic type recovery, binary diff, Python scripting
+- [ ] Phase 4 — emulation (Unicorn), IR lifting, symbolic execution (optional)
+- [ ] Phase 5 — plugin system, full AI layer, multi-user, CI/CD
+
+## Product principles
+
+1. **Evidence first** — important insights should be traceable to an artifact or code location.
+2. **Analyst in control** — AI provides assistance and context; users remain the decision makers.
+3. **Composable by design** — engines and analyzers should be extensible through separate components.
+4. **Secure by default** — analyzed targets are treated as untrusted input.
+5. **Clarity over magic** — outputs should explain limitations, confidence, and assumptions.
+
+## Use cases
+
+- Understand legacy executables without complete source code
+- Map dependencies and behavior in internal libraries
+- Triage malware artifacts in an isolated environment
+- Explain native or low-level functions to engineering teams
+- Generate technical documentation for poorly documented software
+- Support binary-focused code review and security research
+
+> **Security note:** never open untrusted binaries or samples in a production
+> environment. Use an appropriate sandbox, VM, or isolated analysis environment.
+
+## Contributing
+
+Contributions, design discussions, and bug reports are welcome. Before opening a
+pull request, describe the change context, compatibility risks, and validation
+steps.
 
 ## License
 
-MIT (CODEVANTA-authored code). Third-party components keep their own licenses.
+MIT — see [LICENSE](LICENSE). Third-party components keep their own licenses.
