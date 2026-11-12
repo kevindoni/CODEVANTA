@@ -54,6 +54,15 @@ cd D:\PALIKASIKU\CODEVANTA
 python -m pip install -e ".[dev]"
 ```
 
+One-line install (installs, then prints a setup plan):
+
+```powershell
+irm https://raw.githubusercontent.com/kevindoni/CODEVANTA/main/scripts/install.ps1 | iex
+```
+
+See [docs/install.md](docs/install.md) for the macOS/Linux one-liner, manual
+installs, and the full setup/uninstall reference.
+
 ## Usage
 
 ```powershell
