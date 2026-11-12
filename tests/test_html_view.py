@@ -20,6 +20,9 @@ from codevanta.analysis.html_view import to_html
 #: Opening tag of the embedded JSON payload.
 _JSON_OPEN = '<script type="application/json" id="codevanta-graph">'
 
+#: Opening tag of the single inline behaviour script (it carries no attributes).
+_SCRIPT_OPEN = "<script>"
+
 
 def _graph(nodes: list[dict], edges: list[dict]) -> dict:
     """Build a graph mapping from node/edge lists."""
@@ -46,6 +49,12 @@ def _payload(document: str) -> dict:
     start = document.index(_JSON_OPEN) + len(_JSON_OPEN)
     body = document[start : document.index("</script>", start)].strip()
     return json.loads(body.replace("<\\/", "</"))
+
+
+def _behaviour_script(document: str) -> str:
+    """Return the body of the single inline behaviour script."""
+    start = document.index(_SCRIPT_OPEN) + len(_SCRIPT_OPEN)
+    return document[start : document.index("</script>", start)]
 
 
 # --------------------------------------------------------------------------- #
@@ -95,6 +104,24 @@ def test_special_characters_are_escaped() -> None:
     assert "<title><i></title>" not in document
 
 
+def test_every_significant_character_is_escaped_in_labels() -> None:
+    """``<``, ``>``, ``&`` and ``"`` all leave the label as a safe text node."""
+    document = to_html(_graph([{"id": "n", "label": '<a> & "b"</a>'}], []))
+
+    assert "&lt;a&gt; &amp; &quot;b&quot;&lt;/a&gt;" in document
+    assert '<a> & "b"' not in document
+    assert "</a>" not in document
+    assert _payload(document)["nodes"][0]["label"] == '<a> & "b"</a>'
+
+
+def test_kind_attributes_are_escaped_too() -> None:
+    """The ``data-kind`` attribute value is escaped like every other attribute."""
+    document = to_html(_graph([{"id": "n", "label": "n", "kind": 'a"<b>'}], []))
+
+    assert 'data-kind="a&quot;&lt;b&gt;"' in document
+    assert 'data-kind="a"<b>' not in document
+
+
 def test_title_is_escaped_and_defaults_when_blank() -> None:
     """The title is escaped in the head and the header, blank titles fall back."""
     document = to_html(_sample_graph(), title='A <b> & "c"')
@@ -131,6 +158,112 @@ def test_empty_graph_still_renders_a_document() -> None:
     assert "no nodes to display" in document
     assert "no edges" in document
     assert '<line class="edge"' not in document
+
+
+# --------------------------------------------------------------------------- #
+# Interaction toolbar and inline behaviour script
+# --------------------------------------------------------------------------- #
+
+
+def test_toolbar_sits_above_the_svg_with_a_search_box() -> None:
+    """The toolbar precedes the canvas and carries the search input."""
+    document = to_html(_sample_graph())
+
+    assert 'class="toolbar"' in document
+    assert 'id="cv-search"' in document
+    assert 'type="search"' in document
+    assert 'placeholder="search labels"' in document
+    assert document.index('class="toolbar"') < document.index("<svg")
+    assert document.index('id="cv-search"') < document.index("<svg")
+
+
+def test_toolbar_renders_one_checkbox_per_kind_group() -> None:
+    """Three checked ``cv-kind`` checkboxes map kinds onto filter groups."""
+    document = to_html(_sample_graph())
+
+    assert document.count('class="cv-kind"') == 3
+    assert document.count('type="checkbox"') == 3
+    for kind in ("function", "call_site", "import"):
+        assert f'data-kind="{kind}"' in document
+    assert document.count("checked>") == 3
+    assert "function / entry_point" in document
+    assert "import / external" in document
+
+
+def test_node_groups_expose_their_kind_for_filtering() -> None:
+    """Every node group carries the normalized ``kind`` it is filtered by."""
+    document = to_html(_sample_graph())
+
+    assert 'class="node col-0" data-kind="entry_point"' in document
+    assert 'class="node col-0" data-kind="function"' in document
+    # Three node groups plus three filter checkboxes.
+    assert document.count('data-kind="') == 6
+
+
+def test_node_kinds_are_normalized_before_filtering() -> None:
+    """Case and padding in ``kind`` cannot leak into the filter attribute."""
+    document = to_html(_graph([{"id": "a", "label": "a", "kind": " Function "}], []))
+
+    assert 'data-kind="function"' in document
+    assert 'data-kind=" Function "' not in document
+
+
+def test_single_inline_script_without_src() -> None:
+    """Exactly one behavioural script ships, and it is inline."""
+    document = to_html(_sample_graph())
+    script = _behaviour_script(document)
+
+    assert document.count("<script") == 2  # payload + behaviour
+    assert document.count(_SCRIPT_OPEN) == 1
+    assert document.count("</script>") == 2
+    assert '<script src' not in document.lower()
+    assert "src=" not in script
+    assert "href=" not in script
+    assert script.strip().startswith("(function ()")
+    assert document.index(_SCRIPT_OPEN) > document.index('id="codevanta-graph"')
+
+
+def test_behaviour_script_implements_pan_zoom_search_and_filtering() -> None:
+    """The inline script implements the four advertised interactions."""
+    script = _behaviour_script(to_html(_sample_graph()))
+
+    # Panning drags the SVG viewBox.
+    assert "viewBox" in script
+    assert "mousedown" in script and "mousemove" in script
+    assert "mouseup" in script
+    # Wheel zoom, clamped to the documented range.
+    assert "wheel" in script
+    assert "MIN_ZOOM = 0.2" in script
+    assert "MAX_ZOOM = 8" in script
+    assert "Math.min(MAX_ZOOM, Math.max(MIN_ZOOM" in script
+    # Search highlights matches and dims the rest.
+    assert 'getElementById("cv-search")' in script
+    assert "cv-hit" in script and "cv-dim" in script
+    # Checkbox filtering reads the node's kind.
+    assert "input.cv-kind" in script
+    assert 'getAttribute("data-kind")' in script
+
+
+def test_behaviour_script_contains_no_network_reference() -> None:
+    """Neither the script nor the document points at any external resource."""
+    document = to_html(_sample_graph())
+    script = _behaviour_script(document).lower()
+
+    assert "http://" not in script
+    assert "https://" not in script
+    assert "fetch(" not in script
+    assert "xmlhttprequest" not in script
+    assert "http://" not in document.lower()
+    assert "https://" not in document.lower()
+
+
+def test_script_styles_are_declared_inline() -> None:
+    """The classes the script toggles are styled by the inline stylesheet."""
+    document = to_html(_sample_graph())
+    style = document[document.index("<style>") : document.index("</style>")]
+
+    for selector in (".node.cv-hit", ".node.cv-dim", ".graph.cv-panning", ".toolbar"):
+        assert selector in style
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +354,18 @@ def test_output_is_deterministic_and_order_independent() -> None:
     assert to_html(graph) == to_html(_sample_graph())
 
 
+def test_two_renders_are_byte_identical_and_valid_utf8() -> None:
+    """Two calls on the same graph produce identical, decodable bytes."""
+    first = to_html(_sample_graph())
+    second = to_html(_sample_graph())
+
+    assert first == second
+    assert first.encode("utf-8") == second.encode("utf-8")
+    assert first.encode("utf-8").decode("utf-8") == first
+    assert first.endswith("</html>\n")
+    assert first.count(_SCRIPT_OPEN) == 1
+
+
 def test_payload_is_valid_json_with_the_normalized_graph() -> None:
     """The embedded payload round-trips to the normalized graph."""
     data = _payload(to_html(_sample_graph()))
@@ -238,7 +383,11 @@ def test_payload_never_closes_its_script_element() -> None:
     document = to_html(_graph([{"id": "a", "label": "x </script> y"}], []))
 
     assert "<\\/script>" in document
-    assert document.count("</script>") == 1
+    # One closing tag for the payload, one for the inline behaviour script.
+    assert document.count("</script>") == 2
+    start = document.index(_JSON_OPEN) + len(_JSON_OPEN)
+    body = document[start : document.index("</script>", start)]
+    assert "</" not in body
     assert _payload(document)["nodes"][0]["label"] == "x </script> y"
 
 

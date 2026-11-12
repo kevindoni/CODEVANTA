@@ -103,8 +103,9 @@ All notable changes to CODEVANTA are documented here. The format follows
   (`function`/`entry_point`, `call_site`, everything else), header node/edge
   counts, arrowed straight-line edges, a collapsible `<details>` table listing
   every edge, and an `application/json` payload of the normalized graph. It
-  references no `http(s)` URL, CDN, web font or external file and contains no
-  JavaScript logic, so it opens offline; the `<svg>` omits `xmlns` and is
+  references no `http(s)` URL, CDN, web font or external file and shipped without
+  JavaScript logic in its phase 2d form (phase 2f adds one inline script; see
+  below), so it opens offline; the `<svg>` omits `xmlns` and is
   inline-only. Output is byte-identical for identical content.
 - CLI: `codevanta callgraph --format html` (with `--output`/`-o`) joins
   `json|dot|graphml`. Every serializer now receives size-derived caps
@@ -133,16 +134,77 @@ All notable changes to CODEVANTA are documented here. The format follows
 - Documentation: `docs/phase2e.md` covers the new traversal, its successor rules,
   how it differs from the linear sweep, the CLI flag, evidence and confidence,
   bounds, limitations, and next steps.
+- Jump-table resolver (`codevanta.analysis.jump_tables`): `resolve_jump_table`
+  decodes a bounded array of absolute pointers starting at a caller-supplied
+  address — 8-byte slots on a 64-bit binary, 4-byte on a 32-bit one, decoded with
+  the binary's endianness. The scan stops at the first slot that cannot be a
+  target (zero terminator, target outside `min_target`/`max_target`, target no
+  section maps, or — with the default `executable_only` — a target in a
+  non-executable section) and records why in `warnings`. Work is bounded by
+  `max_entries` (default 256, hard ceiling 4096) plus one pointer-sized peek that
+  decides `truncated`. Slot and summary evidence use
+  `jump_table.pointer_array` / `absolute_pointers` at `medium` confidence: a
+  pointer array found by shape is evidence of a dispatch table, not proof that a
+  dispatcher indexes it.
+- Opt-in indirect resolution in the recursive CFG
+  (`codevanta.analysis.cfg.build_recursive_cfg`): `resolve_indirect=False`
+  (default) keeps phase 2e behaviour byte-for-byte; when enabled, a
+  block-terminating `jmp qword ptr [rip + disp]` / `jmp qword ptr [abs]` (and
+  the `dword` 32-bit forms) is turned into a table address and decoded with the
+  jump-table resolver, and its executable, file-backed targets become sorted,
+  deduplicated successors that the traversal follows. Bounded by
+  `max_jump_tables` (default 8) and `max_table_entries` (default 256, ceiling
+  4096); register/indexed operands, unreadable tables, and tables past the budget
+  leave the edge out and are reported in `FunctionCFG.warnings`, prefixed with
+  the block start. Evidence stays `cfg.recursive_traversal` at `medium` and its
+  detail names how many tables and slots were resolved when the option is on.
+- CLI: `codevanta jump-table PATH --address ADDR [--entries N]
+  [--executable-only/--no-executable-only] [--json]` prints an index/target
+  table with a pointer-size, entry-count, and truncated footer plus one warning
+  per stop reason, and exits `2` on an invalid address, a rejected budget, or a
+  table that cannot be read.
+- CLI: `codevanta cfg --resolve-indirect`, accepted only with
+  `--traversal recursive` (the linear sweep exits `2` instead of silently
+  ignoring it). The other cfg output and options are unchanged, and the
+  jump-table budgets stay at their library defaults on the command line.
+- Interactive offline viewer (`codevanta.analysis.html_view`): the HTML export
+  now carries one inline, dependency-free script adding drag-to-pan (via
+  `viewBox`), wheel zoom anchored at the pointer and clamped to 0.2x–8x, a label
+  search that highlights hits and dims the rest (Esc clears it), and per-kind
+  filter checkboxes (function/entry_point, call_site, import/external). Still no
+  CDN, no web font, and no `http(s)` reference anywhere; the static view renders
+  in full with scripting disabled, and output remains deterministic and escaped.
+- Structural binary diff (`codevanta.analysis.binary_diff`): `diff_infos` /
+  `diff_binaries` compare two binaries as metadata only — functions matched by
+  address (with `name`/`size` compared) then by name (so a relocated function is
+  one `changed` entry, not a removal plus an addition), sections and exports by
+  name, imports by `(library, name)`. `max_functions` defaults to 5000, is
+  clamped to 1..20000, keeps the lowest addresses when it truncates, and records
+  the clamp. Evidence uses `binary_diff.structural` / `metadata_compare` at
+  `medium` confidence with the explicit caveat that no instruction bytes were
+  read, compared, or executed, so `identical` means "no structural delta was
+  observed", never "the code is equivalent".
+- CLI: `codevanta diff LEFT RIGHT [--max-functions N] [--json]` prints an
+  `Identical` header, per-kind delta counts, the named section/import/export
+  deltas, and a function-delta table sorted by address. A difference exits `0`;
+  only load or input errors exit `2`.
+- Documentation: `docs/phase2f.md` covers the jump-table resolver and its stop
+  rules, CFG opt-in resolution and its warnings, the interactive viewer, the
+  structural diff and its matching rules, the CLI surface, confidence, limits,
+  and next steps.
 
 ### Notes
 
 - Phase 2 is in progress: the CFG uses a linear sweep by default and an optional
   bounded recursive traversal (`--traversal recursive`), with direct branch
-  targets plus absolute and RIP-relative pointer slots only; no indirect jump or
-  register-target resolution, no call following, no cross-function analysis, no
-  slot dereferencing, no interactive graph viewer (the HTML/SVG export is a
-  static, script-free file), and no debugger yet. See `docs/phase2.md`,
-  `docs/phase2b.md`, `docs/phase2c.md`, `docs/phase2d.md`, and `docs/phase2e.md`.
+  targets plus absolute and RIP-relative pointer slots only; jump tables are
+  absolute 4/8-byte pointer arrays reached from a `jmp` memory operand, so
+  register and indexed dispatch stay unresolved; no call following, no
+  cross-function analysis, no slot dereferencing, and no debugger yet. The HTML
+  export is interactive but still a single offline file, and the binary diff is
+  structural (metadata) only, with no byte-level or semantic comparison. See
+  `docs/phase2.md`, `docs/phase2b.md`, `docs/phase2c.md`, `docs/phase2d.md`,
+  `docs/phase2e.md`, and `docs/phase2f.md`.
 - Node boundaries and caller attribution are heuristics, not proven function
   extents. Sessions and annotations live in one local SQLite file with no schema
   migrations yet.

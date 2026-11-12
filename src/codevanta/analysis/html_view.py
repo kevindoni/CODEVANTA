@@ -28,14 +28,28 @@ Contract
 * Node labels, kinds, ids, edge endpoints, the title and the edge table are all
   escaped with :func:`html.escape`; the embedded JSON payload escapes ``"</"`` as
   ``"<\\/"`` so no data can terminate the surrounding ``script`` element.
+* Besides the inert ``application/json`` payload the document carries exactly one
+  behavioural ``<script>`` element: inline, dependency-free, with no ``src`` and
+  no network access.  It adds pointer drag-to-pan (by rewriting the SVG
+  ``viewBox``), wheel zoom clamped to ``0.2x``-``8x``, label search/highlight
+  and per-kind filtering.  With scripting disabled the static view still renders
+  in full, because every node is visible and no class is applied by default.
 
-Nothing is executed and nothing is written to disk: the graph is only rendered.
+Nothing is fetched and nothing is written to disk: the graph is only rendered.
 
 Limitations
 -----------
 * Layout is a simple three-column stack.  Edge routing is a straight line between
   the box borders, so dense graphs (and edges inside one column) overlap; there
-  is no crossing minimization and no zoom/pan.
+  is no crossing minimization, and pan/zoom only moves the fixed layout, it does
+  not re-flow it.
+* Search matches the *rendered* label and the node id (the box ``title``), so a
+  query that hits the cut-off tail of a truncated label does not match; the
+  embedded JSON payload always keeps the full text.
+* Hiding a node with the kind filters does not hide its edges, and the edge
+  table is intentionally unfiltered: it always lists every edge.
+* Panning is unbounded (it is not clamped to the canvas) and there is no zoom
+  reset control: reloading the page restores the initial view.
 * Labels longer than :data:`_LABEL_LIMIT` characters are truncated with an
   ellipsis for display only — the embedded JSON payload keeps the full text.
 * The ``<svg>`` element deliberately omits ``xmlns`` (which would be an ``http``
@@ -129,6 +143,7 @@ h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
   background: #131a29;
   border: 1px solid #223049;
   border-radius: 10px;
+  cursor: grab;
 }
 .column-title { fill: #7f93ad; font-size: 12px; letter-spacing: .04em; text-anchor: middle; }
 .edge { fill: none; stroke: #46597a; stroke-width: 1.4; }
@@ -141,6 +156,29 @@ h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
 .node-label { font-size: 13px; }
 .node-kind { font-size: 10px; fill: #9fb0c6; }
 .empty { fill: #7f93ad; font-size: 13px; text-anchor: middle; }
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #9fb0c6;
+}
+.toolbar input[type="search"] {
+  min-width: 220px;
+  padding: 5px 9px;
+  color: #e6edf6;
+  background: #131a29;
+  border: 1px solid #223049;
+  border-radius: 8px;
+  font: inherit;
+}
+.cv-filter { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.cv-filter input { margin: 0; accent-color: #4f8bd4; }
+.graph.cv-panning { cursor: grabbing; }
+.node.cv-hit rect { stroke: #f0c674; stroke-width: 2.4; }
+.node.cv-dim { opacity: .22; }
 details {
   margin-top: 18px;
   padding: 10px 14px;
@@ -153,6 +191,175 @@ table { width: 100%; margin-top: 10px; border-collapse: collapse; font-size: 12p
 th, td { padding: 5px 8px; text-align: left; border-bottom: 1px solid #1e2a3e; }
 th { font-weight: 600; color: #8ea2bb; }
 td { color: #cfdae7; }
+""".strip()
+
+#: Identifier of the search input driven by :data:`_SCRIPT`.
+_SEARCH_ID = "cv-search"
+
+#: Class shared by the kind-filter checkboxes.
+_FILTER_CLASS = "cv-kind"
+
+#: ``(data-kind value, caption)`` pairs rendered as filter checkboxes.
+_FILTERS = (
+    ("function", "function / entry_point"),
+    ("call_site", "call_site"),
+    ("import", "import / external"),
+)
+
+#: Inline, dependency-free behaviour script: pan, zoom, search and filtering.
+#: Deliberately free of ``src``/``href``/URL literals and of any ``"</"``
+#: sequence, so it can never terminate its own ``script`` element.  The
+#: ``cv-search`` / ``cv-kind`` literals below mirror :data:`_SEARCH_ID` and
+#: :data:`_FILTER_CLASS`; the tests pin both sides together.
+_SCRIPT = """
+(function () {
+  "use strict";
+
+  var CANVAS = "svg.graph";
+  var MIN_ZOOM = 0.2;
+  var MAX_ZOOM = 8;
+  var STEP = 1.15;
+
+  var svg = document.querySelector(CANVAS);
+  if (!svg) {
+    return;
+  }
+
+  var parts = String(svg.getAttribute("viewBox") || "0 0 1000 600").split(" ");
+  var base = {
+    x: Number(parts[0]) || 0,
+    y: Number(parts[1]) || 0,
+    w: Number(parts[2]) || 1000,
+    h: Number(parts[3]) || 600
+  };
+  var view = { x: base.x, y: base.y, w: base.w, h: base.h };
+
+  function apply() {
+    svg.setAttribute("viewBox", view.x + " " + view.y + " " + view.w + " " + view.h);
+  }
+
+  var drag = null;
+  svg.addEventListener("mousedown", function (event) {
+    if (event.button !== 0) {
+      return;
+    }
+    var rect = svg.getBoundingClientRect();
+    drag = {
+      px: event.clientX,
+      py: event.clientY,
+      x: view.x,
+      y: view.y,
+      sx: view.w / (rect.width || 1),
+      sy: view.h / (rect.height || 1)
+    };
+    svg.classList.add("cv-panning");
+    event.preventDefault();
+  });
+  window.addEventListener("mousemove", function (event) {
+    if (!drag) {
+      return;
+    }
+    view.x = drag.x - (event.clientX - drag.px) * drag.sx;
+    view.y = drag.y - (event.clientY - drag.py) * drag.sy;
+    apply();
+  });
+  window.addEventListener("mouseup", function () {
+    if (drag) {
+      drag = null;
+      svg.classList.remove("cv-panning");
+    }
+  });
+
+  svg.addEventListener("wheel", function (event) {
+    event.preventDefault();
+    var rect = svg.getBoundingClientRect();
+    var fx = rect.width ? (event.clientX - rect.left) / rect.width : 0.5;
+    var fy = rect.height ? (event.clientY - rect.top) / rect.height : 0.5;
+    fx = Math.min(1, Math.max(0, fx));
+    fy = Math.min(1, Math.max(0, fy));
+    var zoom = base.w / view.w;
+    var next = event.deltaY < 0 ? zoom * STEP : zoom / STEP;
+    next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, next));
+    if (next === zoom) {
+      return;
+    }
+    var anchorX = view.x + fx * view.w;
+    var anchorY = view.y + fy * view.h;
+    view.w = base.w / next;
+    view.h = base.h / next;
+    view.x = anchorX - fx * view.w;
+    view.y = anchorY - fy * view.h;
+    apply();
+  }, { passive: false });
+
+  var nodes = Array.prototype.slice.call(svg.querySelectorAll("g.node"));
+  var search = document.getElementById("cv-search");
+  var filters = Array.prototype.slice.call(document.querySelectorAll("input.cv-kind"));
+  var needle = "";
+
+  function lower(value) {
+    return String(value === null || value === undefined ? "" : value).toLowerCase();
+  }
+
+  function groupOf(kind) {
+    if (kind === "function" || kind === "entry_point") {
+      return "function";
+    }
+    if (kind === "call_site") {
+      return "call_site";
+    }
+    return "import";
+  }
+
+  function haystack(node) {
+    var label = node.querySelector(".node-label");
+    var title = node.querySelector("title");
+    return lower(label ? label.textContent : "") + " " + lower(title ? title.textContent : "");
+  }
+
+  function refresh() {
+    var allowed = {};
+    var query = lower(needle).trim();
+    var index;
+    var node;
+    var kind;
+    for (index = 0; index < filters.length; index += 1) {
+      if (filters[index].checked) {
+        allowed[lower(filters[index].getAttribute("data-kind"))] = true;
+      }
+    }
+    for (index = 0; index < nodes.length; index += 1) {
+      node = nodes[index];
+      kind = lower(node.getAttribute("data-kind"));
+      node.style.display = allowed[groupOf(kind)] === true ? "" : "none";
+      node.classList.remove("cv-hit");
+      node.classList.remove("cv-dim");
+      if (query !== "" && haystack(node).indexOf(query) === -1) {
+        node.classList.add("cv-dim");
+      } else if (query !== "") {
+        node.classList.add("cv-hit");
+      }
+    }
+  }
+
+  if (search) {
+    search.addEventListener("input", function () {
+      needle = search.value || "";
+      refresh();
+    });
+    search.addEventListener("keydown", function (event) {
+      if (event.key === "Escape") {
+        search.value = "";
+        needle = "";
+        refresh();
+      }
+    });
+  }
+  filters.forEach(function (box) {
+    box.addEventListener("change", refresh);
+  });
+  refresh();
+})();
 """.strip()
 
 
@@ -334,7 +541,8 @@ def _render_nodes(nodes: list[dict[str, Any]], boxes: dict[str, _Box]) -> list[s
         box = boxes[node["id"]]
         label = _escape(_truncate(_display_label(node)))
         kind = node["kind"].strip()
-        parts.append(f'<g class="node col-{box.column}">')
+        node_kind = _escape(_kind_key(node["kind"]))
+        parts.append(f'<g class="node col-{box.column}" data-kind="{node_kind}">')
         parts.append(f"<title>{_escape(node['id'])}</title>")
         parts.append(
             f'<rect x="{box.x}" y="{box.y}" width="{_BOX_WIDTH}" height="{_BOX_HEIGHT}" rx="6"/>'
@@ -378,6 +586,28 @@ def _render_svg(
         )
     parts.append("</svg>")
     return parts
+
+
+def _render_toolbar() -> list[str]:
+    """Return the interaction toolbar rendered directly above the SVG."""
+    parts = [
+        '<div class="toolbar" role="group" aria-label="graph controls">',
+        f'<input id="{_SEARCH_ID}" type="search" placeholder="search labels" '
+        'aria-label="search labels">',
+    ]
+    for kind, caption in _FILTERS:
+        parts.append(
+            '<label class="cv-filter">'
+            f'<input class="{_FILTER_CLASS}" type="checkbox" data-kind="{kind}" checked> '
+            f"{caption}</label>"
+        )
+    parts.append("</div>")
+    return parts
+
+
+def _render_script() -> list[str]:
+    """Return the single inline behaviour ``script`` element (no ``src``)."""
+    return ["<script>", _SCRIPT, "</script>"]
 
 
 def _render_edge_table(edges: list[dict[str, Any]]) -> list[str]:
@@ -428,10 +658,12 @@ def to_html(
 ) -> str:
     """Render ``graph`` as a self-contained HTML5 document with an inline SVG view.
 
-    The document holds the escaped title and node/edge counts in a header, a
+    The document holds the escaped title and node/edge counts in a header, an
+    interaction toolbar (label search plus one checkbox per kind group), a
     three-column SVG (function/entry_point, call_site, everything else) with
-    labelled node boxes and arrowed edges, a collapsible table listing every edge
-    and an ``application/json`` payload with the normalized graph.
+    labelled node boxes and arrowed edges, a collapsible table listing every edge,
+    an ``application/json`` payload with the normalized graph and a single inline
+    behaviour script implementing pan, wheel zoom, search and filtering.
 
     Args:
         graph: Mapping with ``"nodes"`` and ``"edges"`` lists (see
@@ -454,8 +686,10 @@ def to_html(
 
     parts = _render_head(heading)
     parts.extend(_render_header(heading, len(nodes), len(validated["edges"])))
+    parts.extend(_render_toolbar())
     parts.extend(_render_svg(validated["edges"], nodes, boxes, rows))
     parts.extend(_render_edge_table(validated["edges"]))
     parts.extend(_render_payload(validated, heading))
+    parts.extend(_render_script())
     parts.extend(["</body>", "</html>"])
     return "\n".join(parts) + "\n"

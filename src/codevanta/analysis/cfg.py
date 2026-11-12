@@ -37,6 +37,20 @@ A traversal can decode one block *past* a leader it only discovers later (a
 backward ``jmp`` into the middle of an already decoded run). A post-traversal
 split pass therefore cuts every block at the leaders inside it, so the reported
 ranges are disjoint and every instruction address is reported exactly once.
+
+:func:`build_recursive_cfg` can *optionally* resolve indirect jumps through
+pointer tables (``jmp qword ptr [rip + disp]``, ``jmp qword ptr [abs]``) with
+:func:`codevanta.analysis.jump_tables.resolve_jump_table`. The behaviour is
+opt-in (``resolve_indirect=False`` by default, so every pre-existing call and
+its results are unchanged): when enabled, the memory operand is turned into an
+absolute table address, the table is decoded, and the executable targets become
+successors -- deduplicated, sorted and followed by the traversal like any other
+leader. Resolution is bounded per traversal (``max_jump_tables`` tables,
+``max_table_entries`` slots each). Register-indirect jumps (``jmp rax``,
+``jmp qword ptr [rax]``), unresolvable expressions and tables beyond the budget
+leave the block without those successors and are reported once through
+``FunctionCFG.warnings``. Nothing is executed; a table is only read through the
+containing section's file bytes.
 """
 
 from __future__ import annotations
@@ -46,6 +60,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from codevanta.analysis.jump_tables import MAX_ENTRIES as _JUMP_TABLE_MAX_ENTRIES
+from codevanta.analysis.jump_tables import resolve_jump_table
 from codevanta.core.disassembler import Disassembler, DisassemblyError
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo
@@ -101,6 +117,16 @@ _CONDITIONAL_JUMP_MNEMONICS = frozenset(
         "bal",
     }
 )
+
+
+#: Default cap on jump tables resolved during one recursive traversal.
+_DEFAULT_MAX_JUMP_TABLES = 8
+
+#: Default cap on pointer slots decoded from a single jump table.
+_DEFAULT_MAX_TABLE_ENTRIES = 256
+
+#: ``ptr`` size keyword that denotes a pointer-sized memory read, by width.
+_POINTER_SIZE_KEYWORDS = {4: "dword", 8: "qword"}
 
 
 @dataclass(frozen=True)
@@ -280,6 +306,9 @@ def build_recursive_cfg(
     start: int,
     max_instructions: int = 2000,
     max_blocks: int = 500,
+    resolve_indirect: bool = False,
+    max_jump_tables: int = _DEFAULT_MAX_JUMP_TABLES,
+    max_table_entries: int = _DEFAULT_MAX_TABLE_ENTRIES,
 ) -> FunctionCFG:
     """Build a CFG by *following* control flow from ``start`` (recursive traversal).
 
@@ -312,6 +341,18 @@ def build_recursive_cfg(
        successors), then keeps the most complete block per start address. The
        reported ranges therefore never overlap and ``instruction_count`` counts
        unique instruction addresses.
+    6. **Indirect jumps (opt-in).** With ``resolve_indirect=True`` an indirect
+       ``jmp`` through a pointer-sized memory operand (``jmp qword ptr [rip +
+       disp]`` or ``jmp qword ptr [abs]``) becomes a jump-table lookup: the
+       operand is turned into an absolute table address and
+       :func:`~codevanta.analysis.jump_tables.resolve_jump_table` decodes up to
+       ``max_table_entries`` slots from it. Executable, file-backed targets
+       become that block's successors (deduplicated, sorted) and are followed
+       like any other leader. At most ``max_jump_tables`` tables are resolved
+       per traversal; register/indexed operands, unreadable tables and tables
+       past the budget leave the block without those successors, and every such
+       limitation is reported once (prefixed with the block start) in
+       :attr:`FunctionCFG.warnings`. Nothing is executed.
 
     Args:
         path: File the bytes are read from (read-only; never executed).
@@ -322,6 +363,16 @@ def build_recursive_cfg(
             ``MAX_DISASSEMBLY_COUNT``).
         max_blocks: Maximum number of blocks to report (1 ..
             ``MAX_DISASSEMBLY_COUNT``).
+        resolve_indirect: When true, indirect jumps through a pointer table are
+            resolved (see rule 6). ``False`` (the default) keeps the historical
+            behaviour exactly: an indirect jump simply has no successor and is
+            counted as unresolved.
+        max_jump_tables: Maximum number of jump tables resolved during this
+            traversal (1 .. ``MAX_DISASSEMBLY_COUNT``); ignored unless
+            ``resolve_indirect`` is true.
+        max_table_entries: Maximum pointer slots decoded per table (1 ..
+            ``jump_tables.MAX_ENTRIES``); ignored unless ``resolve_indirect`` is
+            true.
 
     Returns:
         The reconstructed :class:`FunctionCFG` with blocks in ascending
@@ -329,9 +380,11 @@ def build_recursive_cfg(
 
     Raises:
         AnalysisError: When ``start`` is not executable code, when a limit is
-            out of range, or when the architecture cannot be disassembled.
+            out of range (including the jump-table limits), or when the
+            architecture cannot be disassembled.
     """
     _validate_limits(max_instructions, max_blocks)
+    _validate_indirect_limits(max_jump_tables, max_table_entries)
 
     section = info.section_for_va(start)
     if section is None or not section.is_executable:
@@ -351,6 +404,11 @@ def build_recursive_cfg(
     budget_exhausted = False
     dropped: list[int] = []
     warnings: list[str] = []
+    tables: _JumpTableBudget | None = (
+        _JumpTableBudget(max_tables=max_jump_tables, max_entries=max_table_entries)
+        if resolve_indirect
+        else None
+    )
 
     while worklist and remaining > 0 and len(decoded) < max_blocks:
         leader = worklist.popleft()
@@ -364,7 +422,18 @@ def build_recursive_cfg(
             budget_exhausted = True
         remaining -= len(chunk)
         last = chunk[-1]
-        successors, unresolved = _recursive_successors(info, last, dropped)
+        table_targets: tuple[int, ...] | None = None
+        if (
+            tables is not None
+            and _terminator_kind(last.mnemonic) == "jmp"
+            and _direct_target(last.operands) is None
+        ):
+            table_targets = _jump_table_successors(
+                path, info, tables, leader, last, warnings
+            )
+        successors, unresolved = _recursive_successors(
+            info, last, dropped, table_targets
+        )
         indirect_unresolved += int(unresolved)
         decoded[leader] = _Segment(
             instructions=tuple(chunk),
@@ -425,6 +494,16 @@ def build_recursive_cfg(
             "(register/memory operands) and those edges are omitted"
         )
 
+    # Only mention jump tables when the caller asked for them, so the evidence
+    # text of a default traversal stays byte-for-byte what it used to be.
+    table_detail = ""
+    if tables is not None:
+        table_detail = (
+            f"; {tables.resolved} jump table(s) resolved from indirect jumps "
+            f"({tables.entries} pointer slot(s) decoded, bounded by "
+            f"max_jump_tables={max_jump_tables} and max_table_entries={max_table_entries})"
+        )
+
     evidence = Evidence(
         source="cfg.recursive_traversal",
         method="recursive_traversal",
@@ -435,8 +514,8 @@ def build_recursive_cfg(
             f"block(s) / {instruction_count} unique instruction(s); bounded by "
             f"max_instructions={max_instructions} and max_blocks={max_blocks}; "
             f"{indirect_unresolved} indirect target(s) unresolved and call targets not "
-            "followed; blocks split at interior leaders so reported ranges are disjoint; "
-            "boundaries are heuristic"
+            "followed; blocks split at interior leaders so reported ranges are disjoint"
+            f"{table_detail}; boundaries are heuristic"
         ),
     )
     return FunctionCFG(
@@ -460,6 +539,26 @@ def _validate_limits(max_instructions: int, max_blocks: int) -> None:
         raise AnalysisError("max_blocks must be >= 1")
     if max_blocks > MAX_DISASSEMBLY_COUNT:
         raise AnalysisError(f"max_blocks too large (limit {MAX_DISASSEMBLY_COUNT})")
+
+
+def _validate_indirect_limits(max_jump_tables: int, max_table_entries: int) -> None:
+    """Reject out-of-range jump-table limits.
+
+    Validated unconditionally (even for ``resolve_indirect=False``) so a caller
+    can pre-check its bounds without having to branch on the flag.
+    """
+    if max_jump_tables < 1:
+        raise AnalysisError("max_jump_tables must be >= 1")
+    if max_jump_tables > MAX_DISASSEMBLY_COUNT:
+        raise AnalysisError(
+            f"max_jump_tables too large (limit {MAX_DISASSEMBLY_COUNT})"
+        )
+    if max_table_entries < 1:
+        raise AnalysisError("max_table_entries must be >= 1")
+    if max_table_entries > _JUMP_TABLE_MAX_ENTRIES:
+        raise AnalysisError(
+            f"max_table_entries too large (limit {_JUMP_TABLE_MAX_ENTRIES})"
+        )
 
 
 def _decode_block(
@@ -517,6 +616,7 @@ def _recursive_successors(
     info: BinaryInfo,
     last: IRInstruction,
     dropped: list[int],
+    indirect_targets: tuple[int, ...] | None = None,
 ) -> tuple[tuple[int, ...], bool]:
     """Return ``(successors, indirect_unresolved)`` for a block's final instruction.
 
@@ -524,6 +624,17 @@ def _recursive_successors(
     their direct target (never a fallthrough), returns nothing, and ordinary
     instructions (calls included) only the fallthrough. Targets outside an
     executable, file-backed section are discarded and recorded in ``dropped``.
+
+    Args:
+        info: Loaded binary metadata used for the executable/file-backed check.
+        last: Final instruction of the block.
+        dropped: Collector for edge targets that are not executable code.
+        indirect_targets: Already-resolved targets of an indirect ``jmp`` (a jump
+            table), or ``None`` when indirect branches are not resolved. ``None``
+            keeps the historical behaviour: an indirect ``jmp``/``Jcc`` gets no
+            successor and is reported as unresolved. An empty tuple means "the
+            jump was resolved and really leads nowhere", which is *not* counted
+            as unresolved.
     """
     kind = _terminator_kind(last.mnemonic)
     candidates: list[int] = []
@@ -533,10 +644,12 @@ def _recursive_successors(
         candidates.append(last.address + last.size)
     if kind in ("jmp", "cond"):  # direct branch targets only
         target = _direct_target(last.operands)
-        if target is None:
+        if target is not None:
+            candidates.append(target)
+        elif indirect_targets is None:
             unresolved = True
         else:
-            candidates.append(target)
+            candidates.extend(indirect_targets)
 
     kept: set[int] = set()
     for address in candidates:
@@ -545,6 +658,115 @@ def _recursive_successors(
         else:
             dropped.append(address)
     return tuple(sorted(kept)), unresolved
+
+
+@dataclass
+class _JumpTableBudget:
+    """Book-keeping for jump-table resolution during one traversal.
+
+    Attributes:
+        max_tables: Tables that may still be resolved (``max_jump_tables``).
+        max_entries: Slots decoded per table (``max_table_entries``).
+        resolved: Tables actually resolved so far.
+        entries: Pointer slots decoded across every resolved table.
+        limit_warned: ``True`` once the ``max_tables`` warning was emitted, so it
+            is reported exactly once per traversal.
+    """
+
+    max_tables: int
+    max_entries: int
+    resolved: int = 0
+    entries: int = 0
+    limit_warned: bool = False
+
+    @property
+    def exhausted(self) -> bool:
+        """``True`` once no further table may be resolved."""
+        return self.resolved >= self.max_tables
+
+
+def _jump_table_successors(
+    path: str | Path,
+    info: BinaryInfo,
+    budget: _JumpTableBudget,
+    block_start: int,
+    last: IRInstruction,
+    warnings: list[str],
+) -> tuple[int, ...] | None:
+    """Resolve the pointer table behind one indirect ``jmp`` into block starts.
+
+    The dispatch operand is turned into an absolute table address, the table is
+    decoded with :func:`~codevanta.analysis.jump_tables.resolve_jump_table`
+    (bounded by ``budget.max_entries``) and the executable, file-backed targets
+    are returned deduplicated and sorted. Every table-level problem is appended
+    to ``warnings`` prefixed with ``block_start``, so the caveat can be traced
+    back to the block that caused it. The table module's own warnings are
+    surfaced verbatim, including the conventional zero terminator: "the scan
+    ended where a terminator was expected" is still a statement about how much
+    of the graph is guesswork, and dropping it would hide the reason a table
+    looked short.
+
+    Args:
+        path: Binary to read (read-only; never executed).
+        info: Loaded binary metadata.
+        budget: Per-traversal jump-table budget, updated in place.
+        block_start: Start address of the block, used as the warning prefix.
+        last: Final instruction of the block (an indirect ``jmp``).
+        warnings: Collector for human-readable caveats.
+
+    Returns:
+        The resolved successor addresses, an empty tuple when the table yielded
+        no usable target, or ``None`` when the jump could not be resolved at all
+        (register/indexed operand, unreadable table, or spent budget). ``None``
+        makes the caller count the block as an unresolved indirect branch.
+    """
+    table_address = _indirect_table_address(info, last)
+    if table_address is None:
+        return None
+    if budget.exhausted:
+        if not budget.limit_warned:
+            budget.limit_warned = True
+            warnings.append(
+                f"block 0x{block_start:x}: jump-table limit reached "
+                f"(max_jump_tables={budget.max_tables}); further indirect jumps were "
+                "left unresolved"
+            )
+        return None
+
+    try:
+        result = resolve_jump_table(path, info, table_address, max_entries=budget.max_entries)
+    except AnalysisError as exc:
+        warnings.append(
+            f"block 0x{block_start:x}: jump table at 0x{table_address:x} could not be "
+            f"read ({exc}); that edge is omitted"
+        )
+        return None
+
+    budget.resolved += 1
+    budget.entries += len(result.entries)
+    if result.truncated:
+        warnings.append(
+            f"block 0x{block_start:x}: jump table at 0x{table_address:x} was truncated at "
+            f"max_table_entries={budget.max_entries}; some targets are missing"
+        )
+    for warning in result.warnings:
+        warnings.append(
+            f"block 0x{block_start:x}: jump table at 0x{table_address:x}: {warning}"
+        )
+
+    targets: list[int] = []
+    unusable: list[int] = []
+    for entry in result.entries:
+        if _is_executable_address(info, entry.target):
+            targets.append(entry.target)
+        else:
+            unusable.append(entry.target)
+    if unusable:  # bounded: one warning, at most eight addresses named
+        warnings.append(
+            f"block 0x{block_start:x}: jump-table target(s) {_address_sample(unusable)} "
+            "are not executable file bytes; those edges are omitted"
+        )
+    return tuple(sorted(set(targets)))
 
 
 @dataclass(frozen=True)
@@ -847,6 +1069,106 @@ def _direct_target(operands: str) -> int | None:
         return int(token, 16)
     except ValueError:
         return None
+
+
+def _pointer_width(info: BinaryInfo) -> int | None:
+    """Return the pointer width in bytes implied by ``info.bitness``."""
+    bitness = int(getattr(info, "bitness", 0) or 0)
+    if bitness == 64:
+        return 8
+    if bitness == 32:
+        return 4
+    return None
+
+
+def _split_terms(text: str) -> list[tuple[int, str]]:
+    """Split a memory-operand body into ``(sign, term)`` pairs.
+
+    ``"rip + 0xffa"`` becomes ``[(1, "rip "), (1, " 0xffa")]`` and
+    ``"0x401000 - 0x10"`` becomes ``[(1, "0x401000 "), (-1, " 0x10")]``. Only
+    ``+``/``-`` separate terms; everything else stays in the term so the caller
+    can accept or reject it.
+    """
+    terms: list[tuple[int, str]] = []
+    sign = 1
+    current = ""
+    for char in text:
+        if char in "+-":
+            terms.append((sign, current))
+            sign = -1 if char == "-" else 1
+            current = ""
+            continue
+        current += char
+    terms.append((sign, current))
+    return terms
+
+
+def _hex_operand(term: str) -> int | None:
+    """Return the value of a ``0x``-prefixed hexadecimal term, else ``None``."""
+    token = term.strip()
+    if not token.startswith("0x"):
+        return None
+    try:
+        return int(token, 16)
+    except ValueError:
+        return None
+
+
+def _indirect_table_address(info: BinaryInfo, last: IRInstruction) -> int | None:
+    """Return the table address an indirect ``jmp`` reads through, if it is one.
+
+    Only a pointer-sized memory operand is accepted: ``jmp qword ptr [rip +
+    disp]`` on a 64-bit binary (``dword ptr [abs]`` on a 32-bit one) or its
+    absolute form ``jmp qword ptr [0x402000]``. A RIP-relative displacement is
+    resolved against the address of the *next* instruction, exactly as the CPU
+    would. Everything else -- ``jmp rax``, an indexed operand such as ``jmp
+    qword ptr [rax*8 + 0x402000]``, a symbol expression, a narrower or wider
+    read -- returns ``None``: the operand may still be a dispatcher, but this
+    function cannot justify a table address for it.
+
+    Args:
+        info: Loaded binary metadata; only ``bitness`` is used, to know which
+            ``ptr`` size keyword denotes a pointer read.
+        last: Instruction whose operands are inspected.
+
+    Returns:
+        The absolute table address, or ``None`` when the operand cannot be
+        resolved to one.
+    """
+    width = _pointer_width(info)
+    if width is None:
+        return None
+    keyword = _POINTER_SIZE_KEYWORDS[width]
+    operands = (last.operands or "").strip().lower()
+    if "[" not in operands or "]" not in operands:
+        return None
+    head, _, rest = operands.partition("[")
+    inside, _, tail = rest.partition("]")
+    if tail.strip():  # trailing syntax we do not model
+        return None
+    if "ptr" not in head:
+        return None
+    if head.split("ptr")[0].strip() != keyword:
+        return None
+
+    base: str | None = None
+    displacement = 0
+    for sign, term in _split_terms(inside):
+        term = term.strip()
+        if not term:
+            continue
+        if term == "rip":
+            if base is not None:
+                return None
+            base = term
+            continue
+        value = _hex_operand(term)
+        if value is None:
+            return None  # register, symbol, scaled index or non-hex literal
+        displacement += sign * value
+
+    address = last.address + last.size + displacement if base == "rip" else displacement
+    return address if address > 0 else None
 
 
 def _is_executable_address(info: BinaryInfo, address: int) -> bool:

@@ -63,7 +63,22 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   `build_recursive_cfg` (and `codevanta cfg --traversal recursive`) instead walks
   control flow from the start address with a worklist and a visited set, so
   blocks come from real branch targets and unreachable padding after a `ret` or
-  `jmp` is excluded. Indirect targets stay unresolved either way.
+  `jmp` is excluded. Indirect targets stay unresolved by default;
+  `resolve_indirect=True` (and `codevanta cfg --traversal recursive
+  --resolve-indirect`) decodes the pointer table behind a `jmp qword ptr [rip +
+  disp]` / `jmp qword ptr [abs]` and follows its executable targets, bounded per
+  traversal by `max_jump_tables` and `max_table_entries`.
+- **Jump tables** (`analysis/jump_tables.py`) — `resolve_jump_table` decodes a
+  bounded array of absolute pointers (4 or 8 bytes, binary endianness) into
+  `JumpTableEntry` records with evidence. The scan stops at the first zero
+  pointer, out-of-window target, unmapped target, or non-executable target and
+  reports why; results are `medium` confidence because a pointer array found by
+  shape is evidence of a dispatch table, not proof of one.
+- **Structural binary diff** (`analysis/binary_diff.py`) — `diff_binaries`
+  compares two binaries as metadata only: functions matched by address then name,
+  sections/exports by name, imports by `(library, name)`. Deltas are `added`,
+  `removed`, or `changed`, and the whole comparison is `medium` confidence
+  because no bytes and no semantics are compared.
 - **Call graph** (`analysis/callgraph.py`) — `call`, `call_import`, and
   `call_indirect` cross-references aggregated into nodes and edges. Import slots
   become `import` nodes labelled from the import table; unresolved callees stay
@@ -74,8 +89,11 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   Graphviz DOT or GraphML by one dependency-free, deterministic exporter.
 - **Offline graph viewer** (`analysis/html_view.py`) — `codevanta callgraph
   --format html` writes one self-contained HTML5 document with an inline SVG
-  view: three kind-based columns, header counts, and a collapsible edge table. No
-  CDN, no web font, no JavaScript and no server, so it opens offline from disk.
+  view: three kind-based columns, header counts, and a collapsible edge table.
+  One inline script adds drag-to-pan, mouse-wheel zoom (0.2x–8x), label search
+  with hit/dim highlighting, and per-kind filters. No CDN, no web font, no
+  library and no server, so it opens offline from disk — and with scripting
+  disabled the static view still renders in full.
 - **Session storage** (`storage/session.py`) — additive SQLite records of each
   analysis run (fingerprint, format, arch, entry point, function/string counts)
   plus per-address analyst annotations (`annotate`, `annotations`,
@@ -84,20 +102,22 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   `codevanta_session_save`, `codevanta_session_list`, alongside the five phase 1
   tools (ten in total).
 - **CLI:** `codevanta xrefs`, `codevanta cfg` (with
-  `--traversal linear|recursive`, default `linear`), `codevanta callgraph`,
-  `codevanta analyze --callgraph`, plus the
+  `--traversal linear|recursive`, default `linear`, and `--resolve-indirect` for
+  recursive traversals), `codevanta jump-table`, `codevanta diff`,
+  `codevanta callgraph`, `codevanta analyze --callgraph`, plus the
   `session save|list|show|annotate|notes` subcommands.
 
 Phase 2 is deliberately narrow: linear sweep by default with an additional
 bounded recursive traversal for CFGs, direct branch targets plus
-absolute/RIP-relative pointer slots only, call graph edges from `call` /
-`call_import` / `call_indirect` only, no indirect target resolution, no following
-calls into callees, no cross-function analysis, no interactive graph viewer (the
-HTML/SVG export is a static file), and no debugger yet. See
-[docs/phase2.md](docs/phase2.md), [docs/phase2b.md](docs/phase2b.md),
-[docs/phase2c.md](docs/phase2c.md), [docs/phase2d.md](docs/phase2d.md), and
-[docs/phase2e.md](docs/phase2e.md) for scope, confidence semantics, and
-limitations.
+absolute/RIP-relative pointer slots only, jump tables only as absolute 4/8-byte
+pointer arrays reached from a `jmp` memory operand (no register/indexed
+dispatch), call graph edges from `call` / `call_import` / `call_indirect` only,
+no following calls into callees, no cross-function analysis, a structural
+(metadata-only) binary diff with no byte-level comparison, and no debugger yet.
+See [docs/phase2.md](docs/phase2.md), [docs/phase2b.md](docs/phase2b.md),
+[docs/phase2c.md](docs/phase2c.md), [docs/phase2d.md](docs/phase2d.md),
+[docs/phase2e.md](docs/phase2e.md), and [docs/phase2f.md](docs/phase2f.md) for
+scope, confidence semantics, and limitations.
 
 ## Installation
 
@@ -128,10 +148,15 @@ codevanta analyze   samples\elf64_text.bin --output samples\report.json
 codevanta xrefs     C:\Windows\System32\notepad.exe --limit 40
 codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000
 codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000 --traversal recursive
+codevanta cfg       C:\Windows\System32\notepad.exe --address 0x140001000 --traversal recursive --resolve-indirect
+codevanta jump-table C:\Windows\System32\notepad.exe --address 0x140003000
+codevanta jump-table C:\Windows\System32\notepad.exe --address 0x140003000 --entries 64 --json
+codevanta diff      samples\v1.bin samples\v2.bin
+codevanta diff      samples\v1.bin samples\v2.bin --max-functions 20000 --json
 codevanta callgraph C:\Windows\System32\notepad.exe --format dot -o callgraph.dot
 codevanta callgraph C:\Windows\System32\notepad.exe --format graphml -o callgraph.graphml
 codevanta callgraph C:\Windows\System32\notepad.exe --format html -o callgraph.html
-Invoke-Item callgraph.html
+Invoke-Item callgraph.html   # drag to pan, wheel to zoom, search labels, filter by kind
 codevanta analyze   C:\Windows\System32\notepad.exe --callgraph -o report.json
 codevanta session save C:\Windows\System32\notepad.exe --notes "baseline triage"
 codevanta session list --limit 10
@@ -146,15 +171,21 @@ candidates always state their detection source (`export`, `symbol`,
 
 Phase 2 results carry their own evidence: xrefs are `certain` (the target is
 read directly from the decoded operand), CFG blocks are `medium` (block
-boundaries come from mnemonic heuristics), and the call graph is `medium`
-(calls are decoded, but caller attribution is a nearest-candidate heuristic).
-`codevanta callgraph` defaults to `--format json` and can emit `dot`, `graphml`,
-or `html` (one self-contained file with an inline SVG view, opened straight from
-disk); `codevanta cfg` defaults to the entry point and to `--traversal linear`,
-and `--traversal recursive` reports the same shape with evidence source
-`cfg.recursive_traversal`; sessions default to
-`$env:CODEVANTA_DB` or `~/.codevanta/sessions.db`, and `session annotate` accepts
-decimal or `0x` hex addresses.
+boundaries come from mnemonic heuristics), jump-table entries are `medium` (a
+pointer array found by shape is not proof a dispatcher indexes it), the
+structural diff is `medium` (metadata only, never bytes or behavior), and the
+call graph is `medium` (calls are decoded, but caller attribution is a
+nearest-candidate heuristic). `codevanta callgraph` defaults to `--format json`
+and can emit `dot`, `graphml`, or `html` (one self-contained file with an inline
+SVG view that pans, zooms, searches, and filters by kind without any CDN, opened
+straight from disk); `codevanta cfg` defaults to the entry point and to
+`--traversal linear`, `--traversal recursive` reports the same shape with
+evidence source `cfg.recursive_traversal`, and `--resolve-indirect` (recursive
+only) adds jump-table successors; `codevanta jump-table` takes a decimal or `0x`
+hex `--address` and a `--entries` slot budget; `codevanta diff` exits `0`
+whether or not the binaries differ, and `2` on load or input errors. Sessions default
+to `$env:CODEVANTA_DB` or `~/.codevanta/sessions.db`, and `session annotate`
+accepts decimal or `0x` hex addresses.
 
 Calls through a pointer slot report the **slot** address, not the callee: the
 pointer is read at run time, so the code behind it is unknown here. A slot that
@@ -211,7 +242,7 @@ src/codevanta/
 ├── ir/          # backend-neutral instruction model + adapter registry
 ├── mcp_server/  # MCP tools and stdio server for coding agents
 ├── setup/       # client config planning, apply, verify (claude/cursor/cline/vscode)
-├── analysis/    # cross-references, call graph, CFG (linear sweep + recursive traversal), graph/HTML export (phase 2)
+├── analysis/    # cross-references, call graph, CFG (linear sweep + recursive traversal), jump tables, structural diff, graph/HTML export (phase 2)
 ├── api/         # HTTP API (phase 2+)
 ├── cli/         # Typer command line surface
 ├── storage/     # SQLite session storage and annotations (phase 2)
@@ -237,6 +268,7 @@ ruff check src tests
 - [Phase 2c — import/indirect calls, embedded call graphs, MCP call graph](docs/phase2c.md)
 - [Phase 2d — offline HTML/SVG graph viewer](docs/phase2d.md)
 - [Phase 2e — recursive CFG traversal](docs/phase2e.md)
+- [Phase 2f — jump tables, CFG indirect resolution, interactive viewer, structural diff](docs/phase2f.md)
 
 ## Roadmap
 
