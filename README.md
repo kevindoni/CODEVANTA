@@ -190,6 +190,8 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   `--mode absolute|relative` and `--base ADDR` for signed-offset tables),
   `codevanta diff` (with `--deep` for the normalized-shape comparison, and
   `--semantic` / `--threshold` for the shape-similarity pairing),
+  `codevanta entropy` (per-section Shannon entropy with a `packed_hint`
+  heuristic, `--threshold`, `--max-sample-bytes`, `--json`),
   `codevanta callgraph`, `codevanta analyze` (with `--callgraph` for the call
   graph and `--xrefs` / `--cfg` / `--xref-limit` / `--json` for the phase 2
   sections), plus the `session save|list|show|annotate|notes` subcommands.
