@@ -152,6 +152,44 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Decompile one function to C-like text with a pluggable backend. "
+            "backend='auto' (default) prefers a real decompiler -- Ghidra, then "
+            "angr -- when one is installed and falls back to the built-in "
+            "mnemonic-level pseudo-C renderer, listing every skipped backend in "
+            "'warnings'; backend='native' always works; backend='angr' and "
+            "backend='ghidra' are strict and fail with a clear error naming the "
+            "backend and its install hint (never an ImportError) when that "
+            "backend is not available. 'backend' reports the provider that "
+            "actually produced 'text', which differs from the request under "
+            "'auto', and 'blocks' is how many basic blocks the text covers. "
+            "Control flow, argument count and types are inferred from "
+            "mnemonics, so the text is low-confidence evidence and nothing is "
+            "executed. Check 'warnings' before relying on a fallback rendering."
+        )
+    )
+    def codevanta_decompile(
+        path: str,
+        address: int,
+        backend: str = "auto",
+        max_instructions: int = 2000,
+        max_blocks: int = 500,
+    ) -> dict:
+        try:
+            return tools.decompile(
+                path,
+                address,
+                backend=backend,
+                max_instructions=max_instructions,
+                max_blocks=max_blocks,
+            )
+        except AnalysisError as exc:
+            # An unavailable backend or a bad address is caller-correctable, but
+            # the framework would otherwise replace the text with a generic
+            # "Error executing tool" message that hides which argument failed.
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
             "Build an inter-function call graph. Edges come from direct calls "
             "only, plus calls through a pointer slot that resolves to a known "
             "import (the target node is labelled with the import name) or to a "

@@ -16,6 +16,20 @@ from codevanta.analysis.binary_diff import (
 from codevanta.analysis.callgraph import MAX_LIMIT as MAX_CALLGRAPH_LIMIT
 from codevanta.analysis.callgraph import build_call_graph
 from codevanta.analysis.cfg import build_cfg
+from codevanta.analysis.decompile import (
+    DEFAULT_MAX_BLOCKS as DEFAULT_DECOMPILE_MAX_BLOCKS,
+)
+from codevanta.analysis.decompile import (
+    DEFAULT_MAX_INSTRUCTIONS as DEFAULT_DECOMPILE_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.decompile import MAX_MAX_BLOCKS as MAX_DECOMPILE_MAX_BLOCKS
+from codevanta.analysis.decompile import (
+    MAX_MAX_INSTRUCTIONS as MAX_DECOMPILE_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.decompilers import BackendResult, supported_backends
+from codevanta.analysis.decompilers import (
+    decompile_function as decompile_with_backend,
+)
 from codevanta.analysis.function_hash import function_fingerprint, function_similarity
 from codevanta.analysis.jump_tables import MAX_ENTRIES as MAX_JUMP_TABLE_ENTRIES
 from codevanta.analysis.jump_tables import MODE_RELATIVE, resolve_jump_table
@@ -54,6 +68,17 @@ MAX_XREF_BYTES = 64_000_000
 #: Hard ceiling on the numeric limits of the comparison, jump-table and
 #: fingerprint tools, so no single call can be asked for unbounded work.
 MAX_TOOL_LIMIT = 20_000
+
+#: Backend requested when the caller does not name one: pick the best available.
+AUTO_BACKEND = "auto"
+
+#: Decompiler backends :func:`decompile` accepts: ``auto`` plus every registered
+#: provider (``ghidra``, ``angr``, ``native``). Read from the provider registry so
+#: adding a backend never drifts from the accepted set.
+DECOMPILE_BACKENDS: tuple[str, ...] = (AUTO_BACKEND, *supported_backends())
+
+#: Prefix of the block-coverage line the native renderer writes in its header.
+_HEADER_BLOCKS_PREFIX = " * blocks: "
 
 #: Default session database file used when no explicit path is supplied.
 DEFAULT_SESSION_DB = Path.home() / ".codevanta" / "sessions.db"
@@ -205,6 +230,107 @@ def cfg(
         "truncated": graph.truncated,
         "warnings": list(graph.warnings),
     }
+
+
+def _rendered_block_count(result: BackendResult) -> int | None:
+    """Return how many basic blocks the rendering covered, when it says so.
+
+    The external backends record their block count in ``evidence.extra`` because
+    their C output has no header. The native renderer instead publishes it in the
+    pseudo-C header comment (`` * blocks: N  instructions: M``), the same comment
+    block :mod:`codevanta.analysis.decompilers.base` scans for warnings, so the
+    count is read from there. ``None`` means the backend reported no coverage.
+    """
+    recorded = result.evidence.extra.get("block_count")
+    if isinstance(recorded, int) and not isinstance(recorded, bool):
+        return recorded
+    for line in result.text.splitlines():
+        if line == " */":
+            break
+        if not line.startswith(_HEADER_BLOCKS_PREFIX):
+            continue
+        field = line[len(_HEADER_BLOCKS_PREFIX) :].split(" ", 1)[0]
+        if field.isdigit():
+            return int(field)
+    return None
+
+
+def decompile(
+    path: str,
+    address: int,
+    backend: str = AUTO_BACKEND,
+    max_instructions: int = DEFAULT_DECOMPILE_MAX_INSTRUCTIONS,
+    max_blocks: int = DEFAULT_DECOMPILE_MAX_BLOCKS,
+) -> dict[str, Any]:
+    """Render one function as C-like text with the requested decompiler backend.
+
+    ``backend="auto"`` (the default) prefers a real decompiler -- Ghidra, then
+    angr -- when one is installed and falls back to the built-in mnemonic-level
+    pseudo-C renderer, recording every skipped backend in ``warnings``, so a
+    fallback is never silent. ``backend="native"`` always runs; ``"angr"`` and
+    ``"ghidra"`` are strict: when that backend is unavailable the call raises
+    instead of substituting another provider. A missing optional dependency never
+    surfaces as ``ImportError``: it becomes an :class:`AnalysisError` naming the
+    backend, the probe's reason and the install hint.
+
+    Control flow, argument count and types are inferred from mnemonics; nothing
+    is mapped or executed, so the text is LOW-confidence evidence rather than a
+    recovered source file.
+
+    Args:
+        path: PE or ELF file to read; it is read, never executed.
+        address: Virtual address of the function's first instruction, inside an
+            executable section.
+        backend: ``"auto"`` (default), ``"native"``, ``"angr"`` or ``"ghidra"``;
+            matched case-insensitively, and blank means ``"auto"``.
+        max_instructions: Instruction budget (1 ..
+            :data:`codevanta.analysis.decompile.MAX_MAX_INSTRUCTIONS`).
+        max_blocks: Block budget (1 ..
+            :data:`codevanta.analysis.decompile.MAX_MAX_BLOCKS`).
+
+    Returns:
+        The backend result -- ``text``, ``backend`` (the provider that actually
+        rendered it, which differs from the request under ``"auto"``),
+        ``language``, ``warnings`` and ``evidence`` -- plus the resolved
+        ``path``, the resolved ``address`` as ``"0x..."``, and ``blocks``, the
+        number of basic blocks the text covers.
+
+    Raises:
+        AnalysisError: If the file is missing, ``address`` is not a non-negative
+            integer, ``backend`` is not one of :data:`DECOMPILE_BACKENDS`, a
+            budget is out of range, the strictly requested backend is
+            unavailable (the message names it), or the resolved address is not
+            executable code.
+    """
+    start = _check_address(address)
+    if not isinstance(backend, str):
+        raise AnalysisError(f"backend must be a string, got {type(backend).__name__}")
+    selected = backend.strip().lower() or AUTO_BACKEND
+    if selected not in DECOMPILE_BACKENDS:
+        raise AnalysisError(
+            f"backend must be one of {', '.join(DECOMPILE_BACKENDS)}, got {backend!r}"
+        )
+    instruction_budget = _check_bounded_int(
+        "max_instructions", max_instructions, MAX_DECOMPILE_MAX_INSTRUCTIONS
+    )
+    block_budget = _check_bounded_int(
+        "max_blocks", max_blocks, MAX_DECOMPILE_MAX_BLOCKS
+    )
+    target = _validate_path(path)
+    info = load_binary(target)
+    result = decompile_with_backend(
+        target,
+        info,
+        start,
+        backend=selected,
+        max_instructions=instruction_budget,
+        max_blocks=block_budget,
+    )
+    payload = result.to_dict()
+    payload["path"] = str(info.path)
+    payload["address"] = f"0x{start:x}"
+    payload["blocks"] = _rendered_block_count(result)
+    return payload
 
 
 def _check_callgraph_limit(name: str, value: int) -> None:

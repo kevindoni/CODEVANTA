@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 
@@ -13,7 +14,9 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
+from codevanta.analysis import emulate as emulator
 from codevanta.analysis.binary_diff import (
     DEFAULT_MAX_FUNCTIONS as DIFF_MAX_FUNCTIONS,
 )
@@ -34,6 +37,13 @@ from codevanta.analysis.callgraph import (
     build_call_graph,
 )
 from codevanta.analysis.cfg import FunctionCFG, build_cfg, build_recursive_cfg
+from codevanta.analysis.decompile import (
+    DEFAULT_MAX_BLOCKS as DECOMPILE_MAX_BLOCKS,
+)
+from codevanta.analysis.decompile import (
+    DEFAULT_MAX_INSTRUCTIONS as DECOMPILE_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.decompilers import BackendResult, decompile_function
 from codevanta.analysis.graph_export import (
     DEFAULT_MAX_EDGES as EXPORT_MAX_EDGES,
 )
@@ -1326,6 +1336,413 @@ def struct(
             include_stack=include_stack,
         ),
     )
+
+
+def _header_fact(line: str, label: str) -> str | None:
+    """Return the value behind ``label:`` on one header comment line.
+
+    The native renderer states its own block/instruction counts and truncation
+    flag only inside the ``* blocks: 1  instructions: 2  truncated: false`` line
+    of the header comment it writes at the top of the pseudo-C, so the footer
+    reads that line back instead of decoding the function a second time.
+    """
+    _, separator, rest = line.partition(f"{label}:")
+    if not separator:
+        return None
+    value = rest.split()[0] if rest.split() else ""
+    return value or None
+
+
+def _fact_text(value: Any) -> str:
+    """Render one count fact from a rendering, or ``unknown`` when it stated none."""
+    return "unknown" if value is None else str(value)
+
+
+def _truncation_text(value: Any) -> str:
+    """Render a truncation flag as ``yes``/``no``, or ``unknown`` when unstated."""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    text = "" if value is None else str(value).strip().lower()
+    if text in {"true", "yes", "1"}:
+        return "yes"
+    if text in {"false", "no", "0"}:
+        return "no"
+    return "unknown"
+
+
+def _rendering_facts(result: BackendResult) -> tuple[str, str, str]:
+    """Return the ``(blocks, instructions, truncated)`` footer facts of a rendering.
+
+    The backends report these differently: ``angr`` and ``ghidra`` record a block
+    count (and the requested budgets) in the evidence ``extra`` map, while the
+    native renderer only prints them in its header comment, which
+    :func:`_header_fact` reads. A fact no backend stated stays ``unknown`` rather
+    than guessed, and a truncated rendering is never reported as whole.
+    """
+    extra = result.evidence.extra
+    blocks = extra.get("blocks", extra.get("block_count"))
+    instructions = extra.get("instructions")
+    truncated = extra.get("truncated")
+    if blocks is None or instructions is None or truncated is None:
+        header = next(
+            (
+                line
+                for line in result.text.splitlines()
+                if "blocks:" in line and "instructions:" in line and "truncated:" in line
+            ),
+            "",
+        )
+        if blocks is None:
+            blocks = _header_fact(header, "blocks")
+        if instructions is None:
+            instructions = _header_fact(header, "instructions")
+        if truncated is None:
+            truncated = _header_fact(header, "truncated")
+    return _fact_text(blocks), _fact_text(instructions), _truncation_text(truncated)
+
+
+def _print_decompilation(result: BackendResult, start: int) -> None:
+    """Print one rendering as a Panel, then a dim footer and one line per warning.
+
+    The body is wrapped in a :class:`~rich.text.Text` instead of being printed as
+    markup-bearing text, so the pseudo-C is shown byte for byte: a ``[`` or a
+    ``/* ... */`` comment in the rendering is never interpreted by Rich. The
+    footer repeats the counts the backend stated, and every warning keeps its own
+    line so a fallback or an unresolved indirect branch is never hidden.
+    """
+    console.print(
+        Panel(
+            Text(result.text),
+            title=escape(f"Decompilation at 0x{start:x}"),
+            subtitle=escape(f"backend: {result.backend} · language: {result.language}"),
+        )
+    )
+    blocks, instructions, truncated = _rendering_facts(result)
+    console.print(
+        f"[dim]blocks: {blocks} · instructions: {instructions} · truncated: {truncated}[/]"
+    )
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+@app.command()
+def decompile(
+    path: Path,
+    address: Annotated[
+        str | None,
+        typer.Argument(
+            help="Virtual address of the function (decimal or 0x hex); defaults to the entry point"
+        ),
+    ] = None,
+    backend: Annotated[
+        str,
+        typer.Option(
+            "--backend",
+            help=(
+                "Decompiler backend: 'auto' (default: first available external provider, "
+                "else native), 'native', 'angr' or 'ghidra'"
+            ),
+        ),
+    ] = "auto",
+    function: Annotated[
+        str | None, typer.Option("--function", "-f", help="Function name to decompile")
+    ] = None,
+    max_instructions: Annotated[
+        int, typer.Option("--max-instructions", help="Maximum instructions to render")
+    ] = DECOMPILE_MAX_INSTRUCTIONS,
+    max_blocks: Annotated[
+        int, typer.Option("--max-blocks", help="Maximum basic blocks to render")
+    ] = DECOMPILE_MAX_BLOCKS,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON rendering instead of a panel")
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output", "-o", help="Write the rendering here (the JSON payload with --json)"
+        ),
+    ] = None,
+) -> None:
+    """Decompile one function to readable pseudo-C.
+
+    The function comes from ADDRESS, else ``--function``, else the entry point,
+    resolved exactly like ``codevanta disasm`` does -- an address therefore wins
+    over ``--function`` when both are given. The target binary is only ever read:
+    the rendering is static text, and nothing is mapped or executed.
+
+    ``--backend`` selects the provider. ``auto`` (the default) prefers the first
+    available external backend (``ghidra``, then ``angr``) and falls back to the
+    built-in heuristic renderer, recording one warning per skipped backend so a
+    fallback is never silent. ``native`` always works; ``angr`` and ``ghidra``
+    are strict and exit 2 with the probe's reason -- install hint included --
+    instead of substituting another provider. A missing optional dependency never
+    surfaces as ``ImportError``.
+
+    ``--max-instructions`` and ``--max-blocks`` bound the work; an out-of-range
+    budget is rejected before any backend runs.
+
+    The panel shows the pseudo-C body verbatim (no markup is interpreted) with the
+    backend that produced it and the source language, followed by a dim
+    ``blocks``/``instructions``/``truncated`` footer and one ``warning:`` line per
+    limitation: budget cuts, unresolved indirect branches, skipped backends.
+    ``--json`` prints ``BackendResult.to_dict()`` unchanged instead, and
+    ``--output`` writes the rendering -- the JSON payload when ``--json`` is given
+    -- to a file. Load errors, a bad address, an unknown function, an unknown
+    backend and an unavailable backend all exit 2.
+    """
+    requested = None if address is None else _parse_address(address)
+    loaded = _load(path)
+    try:
+        start = resolve_target(loaded, requested, function)
+        result = decompile_function(
+            path,
+            loaded,
+            start,
+            backend=backend,
+            max_instructions=max_instructions,
+            max_blocks=max_blocks,
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    payload = result.to_dict()
+    if output is not None:
+        written = json.dumps(payload) if json_output else result.text
+        output.write_text(written if written.endswith("\n") else f"{written}\n", encoding="utf-8")
+        console.print(f"[green]rendering written:[/] {escape(str(output))}")
+    if json_output:
+        console.print_json(json.dumps(payload))
+        return
+    _print_decompilation(result, start)
+
+
+def _parse_register_assignment(text: str) -> tuple[str, int]:
+    """Parse one ``REG=VALUE`` register seed given through ``--set``.
+
+    The name is passed through untouched -- the emulation layer owns the valid
+    register set, so a typo is reported by its own message -- while the value
+    accepts decimal and ``0x``-prefixed hex. A missing ``=``, an empty name or
+    value, and a negative value all exit 2 rather than seeding a wrong state.
+    """
+    name, separator, value = text.partition("=")
+    name = name.strip()
+    value = value.strip()
+    if not separator or not name or not value:
+        _fail(f"invalid --set {text!r}; use REG=VALUE, e.g. --set rdi=2", 2)
+    try:
+        parsed = int(value, 0)
+    except ValueError:
+        _fail(f"invalid --set value {value!r}; use decimal or 0x-prefixed hex", 2)
+    if parsed < 0:
+        _fail(f"invalid --set value {value!r}; register values must not be negative", 2)
+    return name, parsed
+
+
+def _parse_memory_block(text: str) -> tuple[int, bytes]:
+    """Parse one ``ADDRESS=HEXBYTES`` memory block given through ``--mem``.
+
+    The address side accepts decimal and ``0x``-prefixed hex, the byte side an
+    even number of hex digits (``--mem 0x600000=48454c4c4f``). The block is
+    placed in emulator memory before the run, which is how a decrypted or
+    synthetic input reaches the emulated code without touching the host.
+    """
+    address_text, separator, hex_text = text.partition("=")
+    if not separator:
+        _fail(f"invalid --mem {text!r}; use ADDRESS=HEXBYTES, e.g. --mem 0x600000=deadbeef", 2)
+    block_address = _parse_address(address_text.strip(), label="--mem address")
+    digits = "".join(hex_text.split())
+    if not digits:
+        _fail(f"invalid --mem {text!r}; the byte side is empty", 2)
+    try:
+        data = bytes.fromhex(digits)
+    except ValueError as exc:
+        _fail(f"invalid --mem bytes {digits!r}; use an even number of hex digits ({exc})", 2)
+    return block_address, data
+
+
+def _register_line(registers: Mapping[str, int]) -> str:
+    """Render the non-zero registers as ``rax=0x2a rbp=0x7fff...``.
+
+    Zeroed registers are dropped because the ABI defaults zero most of them, so
+    the ones that survived the run are the interesting ones. ``none`` is printed
+    when every register is zero, so the line never disappears.
+    """
+    live = [f"{name}=0x{value:x}" for name, value in sorted(registers.items()) if value]
+    return " ".join(live) if live else "none"
+
+
+def _value_text(value: int | None) -> str:
+    """Render a machine value as ``0x2a (42)``, or ``none`` when absent."""
+    return "none" if value is None else f"0x{value:x} ({value})"
+
+
+def _print_emulation(result: emulator.EmulationResult) -> None:
+    """Print one run as a fact table, then the live registers and the warnings.
+
+    The table carries exactly what a caller has to read off a bounded run: why it
+    stopped, how many instructions completed, the return value (``none`` unless
+    the stop reason is ``return``, because a value left in ``rax`` by an
+    interrupted run is not a return value) and the resolved indirect targets. The
+    dim line under it lists the non-zero registers, and every warning keeps its
+    own line so a budget cut or a faulting address is never hidden.
+    """
+    table = Table(title=escape(f"Emulation at 0x{result.address:x}"))
+    table.add_column("Fact")
+    table.add_column("Value")
+    targets = ", ".join(f"0x{target:x}" for target in result.indirect_targets) or "none"
+    rows = (
+        ("stopped reason", result.stopped_reason),
+        ("instructions", str(result.instructions)),
+        ("return value", _value_text(result.return_value)),
+        ("indirect targets", targets),
+    )
+    for label, value in rows:
+        table.add_row(label, escape(str(value)))
+    console.print(table)
+    console.print(f"[dim]registers: {escape(_register_line(result.registers))}[/]")
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+@app.command()
+def emulate(
+    path: Path,
+    address: Annotated[
+        str | None,
+        typer.Argument(
+            help="Virtual address to start at (decimal or 0x hex); defaults to the entry point"
+        ),
+    ] = None,
+    max_instructions: Annotated[
+        int, typer.Option("--max-instructions", help="Instruction budget for one run")
+    ] = emulator.DEFAULT_MAX_INSTRUCTIONS,
+    stack_size: Annotated[
+        int, typer.Option("--stack-size", help="Bytes of stack to map for the run")
+    ] = emulator.DEFAULT_STACK_SIZE,
+    set_values: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--set", help="Seed a register, e.g. --set rdi=2 (decimal or 0x hex); repeatable"
+        ),
+    ] = None,
+    memory: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--mem", help="Place a memory block, e.g. --mem 0x600000=deadbeef; repeatable"
+        ),
+    ] = None,
+    stop_at_indirect: Annotated[
+        bool,
+        typer.Option(
+            "--resolve-target",
+            help="Stop at the first indirect branch and report its target instead",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Emulate one function offline and report what it returns.
+
+    The run starts at ADDRESS, else the entry point, on a *private* virtual CPU:
+    only the file's bytes are copied into emulator memory, so nothing is ever
+    executed on the host, and ``--max-instructions`` bounds the work. Registers
+    start at the ABI defaults (instruction and stack pointers seeded, argument
+    registers left alone), which is why inputs are seeded explicitly with
+    ``--set REG=VALUE`` (repeatable, decimal or ``0x`` hex) and
+    ``--mem ADDRESS=HEXBYTES`` (repeatable blocks placed before the run, which is
+    how an encrypted or synthetic input reaches the emulated code).
+
+    The table reports why the run stopped, how many instructions completed, the
+    return value and the indirect targets it resolved; the dim line under it
+    lists the non-zero registers, and every degradation (budget exhausted,
+    unmapped access, unresolved indirect branch) keeps its own ``warning:`` line.
+    A partial answer is never dressed up as a complete one: a value read from
+    ``rax`` after a budget stop is reported as a register, not as a return value.
+    ``--json`` prints ``EmulationResult.to_dict()`` unchanged, which swaps the
+    table for the full register snapshot, the recorded memory writes and the
+    evidence.
+
+    ``--resolve-target`` answers the static-analysis question instead: it runs
+    until the first indirect jump/call and reports that target, so the payload is
+    ``address``/``mode``/``resolved``/``indirect_target`` plus the budget rather
+    than an emulation result (there is none). ``--stack-size`` only affects a full
+    emulation, so a non-default value is called out when ``--resolve-target`` is
+    used.
+
+    Emulation needs the optional ``unicorn`` engine; when it is missing this exits
+    2 with :func:`codevanta.analysis.emulate.emulator_status` as the reason and
+    never raises ``ImportError``. Malformed seeds, an unknown register, an address
+    outside an executable section and out-of-range limits also exit 2.
+    """
+    if not emulator.EMULATOR_AVAILABLE:
+        _fail(
+            "emulation is unavailable: "
+            f"{emulator.emulator_status() or 'the unicorn engine could not be imported'}; "
+            "codevanta.analysis.emulate.emulator_status() reports the exact probe result -- "
+            "install it with 'pip install unicorn' and retry",
+            2,
+        )
+    registers = dict(_parse_register_assignment(text) for text in set_values or ())
+    blocks: dict[int, bytes] = {}
+    for text in memory or ():
+        block_address, data = _parse_memory_block(text)
+        blocks[block_address] = data
+    requested = None if address is None else _parse_address(address)
+    loaded = _load(path)
+    try:
+        start = resolve_target(loaded, requested, None)
+        if stop_at_indirect:
+            target = emulator.resolve_indirect_target(
+                path,
+                loaded,
+                start,
+                registers,
+                max_instructions=max_instructions,
+                initial_memory=blocks,
+            )
+        else:
+            result = emulator.emulate_function(
+                path,
+                loaded,
+                start,
+                initial_registers=registers,
+                initial_memory=blocks,
+                max_instructions=max_instructions,
+                stack_size=stack_size,
+            )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if stop_at_indirect:
+        if json_output:
+            console.print_json(
+                json.dumps(
+                    {
+                        "address": f"0x{start:x}",
+                        "mode": "resolve_indirect_target",
+                        "resolved": target is not None,
+                        "indirect_target": None if target is None else f"0x{target:x}",
+                        "max_instructions": max_instructions,
+                    }
+                )
+            )
+            return
+        if target is None:
+            console.print("[yellow]indirect target: unresolved[/]")
+            console.print(
+                "[dim]no indirect branch was reached before the run stopped, or its operand "
+                "could not be evaluated; that means unresolved, never 'no target'[/]"
+            )
+        else:
+            console.print(f"[green]indirect target:[/] {_value_text(target)}")
+        if stack_size != emulator.DEFAULT_STACK_SIZE:
+            console.print(
+                "[dim]note: --stack-size applies to a full emulation, not to --resolve-target[/]"
+            )
+        return
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    _print_emulation(result)
 
 
 #: Output formats accepted by ``codevanta callgraph``.

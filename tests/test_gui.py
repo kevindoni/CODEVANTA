@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from codevanta.analysis.decompilers import available_backends
 from codevanta.gui import (
     ROUTES,
     VERSION,
@@ -29,6 +30,7 @@ from codevanta.gui import (
     normalize_host,
     render_dashboard_html,
 )
+from codevanta.gui import server as gui_server_module
 from codevanta.gui.server import MAX_RESPONSE_BYTES, _encode_payload, is_allowed_host
 
 TEXT_VA = 0x401000
@@ -176,9 +178,18 @@ def _raw_get(
 def test_dashboard_page_contains_form_controls_and_no_external_url() -> None:
     page = render_dashboard_html()
 
-    for element_id in ("path", "left", "right", "out", "tbl"):
+    for element_id in ("path", "left", "right", "out", "tbl", "backend"):
         assert f'id="{element_id}"' in page
-    for action in ("info", "functions", "strings", "xrefs", "cfg", "struct", "callgraph"):
+    for action in (
+        "info",
+        "functions",
+        "strings",
+        "xrefs",
+        "cfg",
+        "struct",
+        "callgraph",
+        "decompile",
+    ):
         assert f'data-action="{action}"' in page
     assert 'data-action="diff"' in page
     # Self-contained: no CDN, no font, no image, no absolute URL of any scheme.
@@ -188,6 +199,18 @@ def test_dashboard_page_contains_form_controls_and_no_external_url() -> None:
     assert "<link" not in page
     # Results are written with textContent only, never with innerHTML.
     assert "textContent" in page
+    assert "innerHTML" not in page
+
+
+def test_dashboard_page_has_a_decompile_control() -> None:
+    page = render_dashboard_html()
+
+    assert '<button type="button" data-action="decompile">Decompile</button>' in page
+    assert 'id="backend"' in page
+    # The control posts to the same-origin decompile route and renders the
+    # answer with textContent, exactly like the other buttons.
+    assert 'decompile: "/api/decompile"' in page
+    assert 'addParam(parts, "backend", fieldValue("backend") || "auto")' in page
     assert "innerHTML" not in page
 
 
@@ -494,6 +517,7 @@ def test_every_analysis_route_answers(
         f"/api/struct?path={path}&address=0x401000&include_stack=0",
         f"/api/callgraph?path={path}&limit_functions=10&limit_edges=10",
         f"/api/diff?left={path}&right={twin}&semantic=0&threshold=0.5",
+        f"/api/decompile?path={path}&address=0x401000&backend=auto",
     ):
         status, payload = _get(gui_server, route)
         assert status == 200, (route, payload)
@@ -547,4 +571,160 @@ def test_handler_can_refuse_path_parameters(sample_binary: Path) -> None:
         assert health["paths_allowed"] is False
     finally:
         _stop(server, thread)
+
+
+# ---------------------------------------------------------------------------
+# /api/decompile
+# ---------------------------------------------------------------------------
+
+
+def test_decompile_returns_a_text_body(
+    gui_server: ThreadingHTTPServer, sample_binary: Path
+) -> None:
+    status, payload = _get(
+        gui_server, f"/api/decompile?path={sample_binary.as_posix()}&address=0x401000"
+    )
+
+    assert status == 200
+    assert payload["backend"] == "native"
+    assert payload["language"] == "c"
+    assert Path(payload["path"]) == sample_binary
+    assert payload["address"] == "0x401000"
+    assert payload["blocks"] == 1
+    assert isinstance(payload["text"], str)
+    assert "sub_401000" in payload["text"]
+    assert "blocks: 1" in payload["text"]
+    # The fallback is reported, not silent.
+    assert payload["warnings"]
+
+
+def test_decompile_defaults_to_the_entry_point(
+    gui_server: ThreadingHTTPServer, sample_binary: Path
+) -> None:
+    status, payload = _get(
+        gui_server, f"/api/decompile?path={sample_binary.as_posix()}&backend=native"
+    )
+
+    assert status == 200
+    assert payload["address"] == "0x401000"
+    assert payload["warnings"] == []
+
+
+def test_decompile_unknown_backend_is_a_400(
+    gui_server: ThreadingHTTPServer, sample_binary: Path
+) -> None:
+    status, payload = _get(
+        gui_server, f"/api/decompile?path={sample_binary.as_posix()}&backend=radare2"
+    )
+
+    assert status == 400
+    assert "backend" in payload["error"]
+    assert "radare2" in payload["error"]
+
+
+def test_decompile_unavailable_backend_is_a_400_not_a_500(
+    gui_server: ThreadingHTTPServer, sample_binary: Path
+) -> None:
+    probes = {probe.name: probe for probe in available_backends()}
+    if probes["angr"].available:
+        pytest.skip("the angr backend is installed in this environment")
+
+    status, payload = _get(
+        gui_server, f"/api/decompile?path={sample_binary.as_posix()}&backend=angr"
+    )
+
+    assert status == 400
+    assert "angr" in payload["error"]
+
+
+def test_decompile_rejects_an_unusable_address(
+    gui_server: ThreadingHTTPServer, sample_binary: Path
+) -> None:
+    path = sample_binary.as_posix()
+
+    status_text, payload_text = _get(gui_server, f"/api/decompile?path={path}&address=zzz")
+    assert status_text == 400
+    assert "address" in payload_text["error"]
+
+    status_range, payload_range = _get(
+        gui_server, f"/api/decompile?path={path}&address=0x401000&max_blocks=0"
+    )
+    assert status_range == 400
+    assert "max_blocks" in payload_range["error"]
+
+
+def test_foreign_host_is_rejected_before_the_decompile_route_runs(
+    gui_server: ThreadingHTTPServer, sample_binary: Path
+) -> None:
+    status, headers, body = _raw_get(
+        gui_server,
+        f"/api/decompile?path={sample_binary.as_posix()}&address=0x401000",
+        "attacker.example:8080",
+    )
+
+    assert status == 421
+    text = body.decode("utf-8")
+    assert "sub_401000" not in text
+    assert json.loads(text)["error"].startswith("refusing Host")
+    assert headers["X-Frame-Options"] == "DENY"
+
+
+def test_decompile_reply_carries_the_security_headers(
+    gui_server: ThreadingHTTPServer, sample_binary: Path
+) -> None:
+    port = gui_server.server_address[1]
+
+    status, headers, body = _raw_get(
+        gui_server,
+        f"/api/decompile?path={sample_binary.as_posix()}&address=0x401000",
+        f"127.0.0.1:{port}",
+    )
+
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert json.loads(body.decode("utf-8"))["backend"] == "native"
+
+
+def test_decompile_body_counts_toward_the_response_cap(
+    gui_server: ThreadingHTTPServer,
+    sample_binary: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The rendering is text, but it is JSON-encoded like every other payload, so
+    # the existing cap must shrink it rather than being bypassed. The fixture
+    # payload is ~1.8 kB, the shrunk form ~1.1 kB: a 1.5 kB cap forces the
+    # placeholder stage and leaves no doubt about which stage ran.
+    cap = 1500
+    monkeypatch.setattr(gui_server_module, "MAX_RESPONSE_BYTES", cap)
+    port = gui_server.server_address[1]
+
+    status, headers, body = _raw_get(
+        gui_server,
+        f"/api/decompile?path={sample_binary.as_posix()}&address=0x401000",
+        f"127.0.0.1:{port}",
+    )
+
+    assert status == 200
+    assert len(body) <= cap
+    assert int(headers["Content-Length"]) == len(body)
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["response_truncated"] is True
+    assert payload["text"].startswith("<cut: ")
+    assert payload["address"] == "0x401000"
+
+
+def test_response_cap_shrinks_a_decompiled_text_field() -> None:
+    oversized = "d" * (MAX_RESPONSE_BYTES * 2)
+
+    body = _encode_payload(
+        {"text": oversized, "path": "/tmp/sample.bin", "address": "0x401000"}
+    )
+
+    assert len(body) <= MAX_RESPONSE_BYTES
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["response_truncated"] is True
+    assert payload["text"] == f"<cut: {len(oversized)} chars>"
+    assert payload["address"] == "0x401000"
+
 

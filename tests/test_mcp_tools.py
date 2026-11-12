@@ -16,6 +16,7 @@ from mcp.server.transport_security import (
 from starlette.requests import Request
 
 from codevanta.analysis.binary_diff import DEFAULT_SEMANTIC_THRESHOLD
+from codevanta.analysis.decompilers import available_backends
 from codevanta.analysis.type_recovery import MAX_MAX_FIELDS, MAX_MAX_INSTRUCTIONS
 from codevanta.core.report import AnalysisError
 from codevanta.mcp_server import server as mcp_server
@@ -62,13 +63,14 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
     assert report["disassembly"]["instruction_count"] == 3
 
 
-def test_server_lists_fifteen_tools() -> None:
+def test_server_lists_sixteen_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
     assert names == [
         "codevanta_analyze",
         "codevanta_callgraph",
         "codevanta_cfg",
+        "codevanta_decompile",
         "codevanta_diff",
         "codevanta_disasm",
         "codevanta_function_hash",
@@ -82,7 +84,7 @@ def test_server_lists_fifteen_tools() -> None:
         "codevanta_struct",
         "codevanta_xrefs",
     ]
-    assert len(names) == 15
+    assert len(names) == 16
 
 
 def _payload(result: object) -> dict:
@@ -1129,5 +1131,161 @@ def test_run_passes_the_normalised_host_with_hardening(
     settings = call["transport_security"]
     assert isinstance(settings, TransportSecuritySettings)
     assert settings.enable_dns_rebinding_protection is True
+
+
+# ---------------------------------------------------------------------------
+# decompile: the sixteenth tool
+# ---------------------------------------------------------------------------
+
+#: ``mov rax, rdi; add rax, rsi; ret`` -- one block, two argument reads.
+DECOMPILE_CODE = bytes.fromhex("4889f84801f0c3")
+
+
+@pytest.fixture
+def decompile_elf_path(tmp_path: Path) -> Path:
+    """ELF64 sample whose ``.text`` is a one-block, two-argument straight line."""
+    return _write_elf64(tmp_path / "decompile.bin", DECOMPILE_CODE)
+
+
+def _external_backend() -> str | None:
+    """Return the name of an installed external backend, or ``None``."""
+    probes = {probe.name: probe for probe in available_backends()}
+    for name in ("ghidra", "angr"):
+        if probes[name].available:
+            return name
+    return None
+
+
+def test_decompile_returns_backend_text_and_blocks(decompile_elf_path: Path) -> None:
+    installed = _external_backend()
+    if installed is not None:
+        pytest.skip(f"the {installed} backend is installed, so 'auto' is not native")
+
+    payload = tools.decompile(str(decompile_elf_path), 0x401000)
+
+    assert payload["backend"] == "native"
+    assert payload["language"] == "c"
+    assert Path(payload["path"]) == decompile_elf_path
+    assert payload["address"] == "0x401000"
+    assert payload["blocks"] == 1
+    assert "sub_401000(" in payload["text"]
+    assert "mov rax, rdi" in payload["text"]
+    assert "blocks: 1" in payload["text"]
+    assert payload["evidence"]["source"] == "decompile.pseudo_c"
+    # A fallback is never silent: both skipped backends are named, in order.
+    assert len(payload["warnings"]) == 2
+    assert "ghidra" in payload["warnings"][0]
+    assert "angr" in payload["warnings"][1]
+
+
+def test_decompile_native_backend_is_explicit_and_needs_no_fallback(
+    decompile_elf_path: Path,
+) -> None:
+    payload = tools.decompile(str(decompile_elf_path), 0x401000, backend="native")
+
+    assert payload["backend"] == "native"
+    assert payload["warnings"] == []
+    assert payload["blocks"] == 1
+
+
+def test_decompile_angr_backend_errors_when_it_is_missing(
+    decompile_elf_path: Path,
+) -> None:
+    probes = {probe.name: probe for probe in available_backends()}
+    if probes["angr"].available:
+        pytest.skip("the angr backend is installed in this environment")
+
+    with pytest.raises(AnalysisError) as excinfo:
+        tools.decompile(str(decompile_elf_path), 0x401000, backend="angr")
+
+    message = str(excinfo.value)
+    assert "angr" in message
+    assert "backend" in message
+    # Never a bare ImportError leaking out of the provider layer.
+    assert not isinstance(excinfo.value, ImportError)
+
+
+def test_decompile_rejects_an_unknown_backend(decompile_elf_path: Path) -> None:
+    with pytest.raises(AnalysisError, match="backend"):
+        tools.decompile(str(decompile_elf_path), 0x401000, backend="radare2")
+
+
+def test_decompile_rejects_an_invalid_address(decompile_elf_path: Path) -> None:
+    with pytest.raises(AnalysisError, match="address"):
+        tools.decompile(str(decompile_elf_path), -1)
+
+    with pytest.raises(AnalysisError, match="address"):
+        tools.decompile(str(decompile_elf_path), True)  # type: ignore[arg-type]
+
+    with pytest.raises(AnalysisError, match="0x999000"):
+        tools.decompile(str(decompile_elf_path), 0x999000)
+
+
+def test_decompile_rejects_out_of_range_budgets(decompile_elf_path: Path) -> None:
+    with pytest.raises(AnalysisError, match="max_instructions"):
+        tools.decompile(str(decompile_elf_path), 0x401000, max_instructions=0)
+
+    with pytest.raises(AnalysisError, match="max_blocks"):
+        tools.decompile(str(decompile_elf_path), 0x401000, max_blocks=0)
+
+
+def test_decompile_tool_is_registered_with_a_stable_schema() -> None:
+    listed = {tool.name: tool for tool in asyncio.run(build_server().list_tools())}
+    schema = listed["codevanta_decompile"].input_schema
+
+    assert schema["required"] == ["path", "address"]
+    assert set(schema["properties"]) == {
+        "path",
+        "address",
+        "backend",
+        "max_instructions",
+        "max_blocks",
+    }
+    assert schema["properties"]["backend"]["default"] == "auto"
+    assert schema["properties"]["backend"]["type"] == "string"
+    assert schema["properties"]["address"]["type"] == "integer"
+
+
+def test_server_call_tool_decompile_returns_a_rendering(
+    decompile_elf_path: Path,
+) -> None:
+    result = asyncio.run(
+        build_server().call_tool(
+            "codevanta_decompile",
+            {
+                "path": str(decompile_elf_path),
+                "address": 0x401000,
+                "backend": "native",
+            },
+        )
+    )
+
+    payload = _payload(result)
+    assert payload["backend"] == "native"
+    assert payload["text"].strip()
+    assert payload["blocks"] >= 1
+
+
+def test_server_call_tool_decompile_surfaces_an_unavailable_backend(
+    decompile_elf_path: Path,
+) -> None:
+    probes = {probe.name: probe for probe in available_backends()}
+    if probes["angr"].available:
+        pytest.skip("the angr backend is installed in this environment")
+
+    with pytest.raises(ToolError, match="angr") as excinfo:
+        asyncio.run(
+            build_server().call_tool(
+                "codevanta_decompile",
+                {
+                    "path": str(decompile_elf_path),
+                    "address": 0x401000,
+                    "backend": "angr",
+                },
+            )
+        )
+
+    assert "codevanta_decompile" in str(excinfo.value)
+
 
 
