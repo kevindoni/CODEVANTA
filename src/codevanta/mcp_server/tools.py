@@ -6,9 +6,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+from codevanta.analysis.binary_diff import diff_binaries
 from codevanta.analysis.callgraph import MAX_LIMIT as MAX_CALLGRAPH_LIMIT
 from codevanta.analysis.callgraph import build_call_graph
 from codevanta.analysis.cfg import build_cfg
+from codevanta.analysis.function_hash import function_fingerprint
+from codevanta.analysis.jump_tables import MAX_ENTRIES as MAX_JUMP_TABLE_ENTRIES
+from codevanta.analysis.jump_tables import MODE_RELATIVE, resolve_jump_table
+from codevanta.analysis.jump_tables import MODES as JUMP_TABLE_MODES
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.functions import discover_functions
 from codevanta.core.report import (
@@ -32,6 +37,10 @@ MAX_XREF_LIMIT = 200_000
 
 #: Hard ceiling on executable bytes decoded by one cross-reference scan (64 MiB).
 MAX_XREF_BYTES = 64_000_000
+
+#: Hard ceiling on the numeric limits of the comparison, jump-table and
+#: fingerprint tools, so no single call can be asked for unbounded work.
+MAX_TOOL_LIMIT = 20_000
 
 #: Default session database file used when no explicit path is supplied.
 DEFAULT_SESSION_DB = Path.home() / ".codevanta" / "sessions.db"
@@ -234,6 +243,238 @@ def callgraph(
         max_edges=limit_edges,
     )
     return graph.to_dict()
+
+
+def _check_bounded_int(
+    name: str,
+    value: int,
+    maximum: int = MAX_TOOL_LIMIT,
+) -> int:
+    """Return ``value`` when it is a plain integer in ``1 .. maximum``, else raise.
+
+    Args:
+        name: Argument name used in the error message.
+        value: Caller-supplied value; booleans are rejected even though ``bool``
+            is an ``int`` subclass, because ``True`` is never a valid limit.
+        maximum: Inclusive upper bound for ``value``.
+
+    Returns:
+        ``value`` unchanged.
+
+    Raises:
+        AnalysisError: If ``value`` is not a non-boolean ``int``, or if it falls
+            outside ``1 .. maximum``.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AnalysisError(f"{name} must be an integer")
+    if value < 1 or value > maximum:
+        raise AnalysisError(f"{name} must be between 1 and {maximum}")
+    return value
+
+
+def _check_bool(name: str, value: bool) -> bool:
+    """Return ``value`` when it is a real ``bool``, else raise.
+
+    Args:
+        name: Argument name used in the error message.
+        value: Caller-supplied flag; strings, integers and ``None`` are rejected
+            so a truthy value can never silently switch a mode on.
+
+    Returns:
+        ``value`` unchanged.
+
+    Raises:
+        AnalysisError: If ``value`` is not a ``bool``.
+    """
+    if not isinstance(value, bool):
+        raise AnalysisError(f"{name} must be a boolean")
+    return value
+
+
+def _check_address(address: int) -> int:
+    """Return ``address`` when it is a non-negative plain integer, else raise.
+
+    Args:
+        address: Virtual address supplied by the caller.
+
+    Returns:
+        ``address`` unchanged.
+
+    Raises:
+        AnalysisError: If ``address`` is not a non-boolean ``int`` or is negative.
+    """
+    if isinstance(address, bool) or not isinstance(address, int):
+        raise AnalysisError(f"address must be an integer, got {address!r}")
+    if address < 0:
+        raise AnalysisError(f"address must be non-negative, got {address}")
+    return address
+
+
+def diff(
+    left: str,
+    right: str,
+    max_functions: int = 5000,
+    deep: bool = False,
+) -> dict[str, Any]:
+    """Compare two binaries structurally and report per-side deltas.
+
+    Both files are parsed only; nothing is mapped or executed. Functions are
+    matched by virtual address first and, for the leftovers, by name after
+    moving. ``identical`` means no function, section, import or export delta was
+    observed -- equal file hashes are neither required nor implied.
+
+    Args:
+        left: Path of the left-hand binary; it is read, never executed.
+        right: Path of the right-hand binary; it is read, never executed.
+        max_functions: Per-side ceiling on the compared function candidates
+            (1 .. 20000). Any truncation is reported in ``warnings``.
+        deep: When true, additionally fingerprint the normalized instruction
+            shape of address-matched functions and mark differing digests as
+            ``changed``. Digests are shape fingerprints: equal is not byte
+            equality and different is not a semantic difference.
+
+    Returns:
+        The serialized comparison with ``left_path``, ``right_path``,
+        ``identical``, the added/removed/changed function and section lists, the
+        import and export deltas, ``evidence``, and ``warnings``.
+
+    Raises:
+        AnalysisError: If either file is missing, ``max_functions`` is out of
+            range, or ``deep`` is not a boolean.
+    """
+    left_path = _validate_path(left)
+    right_path = _validate_path(right)
+    limit = _check_bounded_int("max_functions", max_functions)
+    deep_flag = _check_bool("deep", deep)
+    comparison = diff_binaries(
+        left_path,
+        right_path,
+        max_functions=limit,
+        deep=deep_flag,
+    )
+    return comparison.to_dict()
+
+
+def jump_table(
+    path: str,
+    address: int,
+    mode: str = "absolute",
+    base: int | None = None,
+    entries: int = 256,
+    executable_only: bool = True,
+) -> dict[str, Any]:
+    """Decode a jump table at an absolute virtual address.
+
+    ``mode="absolute"`` reads consecutive pointer-sized virtual addresses;
+    ``mode="relative"`` reads consecutive signed 32-bit offsets and resolves each
+    one as ``base + offset``. In both layouts the scan stops at the first slot
+    that cannot be a usable target and records why in ``warnings``: a target no
+    section maps, a target outside an executable section when
+    ``executable_only`` is true, or -- in absolute mode only -- a zero pointer,
+    the conventional terminator. A zero offset in relative mode is a real delta,
+    so it terminates nothing.
+
+    Entries carry medium confidence: a run of same-width slots found by shape is
+    evidence of a dispatch table, not proof that a dispatcher indexes it.
+
+    Args:
+        path: PE or ELF file to read; it is read, never executed.
+        address: Absolute virtual address of the first slot, which must be
+            backed by file bytes of a mapped section.
+        mode: ``"absolute"`` (default) or ``"relative"``, case-insensitive.
+        base: Origin the signed offsets are added to. Required for
+            ``"relative"`` and ignored for ``"absolute"``.
+        entries: Maximum number of slots to decode (1 .. 20000, further capped by
+            the resolver ceiling
+            :data:`codevanta.analysis.jump_tables.MAX_ENTRIES`).
+        executable_only: When true (default), a target inside a non-executable
+            section ends the scan with a warning.
+
+    Returns:
+        The serialized table with ``table_address``, ``entry_count``,
+        ``entries``, ``pointer_size``, ``truncated``, ``warnings``, and
+        ``evidence``.
+
+    Raises:
+        AnalysisError: If the file is missing, ``address`` or ``base`` is not a
+            non-negative integer, ``mode`` is unknown, ``entries`` is out of
+            range, or ``executable_only`` is not a boolean.
+    """
+    table_address = _check_address(address)
+    if not isinstance(mode, str):
+        raise AnalysisError(f"mode must be a string, got {type(mode).__name__}")
+    normalized = mode.strip().lower()
+    if normalized not in JUMP_TABLE_MODES:
+        raise AnalysisError(
+            f"mode must be one of {', '.join(JUMP_TABLE_MODES)}, got {mode!r}"
+        )
+    base_address: int | None = None
+    if normalized == MODE_RELATIVE:
+        if base is None:
+            raise AnalysisError("base is required when mode is 'relative'")
+        base_address = _check_address(base)
+    limit = _check_bounded_int("entries", entries)
+    if limit > MAX_JUMP_TABLE_ENTRIES:
+        raise AnalysisError(f"entries too large (limit {MAX_JUMP_TABLE_ENTRIES})")
+    flag = _check_bool("executable_only", executable_only)
+    target = _validate_path(path)
+    info = load_binary(target)
+    result = resolve_jump_table(
+        target,
+        info,
+        table_address,
+        max_entries=limit,
+        executable_only=flag,
+        mode=normalized,
+        base_address=base_address,
+    )
+    return result.to_dict()
+
+
+def function_hash(
+    path: str,
+    address: int,
+    max_instructions: int = 2000,
+) -> dict[str, Any]:
+    """Fingerprint the normalized instruction shape of a function region.
+
+    The region is decoded with a bounded linear sweep from ``address`` and each
+    instruction is rendered as ``"<mnemonic> <operands>"`` with every numeric
+    literal masked to ``#``. The masked stream is hashed with SHA-256, so two
+    functions with the same mnemonic/operand structure share a digest even when
+    their immediates, branch targets or frame offsets differ.
+
+    Equal digests are therefore **not** byte equality, and different digests are
+    **not** a semantic difference. ``truncated`` marks a digest that covers only
+    a prefix of the region.
+
+    Args:
+        path: PE or ELF file to read; it is read, never executed.
+        address: Virtual address of the first instruction, inside an executable
+            section.
+        max_instructions: Instruction budget (1 .. 20000); the sweep reads at
+            most ``max_instructions * 16`` file bytes.
+
+    Returns:
+        The serialized fingerprint with ``address``, ``algorithm``, ``digest``,
+        ``instruction_count``, ``truncated``, and ``evidence``.
+
+    Raises:
+        AnalysisError: If the file is missing, ``address`` is not a non-negative
+            integer or is not inside an executable section, or
+            ``max_instructions`` is out of range.
+    """
+    start = _check_address(address)
+    limit = _check_bounded_int("max_instructions", max_instructions)
+    target = _validate_path(path)
+    info = load_binary(target)
+    fingerprint = function_fingerprint(
+        target,
+        info,
+        start,
+        max_instructions=limit,
+    )
+    return fingerprint.to_dict()
 
 
 def session_save(

@@ -46,7 +46,19 @@ from codevanta.analysis.jump_tables import (
     JumpTableResult,
     resolve_jump_table,
 )
+from codevanta.analysis.type_recovery import (
+    DEFAULT_MAX_FIELDS as STRUCT_MAX_FIELDS,
+)
+from codevanta.analysis.type_recovery import (
+    DEFAULT_MAX_INSTRUCTIONS as STRUCT_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.type_recovery import (
+    StructSuggestion,
+    parse_memory_operands,
+    suggest_struct,
+)
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
+from codevanta.core.disassembler import DisassemblyError
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
 from codevanta.core.report import AnalysisError, build_report, disassemble_region, resolve_target
@@ -730,6 +742,181 @@ def jump_table(
         result,
         mode=explicit_mode,
         base_address=base_address if resolved_mode == MODE_RELATIVE else None,
+    )
+
+
+#: Pointer width in bytes per bitness, used when a memory operand carries no
+#: Intel size keyword. Mirrors the fallback used by the type-recovery layer.
+_STRUCT_POINTER_WIDTHS: dict[int, int] = {16: 2, 32: 4, 64: 8}
+
+
+def _struct_offset_cell(offset: int) -> str:
+    """Render a field offset in hex, keeping the sign in front (``-0x8``)."""
+    return f"-0x{-offset:x}" if offset < 0 else f"0x{offset:x}"
+
+
+def _struct_base_registers(
+    path: Path,
+    info: BinaryInfo,
+    start: int,
+    *,
+    max_instructions: int,
+    include_stack: bool,
+) -> tuple[str, ...]:
+    """Return the base registers the struct sweep saw, sorted and de-duplicated.
+
+    :func:`codevanta.analysis.type_recovery.suggest_struct` aggregates accesses
+    per offset and therefore drops the base register of each access, while the
+    footer still has to name the registers used as struct pointers. The same
+    bounded window is decoded once more and every operand goes through the
+    production parser (:func:`parse_memory_operands`), so both passes agree on
+    which operands count. A failure here never fails the command: the suggestion
+    is already computed, so the footer simply reports no base register.
+    """
+    pointer_width = _STRUCT_POINTER_WIDTHS.get(info.bitness, 8)
+    try:
+        region = disassemble_region(path, info, start, count=max_instructions)
+    except (AnalysisError, DisassemblyError):
+        return ()
+    registers: set[str] = set()
+    for instruction in region.instructions:
+        for access in parse_memory_operands(
+            instruction, include_stack=include_stack, pointer_width=pointer_width
+        ):
+            registers.add(access.base_register)
+    return tuple(sorted(registers))
+
+
+def _struct_warnings(result: StructSuggestion) -> list[str]:
+    """Return the CLI-level warnings for one struct suggestion."""
+    warnings: list[str] = []
+    if result.truncated:
+        warnings.append(
+            f"field cap of {result.max_fields} reached; raise --max-fields for the "
+            "remaining offsets"
+        )
+    if not result.fields:
+        hint = (
+            ""
+            if result.include_stack
+            else "; stack-based operands are excluded unless --include-stack is given"
+        )
+        warnings.append(f"no field-shaped memory operand was decoded in the window{hint}")
+    return warnings
+
+
+def _print_struct_suggestion(
+    result: StructSuggestion,
+    *,
+    base_registers: tuple[str, ...],
+) -> None:
+    """Print one :class:`StructSuggestion` as an offset table plus a footer."""
+    table = Table(title=escape(f"Struct at 0x{result.address:x}"))
+    table.add_column("Offset", justify="right")
+    table.add_column("Width", justify="right")
+    table.add_column("Reads", justify="right")
+    table.add_column("Writes", justify="right")
+    for field in result.fields:
+        table.add_row(
+            _struct_offset_cell(field.offset),
+            str(field.width),
+            str(field.read_count),
+            str(field.write_count),
+        )
+    console.print(table)
+    registers = ", ".join(base_registers) or "-"
+    console.print(f"[dim]base registers: {escape(registers)} · fields: {result.field_count}[/]")
+    console.print(
+        f"[dim]instructions: {result.instruction_count}"
+        f" · max fields: {result.max_fields}"
+        f" · truncated: {'yes' if result.truncated else 'no'}[/]"
+    )
+    for warning in _struct_warnings(result):
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+@app.command()
+def struct(
+    path: Path,
+    address: Annotated[
+        str | None,
+        typer.Option(
+            "--address",
+            "-a",
+            help="Virtual address of the first instruction (decimal or 0x hex)",
+        ),
+    ] = None,
+    function: Annotated[
+        str | None, typer.Option("--function", "-f", help="Function to start the sweep at")
+    ] = None,
+    max_instructions: Annotated[
+        int,
+        typer.Option("--max-instructions", help="Maximum instructions to decode"),
+    ] = STRUCT_MAX_INSTRUCTIONS,
+    max_fields: Annotated[
+        int,
+        typer.Option("--max-fields", help="Maximum distinct field offsets reported"),
+    ] = STRUCT_MAX_FIELDS,
+    include_stack: Annotated[
+        bool,
+        typer.Option(
+            "--include-stack",
+            help=(
+                "Keep \\[rsp]/\\[rbp]-relative operands instead of treating them as "
+                "stack slots"
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Suggest the struct fields a function accesses through memory operands.
+
+    The start address comes from ``--address``, else ``--function``, else the
+    entry point. A bounded window (``--max-instructions``) is disassembled and
+    every ``\\[reg]`` / ``\\[reg + 0xNN]`` / ``\\[reg - 0xNN]`` operand is
+    aggregated per offset: the dominant access width, the read count and the
+    write count. Only file bytes are read; nothing is mapped or executed.
+
+    Fields are a heuristic about how the code reaches memory through one base
+    register, not verified types: signedness, purpose and lifetime stay unknown.
+    ``\\[rsp]``/``\\[rbp]``-based operands usually describe stack slots, so they
+    are dropped unless ``--include-stack`` is given, and ``--max-fields`` caps the
+    number of offsets kept (the rest are dropped and reported as truncated).
+
+    ``--json`` emits ``StructSuggestion.to_dict()`` unchanged; the table adds a
+    footer naming the base registers seen, the field and instruction counts and
+    the truncation flag, followed by one ``warning:`` line per limitation. Load
+    and input errors -- unreadable file, bad address, unknown function, address
+    outside an executable section -- exit 2.
+    """
+    start_address = None if address is None else _parse_address(address)
+    loaded = _load(path)
+    try:
+        start = resolve_target(loaded, start_address, function)
+        result = suggest_struct(
+            path,
+            loaded,
+            start,
+            max_instructions=max_instructions,
+            max_fields=max_fields,
+            include_stack=include_stack,
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    _print_struct_suggestion(
+        result,
+        base_registers=_struct_base_registers(
+            path,
+            loaded,
+            start,
+            max_instructions=max_instructions,
+            include_stack=include_stack,
+        ),
     )
 
 

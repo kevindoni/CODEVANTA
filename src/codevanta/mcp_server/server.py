@@ -129,6 +129,77 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Compare two binaries structurally: functions (matched by address "
+            "first, then by name after moving), sections, imports and exports. "
+            "Nothing is executed. With deep=true, address-matched functions are "
+            "also compared by a normalized-instruction fingerprint; equal "
+            "digests are shape equality, not byte equality. Check 'warnings' "
+            "before assuming the comparison is complete."
+        )
+    )
+    def codevanta_diff(
+        left: str,
+        right: str,
+        max_functions: int = 5000,
+        deep: bool = False,
+    ) -> dict:
+        return tools.diff(
+            left,
+            right,
+            max_functions=max_functions,
+            deep=deep,
+        )
+
+    @server.tool(
+        description=(
+            "Decode a jump table at an absolute virtual address. mode='absolute' "
+            "reads consecutive pointer-sized virtual addresses; mode='relative' "
+            "reads signed 32-bit offsets added to 'base' (required in that "
+            "mode). Scanning stops at the first slot that is not a usable code "
+            "target and explains why in 'warnings'; a zero pointer also ends an "
+            "absolute table. Entries are shape evidence, not proof that a "
+            "dispatcher indexes the table."
+        )
+    )
+    def codevanta_jump_table(
+        path: str,
+        address: int,
+        mode: str = "absolute",
+        base: int | None = None,
+        entries: int = 256,
+        executable_only: bool = True,
+    ) -> dict:
+        return tools.jump_table(
+            path,
+            address,
+            mode=mode,
+            base=base,
+            entries=entries,
+            executable_only=executable_only,
+        )
+
+    @server.tool(
+        description=(
+            "Return a SHA-256 fingerprint of the normalized instruction shape of "
+            "the function starting at an address. Numeric literals are masked, "
+            "so equal digests mean equal mnemonic/operand structure, not byte "
+            "equality, and different digests are not a semantic difference. "
+            "'truncated' means the digest covers only a prefix of the region."
+        )
+    )
+    def codevanta_function_hash(
+        path: str,
+        address: int,
+        max_instructions: int = 2000,
+    ) -> dict:
+        return tools.function_hash(
+            path,
+            address,
+            max_instructions=max_instructions,
+        )
+
+    @server.tool(
+        description=(
             "Analyze a binary and persist its fingerprint, function count, and "
             "string count as a new session in the local SQLite session database."
         )
