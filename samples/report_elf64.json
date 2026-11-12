@@ -1,0 +1,157 @@
+{
+  "provenance": {
+    "tool": "codevanta",
+    "tool_version": "0.1.0",
+    "created_at": "2026-11-12T03:33:21.528748+00:00",
+    "steps": [
+      "load_binary",
+      "discover_functions",
+      "extract_strings"
+    ]
+  },
+  "binary": {
+    "path": "samples\\elf64_text.bin",
+    "format": "ELF",
+    "architecture": "x86_64",
+    "bitness": 64,
+    "endianness": "little",
+    "entry_point": "0x401000",
+    "image_base": "0x0",
+    "sha256": "90484368acda3d151338987a32f89239863f589e1483256ac265c772129f6cc1",
+    "file_size": 280,
+    "is_stripped": true,
+    "sections": [
+      {
+        "name": "",
+        "virtual_address": "0x0",
+        "size": 0,
+        "raw_size": 0,
+        "offset": "0x0",
+        "entropy": 0.0,
+        "executable": false,
+        "writable": false,
+        "evidence": {
+          "source": "elf.section_table",
+          "method": "section_header",
+          "confidence": "certain",
+          "address": "0x0",
+          "detail": "ELF section ''"
+        }
+      },
+      {
+        "name": ".text",
+        "virtual_address": "0x401000",
+        "size": 5,
+        "raw_size": 0,
+        "offset": "0x40",
+        "entropy": 2.321928094887362,
+        "executable": true,
+        "writable": false,
+        "evidence": {
+          "source": "elf.section_table",
+          "method": "section_header",
+          "confidence": "certain",
+          "address": "0x401000",
+          "detail": "ELF section '.text'"
+        }
+      },
+      {
+        "name": ".shstrtab",
+        "virtual_address": "0x0",
+        "size": 17,
+        "raw_size": 0,
+        "offset": "0x45",
+        "entropy": 3.1018812234760187,
+        "executable": false,
+        "writable": false,
+        "evidence": {
+          "source": "elf.section_table",
+          "method": "section_header",
+          "confidence": "certain",
+          "address": "0x0",
+          "detail": "ELF section '.shstrtab'"
+        }
+      }
+    ],
+    "imports": [],
+    "exports": [],
+    "symbols": [],
+    "warnings": [
+      "Binary is stripped: no symbol table found."
+    ]
+  },
+  "functions": [
+    {
+      "address": "0x401000",
+      "source": "binary.entry_point",
+      "confidence": "medium",
+      "evidence": {
+        "source": "binary.entry_point",
+        "method": "entry_point",
+        "confidence": "medium",
+        "address": "0x401000",
+        "detail": "program entry point; a code candidate, not a proven function boundary"
+      }
+    }
+  ],
+  "strings": {
+    "count": 2,
+    "returned": 2,
+    "truncated": false,
+    "items": [
+      {
+        "offset": "0x46",
+        "text": ".text",
+        "encoding": "ascii",
+        "length": 5,
+        "address": "0x1"
+      },
+      {
+        "offset": "0x4c",
+        "text": ".shstrtab",
+        "encoding": "ascii",
+        "length": 9,
+        "address": "0x7"
+      }
+    ]
+  },
+  "disassembly": {
+    "base_address": "0x401000",
+    "consumed_bytes": 5,
+    "truncated": false,
+    "instruction_count": 3,
+    "instructions": [
+      {
+        "address": "0x401000",
+        "size": 1,
+        "bytes": "55",
+        "mnemonic": "push",
+        "operands": "rbp",
+        "text": "push rbp"
+      },
+      {
+        "address": "0x401001",
+        "size": 3,
+        "bytes": "4889e5",
+        "mnemonic": "mov",
+        "operands": "rbp, rsp",
+        "text": "mov rbp, rsp"
+      },
+      {
+        "address": "0x401004",
+        "size": 1,
+        "bytes": "c3",
+        "mnemonic": "ret",
+        "operands": "",
+        "text": "ret"
+      }
+    ],
+    "evidence": {
+      "source": "capstone",
+      "method": "linear_disassembly",
+      "confidence": "certain",
+      "address": "0x401000",
+      "detail": "3 instruction(s) decoded"
+    }
+  }
+}

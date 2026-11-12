@@ -155,6 +155,11 @@ class Annotation:
         }
 
 
+# ``SessionStore.list`` shadows the ``list`` builtin inside the class body, so the
+# type of an annotation collection is aliased here to keep it spellable there.
+_AnnotationList = list[Annotation]
+
+
 class SessionStore:
     """Create, read, list and delete analysis sessions in SQLite.
 
@@ -352,7 +357,7 @@ class SessionStore:
             ) from exc
         return annotation
 
-    def annotations(self, session_id: str) -> list[Annotation]:
+    def annotations(self, session_id: str) -> _AnnotationList:
         """Return every annotation of ``session_id``, lowest address first."""
         self._require_open()
         sid = _require_session_id(session_id)
