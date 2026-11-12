@@ -10,7 +10,7 @@ from codevanta.analysis.binary_diff import diff_binaries
 from codevanta.analysis.callgraph import MAX_LIMIT as MAX_CALLGRAPH_LIMIT
 from codevanta.analysis.callgraph import build_call_graph
 from codevanta.analysis.cfg import build_cfg
-from codevanta.analysis.function_hash import function_fingerprint
+from codevanta.analysis.function_hash import function_fingerprint, function_similarity
 from codevanta.analysis.jump_tables import MAX_ENTRIES as MAX_JUMP_TABLE_ENTRIES
 from codevanta.analysis.jump_tables import MODE_RELATIVE, resolve_jump_table
 from codevanta.analysis.jump_tables import MODES as JUMP_TABLE_MODES
@@ -482,6 +482,95 @@ def function_hash(
         max_instructions=limit,
     )
     return fingerprint.to_dict()
+
+
+def _check_side_address(side: str, address: int) -> int:
+    """Return ``address`` when it is a non-negative plain integer, else raise.
+
+    Args:
+        side: Argument name (``address_a`` or ``address_b``) used in the error
+            message, so a two-address tool names the offending side.
+        address: Virtual address supplied by the caller.
+
+    Returns:
+        ``address`` unchanged.
+
+    Raises:
+        AnalysisError: If ``address`` is not a non-boolean ``int`` or is negative.
+    """
+    if isinstance(address, bool) or not isinstance(address, int):
+        raise AnalysisError(f"{side} must be an integer, got {address!r}")
+    if address < 0:
+        raise AnalysisError(f"{side} must be non-negative, got {address}")
+    return address
+
+
+def similarity(
+    path_a: str,
+    address_a: int,
+    path_b: str,
+    address_b: int,
+    max_instructions: int = 2000,
+) -> dict[str, Any]:
+    """Compare two function regions by normalized instruction *shape*.
+
+    Each region is decoded with the same bounded linear sweep as
+    :func:`codevanta.mcp_server.tools.function_hash` and its instructions are
+    normalized to ``"<mnemonic> <masked operands>"``, with every numeric literal
+    masked to ``#``. The two token streams are compared as multisets::
+
+        shared = sum((left & right).values())   # sum(min), shared occurrences
+        union  = sum((left | right).values())   # sum(max), union size
+        score  = shared / union
+
+    The score is therefore in ``[0, 1]``: ``1.0`` means both sides share every
+    token with the same multiplicity and ``0.0`` means they share none.
+    Multiplicity matters (``nop; nop; ret`` is only partially similar to
+    ``nop; ret``). Because immediates, frame offsets and branch targets are
+    masked, a relocated or recompiled copy of a function usually scores
+    ``1.0`` -- and structurally similar but semantically unrelated code can too.
+
+    The score is **shape evidence at medium confidence, never semantic
+    equivalence**: it says nothing about what the code does, and a genuine
+    rewrite scores low.
+
+    Args:
+        path_a: Left-hand PE or ELF file; it is read, never executed.
+        address_a: Virtual address of the left region's first instruction,
+            inside an executable section.
+        path_b: Right-hand PE or ELF file; it is read, never executed.
+        address_b: Virtual address of the right region's first instruction,
+            inside an executable section.
+        max_instructions: Per-side instruction budget (1 .. 20000); each sweep
+            reads at most ``max_instructions * 16`` file bytes.
+
+    Returns:
+        The serialized comparison with ``score``, ``shared``, ``left_total``,
+        ``right_total``, ``union``, ``warnings``, and ``evidence``. A warning
+        means that side was truncated, so only prefixes were compared.
+
+    Raises:
+        AnalysisError: If either file is missing, either address is not a
+            non-negative integer or is not inside an executable section, or
+            ``max_instructions`` is out of range.
+    """
+    start_a = _check_side_address("address_a", address_a)
+    start_b = _check_side_address("address_b", address_b)
+    limit = _check_bounded_int("max_instructions", max_instructions)
+    target_a = _validate_path(path_a)
+    target_b = _validate_path(path_b)
+    info_a = load_binary(target_a)
+    info_b = load_binary(target_b)
+    comparison = function_similarity(
+        target_a,
+        info_a,
+        start_a,
+        target_b,
+        info_b,
+        start_b,
+        max_instructions=limit,
+    )
+    return comparison.to_dict()
 
 
 def struct(

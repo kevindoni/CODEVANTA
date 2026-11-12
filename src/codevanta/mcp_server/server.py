@@ -200,6 +200,34 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Compare two function regions as multisets of normalized instruction "
+            "shapes and return a 'score' in 0..1 (shared / union token "
+            "occurrences). Numeric literals, frame offsets and branch targets are "
+            "masked, so a relocated or recompiled copy usually scores 1.0, while "
+            "two structurally similar functions can score 1.0 without sharing "
+            "meaning. The score is shape evidence at MEDIUM confidence, not "
+            "semantic equivalence: different code can score high and a rewrite can "
+            "score low. 'warnings' means a side was truncated to the instruction "
+            "budget, so only prefixes were compared."
+        )
+    )
+    def codevanta_similarity(
+        path_a: str,
+        address_a: int,
+        path_b: str,
+        address_b: int,
+        max_instructions: int = 2000,
+    ) -> dict:
+        return tools.similarity(
+            path_a,
+            address_a,
+            path_b,
+            address_b,
+            max_instructions=max_instructions,
+        )
+
+    @server.tool(
+        description=(
             "Suggest struct fields for the memory a function accesses around a "
             "base register, starting at an address, a named function, or the "
             "entry point. Only '[reg]', '[reg + 0xNN]' and '[reg - 0xNN]' "

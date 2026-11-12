@@ -92,8 +92,7 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   shared count, both side totals, and a warning per truncated side. It is
   `medium` confidence and a *shape* measure only: literals are masked and the
   comparison is order-insensitive, so `1.0` is not equality and `0.0` is not
-  proof of different behaviour. Library-only for now — no CLI command and no MCP
-  tool.
+  proof of different behaviour. Exposed as the `codevanta_similarity` MCP tool.
 - **Structural binary diff** (`analysis/binary_diff.py`) — `diff_binaries`
   compares two binaries as metadata only: functions matched by address then name,
   sections/exports by name, imports by `(library, name)`. Deltas are `added`,
@@ -101,7 +100,16 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   because no bytes and no semantics are compared. `deep=True` adds a content
   signal for address-matched functions only: when their fingerprints differ the
   entry becomes `changed` with both digests, while every structural rule, and
-  structural-only mode, stays unchanged.
+  structural-only mode, stays unchanged. `semantic=True` adds a *pairing* pass
+  instead of a new rule: the functions that address and name matching left
+  unpaired are scored with `function_similarity` and the highest scores at or
+  above `threshold` (default `0.9`) become one `changed` entry each, carrying a
+  `similarity` rounded to four decimals. Pairing is greedy — highest score first,
+  ties broken by address, one use per candidate — and it never overrides an
+  address or name match, so a leftover below the threshold keeps its
+  `added`/`removed` verdict. It is bounded twice: at most 4096 leftover pairs are
+  scored (the whole pass is skipped, with a warning, above that) and one score
+  reads at most 2000 instructions per side.
 - **Call graph** (`analysis/callgraph.py`) — `call`, `call_import`, and
   `call_indirect` cross-references aggregated into nodes and edges. Import slots
   become `import` nodes labelled from the import table; unresolved callees stay
@@ -135,21 +143,29 @@ Phase 2 adds the first reverse-engineering views on top of the phase 1 engine:
   maximal runs of at least three consecutive fields that share one width and one
   stride. Every record is `medium` confidence and explicitly heuristic: no type
   names, no padding or struct-size inference, and offsets are bucketed per
-  displacement so different base registers share one bucket.
-- **MCP tools** — `codevanta_struct` joins `codevanta_diff`,
-  `codevanta_jump_table`, `codevanta_function_hash`, `codevanta_xrefs`,
-  `codevanta_cfg`, `codevanta_callgraph`, `codevanta_session_save`, and
-  `codevanta_session_list`, alongside the five phase 1 tools (fourteen in
-  total).
+  displacement so different base registers share one bucket. Each field also
+  carries a `signed` hint read from the *mnemonics* that touched its offset:
+  `movsx`/`movsxd`/`sar`/`idiv`/`imul` say signed,
+  `movzx`/`shr`/`div`/`mul` say unsigned, and every other mnemonic says nothing.
+  Only one kind of hint at an offset gives `True`/`False`; no hint gives `None`,
+  and a contradiction gives `None` plus a `SignednessConflictWarning` naming the
+  offset. `None` means *no evidence*, never "safe", and the key is omitted from
+  the JSON rather than emitted as `null`.
+- **MCP tools** — `codevanta_similarity` joins `codevanta_struct`,
+  `codevanta_diff`, `codevanta_jump_table`, `codevanta_function_hash`,
+  `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`,
+  `codevanta_session_save`, and `codevanta_session_list`, alongside the five
+  phase 1 tools (fifteen in total).
 - **CLI:** `codevanta struct` (with `--address`/`--function`,
   `--max-instructions`, `--max-fields`, `--include-stack`, `--json`, and a
   footer reporting `alignment:` plus one line per array candidate or
-  `arrays: none`),
+  `arrays: none`, closing with a `signed:` line),
   `codevanta xrefs`, `codevanta cfg` (with
   `--traversal linear|recursive`, default `linear`, and `--resolve-indirect` for
   recursive traversals), `codevanta jump-table` (with
   `--mode absolute|relative` and `--base ADDR` for signed-offset tables),
-  `codevanta diff` (with `--deep` for the normalized-shape comparison),
+  `codevanta diff` (with `--deep` for the normalized-shape comparison, and
+  `--semantic` / `--threshold` for the shape-similarity pairing),
   `codevanta callgraph`, `codevanta analyze --callgraph`, plus the
   `session save|list|show|annotate|notes` subcommands.
 
@@ -160,9 +176,10 @@ pointer arrays or signed 32-bit offset tables with an analyst-supplied base
 (`--mode relative --base`) — never register/indexed dispatch, call graph edges
 from `call` / `call_import` / `call_indirect` only, no following calls into
 callees, no cross-function analysis, a structural (metadata-only) binary diff
-plus an opt-in shape-fingerprint comparison of address-matched functions, struct
-fields as per-offset hypotheses from `[reg]`/`[reg ± disp]` operands only, and no
-debugger yet. The phase 2g switches are `jump-table --mode absolute|relative
+plus an opt-in shape-fingerprint comparison of address-matched functions, an
+opt-in shape-similarity pairing of the leftovers, struct fields as per-offset
+hypotheses from `[reg]`/`[reg ± disp]` operands only, and no debugger yet. The
+phase 2g switches are `jump-table --mode absolute|relative
 --base ADDR` (plus the same `mode`/`base_address` arguments on
 `resolve_jump_table`), the new `function_fingerprint` API, and `diff --deep`
 (`deep=True`); the CFG's indirect resolution still uses the absolute layout.
@@ -170,12 +187,17 @@ Phase 2h adds `codevanta struct` (and the `suggest_struct` API) plus the
 `codevanta_diff`, `codevanta_jump_table`, and `codevanta_function_hash` MCP
 tools. Phase 2i adds the `alignment`/`array_groups` layout hints on a struct
 suggestion, the `function_similarity`/`normalized_tokens` API, and the
-`codevanta_struct` MCP tool (fourteen tools).
+`codevanta_struct` MCP tool. Phase 2j adds the opt-in semantic pairing pass on the
+binary diff (`semantic=True`, `threshold` defaulting to `0.9`), the
+`codevanta_similarity` MCP tool (fifteen tools), and the `signed` mnemonic hint on
+struct fields, reachable as `diff --semantic --threshold` and as the
+`codevanta struct` footer `signed:` line. `codevanta_diff` still has no
+`semantic` argument, so MCP pairing goes through `codevanta_similarity`.
 See [docs/phase2.md](docs/phase2.md), [docs/phase2b.md](docs/phase2b.md),
 [docs/phase2c.md](docs/phase2c.md), [docs/phase2d.md](docs/phase2d.md),
 [docs/phase2e.md](docs/phase2e.md), [docs/phase2f.md](docs/phase2f.md),
-[docs/phase2g.md](docs/phase2g.md), [docs/phase2h.md](docs/phase2h.md), and
-[docs/phase2i.md](docs/phase2i.md) for
+[docs/phase2g.md](docs/phase2g.md), [docs/phase2h.md](docs/phase2h.md),
+[docs/phase2i.md](docs/phase2i.md), and [docs/phase2j.md](docs/phase2j.md) for
 scope, confidence semantics, and limitations.
 
 ## Installation
@@ -212,6 +234,8 @@ codevanta jump-table C:\Windows\System32\notepad.exe --address 0x140003000
 codevanta jump-table C:\Windows\System32\notepad.exe --address 0x140003000 --entries 64 --json
 codevanta diff      samples\v1.bin samples\v2.bin
 codevanta diff      samples\v1.bin samples\v2.bin --max-functions 20000 --json
+codevanta diff      samples\v1.bin samples\v2.bin --semantic
+codevanta diff      samples\v1.bin samples\v2.bin --semantic --threshold 0.75 --json
 codevanta callgraph C:\Windows\System32\notepad.exe --format dot -o callgraph.dot
 codevanta callgraph C:\Windows\System32\notepad.exe --format graphml -o callgraph.graphml
 codevanta callgraph C:\Windows\System32\notepad.exe --format html -o callgraph.html
@@ -226,6 +250,22 @@ codevanta struct    C:\Windows\System32\notepad.exe --address 0x140001000
 codevanta struct    samples\handle.bin --function process --include-stack --json
 ```
 
+`diff --semantic` prints one dim
+`semantic pair 0x401000 -> 0x401010 (<name>): similarity 1.0000` line per pair
+after the unchanged function table (`--threshold` defaults to `0.9` and is
+validated before either file is loaded), and `codevanta struct` closes its footer
+with `signed: 0x10 signed, 0x18 unsigned`, or `signed: none` when no mnemonic
+hinted anything. The same data comes back from Python and JSON:
+
+```python
+from codevanta.analysis.binary_diff import diff_binaries
+
+# Leftovers paired by normalized instruction-shape similarity (default 0.9)
+diff = diff_binaries("samples/v1.bin", "samples/v2.bin", semantic=True, threshold=0.9)
+for delta in diff.functions_changed:
+    print(hex(delta.address), delta.similarity)  # None unless the pair was scored
+```
+
 All addresses in reports are absolute virtual addresses (VA). Function
 candidates always state their detection source (`export`, `symbol`,
 `entry_point`) and confidence (`high`, `medium`, `low`, `unknown`).
@@ -238,7 +278,8 @@ structural diff is `medium` (metadata only, never bytes or behavior), the call
 graph is `medium` (calls are decoded, but caller attribution is a
 nearest-candidate heuristic), struct fields are `medium` (an operand proves
 an access, not a type or a layout — `alignment` is only the gcd of the observed
-offsets and an `array_groups` entry is only a repeated width and stride), a
+offsets and an `array_groups` entry is only a repeated width and stride, and a
+`signed` hint is only the mnemonics that happened to touch that offset), a
 function fingerprint is `medium` (normalized shape, not bytes), and a similarity
 score is `medium` (multiset overlap of normalized tokens, not semantics).
 `codevanta callgraph` defaults to
@@ -291,11 +332,11 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools (fourteen): `codevanta_info`, `codevanta_functions`,
+MCP tools (fifteen): `codevanta_info`, `codevanta_functions`,
 `codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
 `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
-`codevanta_jump_table`, `codevanta_function_hash`, `codevanta_struct`,
-`codevanta_session_save`, `codevanta_session_list`.
+`codevanta_jump_table`, `codevanta_function_hash`, `codevanta_similarity`,
+`codevanta_struct`, `codevanta_session_save`, `codevanta_session_list`.
 
 `codevanta_callgraph` takes the same bounded limits as the CLI
 (`limit_functions`, `limit_edges`, defaulting to 1000 and 5000) and returns nodes,
@@ -305,6 +346,8 @@ nodes labelled from the import table; unresolved callees stay `external`.
 
 `codevanta_diff` compares two binaries structurally (`max_functions` default
 5000, `deep=False`) and reports `warnings` when a cap truncated the comparison.
+The semantic pairing pass is not exposed here yet — call `codevanta_similarity`
+on the addresses that matter instead.
 `codevanta_jump_table` defaults to `mode="absolute"` and requires `base` when
 `mode="relative"`; `entries` defaults to 256 and values above 4096 are rejected.
 `codevanta_function_hash` returns a SHA-256 over the normalized instruction
@@ -312,9 +355,13 @@ shape (numeric literals masked) with a `truncated` flag — equal digests are no
 byte equality, and different digests are not a semantic difference.
 `codevanta_struct` takes the same `address`/`function`/`max_instructions`/
 `max_fields`/`include_stack` arguments as the CLI and returns the suggestion
-document unchanged, including `alignment` (a number or `null`) and
-`array_groups`; fields are `medium` heuristics from operand shapes, never
-verified types. Function similarity has no MCP tool yet.
+document unchanged, including `alignment` (a number or `null`), `array_groups`,
+and each field's `signed` hint when it is known; fields are `medium` heuristics
+from operand shapes, never verified types.
+`codevanta_similarity` compares two regions as multisets of normalized
+instruction tokens and returns `score` (`shared / union`, four decimals),
+`shared`, `left_total`, `right_total`, `union`, `warnings`, and evidence — a
+shape measure, so `1.0` is not equality.
 
 Prompt you can paste into a coding agent:
 
@@ -363,6 +410,7 @@ plus smoke-tests the wheel on 3.13.
 - [Phase 2g — relative jump tables, function fingerprints, deep diff](docs/phase2g.md)
 - [Phase 2h — struct-field suggestions, MCP parity, Python 3.14 CI](docs/phase2h.md)
 - [Phase 2i — alignment/array hints, function similarity, struct over MCP](docs/phase2i.md)
+- [Phase 2j — semantic diff pairing, similarity over MCP, signedness hints](docs/phase2j.md)
 
 ## Roadmap
 

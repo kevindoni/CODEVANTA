@@ -1,4 +1,4 @@
-"""Binary diff tests (structural matching, evidence, bounds)."""
+﻿"""Binary diff tests (structural matching, evidence, bounds, semantic pairing)."""
 
 from __future__ import annotations
 
@@ -6,9 +6,13 @@ import json
 import struct
 from pathlib import Path
 
+import pytest
+
 from codevanta.analysis.binary_diff import (
     DEFAULT_MAX_FUNCTIONS,
+    DEFAULT_SEMANTIC_THRESHOLD,
     MAX_MAX_FUNCTIONS,
+    MAX_SEMANTIC_PAIRS,
     FunctionDelta,
     diff_binaries,
     diff_infos,
@@ -21,6 +25,7 @@ from codevanta.core.loader import (
     ImportInfo,
     SectionInfo,
 )
+from codevanta.core.report import AnalysisError
 from codevanta.evidence.confidence import Confidence
 from codevanta.evidence.models import Evidence
 
@@ -482,3 +487,231 @@ def test_deep_warns_about_truncated_fingerprints(tmp_path: Path) -> None:
     assert diff.identical is True
     assert any("DEEP_MAX_INSTRUCTIONS" in warning for warning in diff.warnings)
 
+
+# ---- semantic (similarity) mode ------------------------------------------
+
+
+def test_semantic_pairs_identical_code_at_a_new_address(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    right = _make_code_elf(tmp_path / "right.bin", MOV_RET_42, entry=0x401010)
+
+    structural = diff_binaries(left, right)
+    semantic = diff_binaries(left, right, semantic=True)
+
+    # No shared address and no symbol name, so a structural diff reports a move
+    # as one removal plus one addition.
+    assert structural.identical is False
+    assert [delta.address for delta in structural.functions_removed] == [0x401000]
+    assert [delta.address for delta in structural.functions_added] == [0x401010]
+    assert structural.functions_changed == ()
+    assert "semantic" not in structural.evidence.extra
+
+    # The very same inputs, scored, become one changed (moved) function.
+    assert semantic.identical is False
+    assert semantic.functions_added == ()
+    assert semantic.functions_removed == ()
+    assert len(semantic.functions_changed) == 1
+    delta = semantic.functions_changed[0]
+    assert delta.change == "changed"
+    assert delta.address == 0x401010
+    assert delta.name is None
+    assert delta.similarity == pytest.approx(1.0)
+    assert delta.left_digest is None and delta.right_digest is None
+    assert delta.left is not None and delta.left["address"] == "0x401000"
+    assert delta.right is not None and delta.right["address"] == "0x401010"
+    detail = delta.evidence.detail or ""
+    assert "similarity" in detail
+    assert "0x401000" in detail
+    assert "0x401010" in detail
+    assert "not proof" in detail
+    assert semantic.evidence.extra["semantic"] is True
+    assert semantic.evidence.extra["semantic_threshold"] == DEFAULT_SEMANTIC_THRESHOLD
+    assert semantic.evidence.extra["max_semantic_pairs"] == MAX_SEMANTIC_PAIRS
+
+    # The threshold is validated on the file-loading entry point too.
+    with pytest.raises(AnalysisError, match="threshold"):
+        diff_binaries(left, right, semantic=True, threshold=1.01)
+
+
+def test_semantic_pairing_never_overrides_an_address_match(tmp_path: Path) -> None:
+    binary = _make_code_elf(tmp_path / "code.bin", MOV_RET_42)
+
+    diff = diff_infos(
+        _make_info(path=binary),
+        _make_info(path=binary),
+        [_candidate(TEXT_VA, "old_name")],
+        [_candidate(TEXT_VA, "new_name")],
+        semantic=True,
+    )
+
+    assert len(diff.functions_changed) == 1
+    # The address already proved identity, so no score was needed.
+    assert diff.functions_changed[0].similarity is None
+    assert "similarity" not in diff.functions_changed[0].to_dict()
+
+
+def test_semantic_pairs_each_leftover_once_highest_score_first(tmp_path: Path) -> None:
+    block_small = bytes.fromhex("9090c3")  # nop; nop; ret
+    block_large = bytes.fromhex("909090c3")  # nop; nop; nop; ret
+    # Two functions per side, the second one 0x20 bytes into the section, with no
+    # shared address and no name: only the scores can pair them.
+    code = block_small + bytes(0x20 - len(block_small)) + block_large
+    left_path = _make_code_elf(tmp_path / "left.bin", code, entry=0x401000)
+    right_path = _make_code_elf(tmp_path / "right.bin", code, entry=0x402000)
+
+    loader = BinaryLoader()
+    left_info = loader.load(left_path)
+    right_info = loader.load(right_path)
+
+    diff = diff_infos(
+        left_info,
+        right_info,
+        [_candidate(0x401000), _candidate(0x401020)],
+        [_candidate(0x402000), _candidate(0x402020)],
+        semantic=True,
+    )
+
+    assert diff.functions_added == ()
+    assert diff.functions_removed == ()
+    assert [
+        (delta.left["address"], delta.right["address"])
+        for delta in diff.functions_changed
+        if delta.left is not None and delta.right is not None
+    ] == [("0x401000", "0x402000"), ("0x401020", "0x402020")]
+    assert all(delta.similarity == pytest.approx(1.0) for delta in diff.functions_changed)
+
+
+def test_semantic_and_deep_modes_combine(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    right = _make_code_elf(tmp_path / "right.bin", MOV_RET_42, entry=0x401010)
+
+    diff = diff_binaries(left, right, deep=True, semantic=True)
+
+    assert len(diff.functions_changed) == 1
+    assert diff.evidence.extra["deep"] is True
+    assert diff.evidence.extra["semantic"] is True
+    assert diff.functions_changed[0].similarity == pytest.approx(1.0)
+    # Name and address matching left nothing to fingerprint, so no digest pair.
+    assert diff.functions_changed[0].left_digest is None
+
+
+def test_semantic_keeps_below_threshold_leftovers_one_sided(tmp_path: Path) -> None:
+    # nop; nop; ret scores 0.25 against mov eax, #; ret, far below the default.
+    left = _make_code_elf(tmp_path / "left.bin", bytes.fromhex("9090c3"), entry=0x401000)
+    right = _make_code_elf(tmp_path / "right.bin", MOV_RET_42, entry=0x401010)
+
+    diff = diff_binaries(left, right, semantic=True)
+
+    assert diff.functions_changed == ()
+    assert [delta.address for delta in diff.functions_removed] == [0x401000]
+    assert [delta.address for delta in diff.functions_added] == [0x401010]
+    assert diff.warnings == ()
+
+
+def test_semantic_pairing_is_skipped_above_the_pair_cap() -> None:
+    left_functions = [_candidate(0x401000 + 0x10 * index) for index in range(65)]
+    right_functions = [_candidate(0x500000 + 0x10 * index) for index in range(65)]
+
+    diff = diff_infos(_make_info(), _make_info(), left_functions, right_functions, semantic=True)
+
+    # 65 * 65 = 4225 pairs would exceed the cap, so nothing is scored.
+    assert len(diff.functions_removed) == 65
+    assert len(diff.functions_added) == 65
+    assert diff.functions_changed == ()
+    assert any(str(MAX_SEMANTIC_PAIRS) in warning for warning in diff.warnings)
+
+
+def test_semantic_warns_when_a_pair_cannot_be_scored(tmp_path: Path) -> None:
+    diff = diff_infos(
+        _make_info(path=tmp_path / "missing.bin"),
+        _make_info(path=tmp_path / "missing2.bin"),
+        [_candidate(TEXT_VA)],
+        [_candidate(TEXT_VA + 0x10)],
+        semantic=True,
+    )
+
+    assert diff.functions_changed == ()
+    assert [delta.address for delta in diff.functions_removed] == [TEXT_VA]
+    assert [delta.address for delta in diff.functions_added] == [TEXT_VA + 0x10]
+    assert any("could not be scored" in warning for warning in diff.warnings)
+
+
+@pytest.mark.parametrize("threshold", [1.01, 1.5, -0.01, -1.0, float("nan")])
+def test_semantic_threshold_outside_the_unit_interval_is_rejected(
+    threshold: float,
+) -> None:
+    with pytest.raises(AnalysisError, match="threshold"):
+        diff_infos(_make_info(), _make_info(), [], [], semantic=True, threshold=threshold)
+
+
+def test_threshold_is_validated_even_without_semantic_matching() -> None:
+    with pytest.raises(AnalysisError, match="threshold"):
+        diff_infos(_make_info(), _make_info(), [], [], threshold=1.01)
+
+
+def test_semantic_threshold_must_be_a_number() -> None:
+    with pytest.raises(AnalysisError, match="threshold"):
+        diff_infos(
+            _make_info(),
+            _make_info(),
+            [],
+            [],
+            semantic=True,
+            threshold="0.9",  # type: ignore[arg-type]
+        )
+
+
+def test_similarity_is_serialised_only_when_set(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    right = _make_code_elf(tmp_path / "right.bin", MOV_RET_42, entry=0x401010)
+
+    semantic = diff_binaries(left, right, semantic=True).to_dict()
+    structural = diff_infos(_make_info(), _make_info(), [_candidate(TEXT_VA, "gone")], [])
+
+    assert semantic["functions_changed"][0]["similarity"] == 1.0
+    assert json.loads(json.dumps(semantic))["functions_changed"][0]["similarity"] == 1.0
+    assert "similarity" not in structural.functions_removed[0].to_dict()
+
+
+def test_semantic_reported_score_never_rounds_below_its_threshold(tmp_path: Path) -> None:
+    # nop against nop;ret;hlt shares one of three tokens: exactly 1/3.
+    left = _make_code_elf(tmp_path / "left.bin", bytes.fromhex("90"), entry=0x401000)
+    right = _make_code_elf(tmp_path / "right.bin", bytes.fromhex("90c3f4"), entry=0x401010)
+
+    diff = diff_binaries(left, right, semantic=True, threshold=0.33333)
+
+    assert len(diff.functions_changed) == 1
+    assert diff.functions_changed[0].similarity == pytest.approx(0.3333)
+    # The payload must agree with the threshold that authorised the pair.
+    threshold = diff.evidence.extra["semantic_threshold"]
+    assert diff.functions_changed[0].similarity >= round(threshold, 4)
+
+
+def test_semantic_never_pairs_on_zero_overlap(tmp_path: Path) -> None:
+    # nop and ret share no token, so a zero threshold still must not pair them.
+    left = _make_code_elf(tmp_path / "left.bin", bytes.fromhex("90"), entry=0x401000)
+    right = _make_code_elf(tmp_path / "right.bin", bytes.fromhex("c3"), entry=0x401010)
+
+    diff = diff_binaries(left, right, semantic=True, threshold=0.0)
+
+    assert diff.functions_changed == ()
+    assert [delta.address for delta in diff.functions_removed] == [0x401000]
+    assert [delta.address for delta in diff.functions_added] == [0x401010]
+
+
+def test_deep_and_semantic_caveat_names_both_modes(tmp_path: Path) -> None:
+    left = _make_code_elf(tmp_path / "left.bin", MOV_RET_42, entry=0x401000)
+    right = _make_code_elf(tmp_path / "right.bin", MOV_RET_42, entry=0x401010)
+
+    diff = diff_binaries(left, right, deep=True, semantic=True)
+
+    detail = diff.evidence.detail
+    assert "instruction shapes" in detail
+    assert "similarity" in detail
+
+
+def test_diff_binaries_validates_threshold_before_loading(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.bin"
+
+    with pytest.raises(AnalysisError, match="threshold"):
+        diff_binaries(missing, missing, semantic=True, threshold=2.0)

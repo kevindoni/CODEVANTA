@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -15,6 +16,15 @@ from rich.table import Table
 
 from codevanta.analysis.binary_diff import (
     DEFAULT_MAX_FUNCTIONS as DIFF_MAX_FUNCTIONS,
+)
+from codevanta.analysis.binary_diff import (
+    DEFAULT_SEMANTIC_THRESHOLD as DIFF_SEMANTIC_THRESHOLD,
+)
+from codevanta.analysis.binary_diff import (
+    MAX_SEMANTIC_THRESHOLD as DIFF_MAX_THRESHOLD,
+)
+from codevanta.analysis.binary_diff import (
+    MIN_SEMANTIC_THRESHOLD as DIFF_MIN_THRESHOLD,
 )
 from codevanta.analysis.binary_diff import BinaryDiff, FunctionDelta, diff_binaries
 from codevanta.analysis.callgraph import (
@@ -467,6 +477,23 @@ def _digest_cell(delta: FunctionDelta) -> str:
     return f"{delta.left_digest[:_DIGEST_PREVIEW]} -> {delta.right_digest[:_DIGEST_PREVIEW]}"
 
 
+def _similarity_line(delta: FunctionDelta) -> str:
+    """Render one semantic pairing as ``0x401000 -> 0x401010 ... similarity 1.0000``.
+
+    Only deltas carrying a ``similarity`` reach this renderer, so both metadata
+    snapshots are set and the two addresses are the move the score paired. The
+    score keeps four decimals, matching :attr:`FunctionDelta.similarity` and the
+    JSON report, so the text and the payload cannot disagree.
+    """
+    left = "-" if delta.left is None else str(delta.left.get("address", "-"))
+    right = "-" if delta.right is None else str(delta.right.get("address", "-"))
+    score = 0.0 if delta.similarity is None else delta.similarity
+    return (
+        f"semantic pair {left} -> {right} "
+        f"({delta.name or '<unknown>'}): similarity {score:.4f}"
+    )
+
+
 def _print_binary_diff(result: BinaryDiff) -> None:
     """Print a :class:`BinaryDiff` as an identity panel plus two tables.
 
@@ -474,7 +501,9 @@ def _print_binary_diff(result: BinaryDiff) -> None:
     sections, imports and exports; the second lists the individual name deltas.
     The function delta table then carries the address, name and change of every
     candidate the comparison could not match, plus -- when deep mode
-    fingerprinted the pair -- the truncated content digests of both sides.
+    fingerprinted the pair -- the truncated content digests of both sides. A
+    pairing made by semantic mode adds no column: its score is printed as one
+    dim detail line per pair, so the table keeps its shape.
     """
     header = Table.grid(padding=(0, 2))
     header.add_column(style="bold cyan")
@@ -528,6 +557,7 @@ def _print_binary_diff(result: BinaryDiff) -> None:
         show_digests = any(
             delta.left_digest is not None or delta.right_digest is not None for delta in deltas
         )
+        scored = [delta for delta in deltas if delta.similarity is not None]
         functions = Table(title=f"Function deltas ({len(deltas)})")
         functions.add_column("Address", justify="right")
         functions.add_column("Name")
@@ -550,10 +580,36 @@ def _print_binary_diff(result: BinaryDiff) -> None:
                 f"{_DIGEST_PREVIEW} hex characters of the normalized shape SHA-256; "
                 "equal digests are not byte equality[/]"
             )
+        if scored:
+            for delta in scored:
+                console.print(f"[dim]{escape(_similarity_line(delta))}[/]")
+            console.print(
+                "[dim]pairs are decoded instruction-shape overlaps, "
+                "not proof the functions are the same code[/]"
+            )
     else:
         console.print("[dim]no function deltas[/]")
     for warning in result.warnings:
         console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+def _diff_threshold(value: float) -> float:
+    """Validate ``--threshold`` and return it as a float, or exit 2.
+
+    The bound is checked before either binary is loaded, so an out-of-range
+    value fails as an input error instead of after a potentially expensive
+    parse -- and it is checked even when ``--semantic`` is off, because a
+    silently ignored value would change behaviour the moment semantic matching
+    is switched on. ``nan``/``inf`` are rejected alongside the finite range
+    because the comparison would otherwise be silently always-false.
+    """
+    if not math.isfinite(value) or not (DIFF_MIN_THRESHOLD <= value <= DIFF_MAX_THRESHOLD):
+        _fail(
+            f"invalid threshold {value!r}; expected a number within "
+            f"{DIFF_MIN_THRESHOLD} .. {DIFF_MAX_THRESHOLD}",
+            2,
+        )
+    return float(value)
 
 
 @app.command()
@@ -573,6 +629,27 @@ def diff(
             help="Also compare the normalized content of address-matched functions",
         ),
     ] = False,
+    semantic: Annotated[
+        bool,
+        typer.Option(
+            "--semantic",
+            help=(
+                "Also pair the functions left unpaired by address and name when "
+                "their normalized instruction shapes score at least --threshold"
+            ),
+        ),
+    ] = False,
+    threshold: Annotated[
+        float,
+        typer.Option(
+            "--threshold",
+            help=(
+                "Smallest shape-similarity score that may pair two leftovers "
+                f"({DIFF_MIN_THRESHOLD} .. {DIFF_MAX_THRESHOLD}, "
+                f"default {DIFF_SEMANTIC_THRESHOLD})"
+            ),
+        ),
+    ] = DIFF_SEMANTIC_THRESHOLD,
     json_output: Annotated[
         bool, typer.Option("--json", help="Emit the JSON result instead of tables")
     ] = False,
@@ -592,10 +669,30 @@ def diff(
     ``added``/``removed`` pairs are not fingerprinted and keep ``-``. Equal
     digests are not byte equality and different digests are not a semantic
     difference, so the metadata verdict is never upgraded to "equivalent".
+
+    ``--semantic`` reads the decoded instruction shapes of the functions that
+    address and name matching left unpaired and pairs them when their score
+    reaches ``--threshold`` (default 0.9, valid range 0.0 .. 1.0; anything else
+    exits 2 before a file is loaded). A paired move becomes one ``changed``
+    entry and its score is printed as a dim ``semantic pair`` detail line under
+    the unchanged function table. Every unpaired candidate keeps its structural
+    verdict, so semantic mode can only merge a removal with an addition, never
+    hide one. An overlap is evidence of similar decoded shapes, not proof that
+    two functions are the same code.
     """
+    effective_threshold = _diff_threshold(threshold)
     try:
-        result = diff_binaries(left, right, max_functions=max_functions, deep=deep)
+        result = diff_binaries(
+            left,
+            right,
+            max_functions=max_functions,
+            deep=deep,
+            semantic=semantic,
+            threshold=effective_threshold,
+        )
     except BinaryLoadError as exc:
+        _fail(str(exc), 2)
+    except AnalysisError as exc:
         _fail(str(exc), 2)
     if json_output:
         console.print_json(json.dumps(result.to_dict()))
@@ -819,19 +916,41 @@ def _struct_array_line(group: ArrayGroup) -> str:
     )
 
 
+def _struct_signed_text(result: StructSuggestion) -> str:
+    """Render the signedness hints of ``result`` as one footer value.
+
+    Only fields with evidence contribute, so a field whose offset was never
+    touched by a sign- or zero-extending mnemonic stays out of the line, and a
+    suggestion without any hint reports ``none`` -- meaning "no signedness
+    evidence", never "safe". Contradictory offsets are already collapsed to
+    ``signed=None`` (with a warning) by the analysis layer, so they read as
+    unknown here too. Offsets are named in hex, order preserved from the table.
+    """
+    hints = [
+        f"{_struct_offset_cell(field.offset)} "
+        f"{'signed' if field.signed else 'unsigned'}"
+        for field in result.fields
+        if field.signed is not None
+    ]
+    return ", ".join(hints) or "none"
+
+
 def _print_struct_layout(result: StructSuggestion) -> None:
     """Print the alignment line and one line per array candidate.
 
     ``arrays: none`` stands in for the absent group lines, so the footer always
     says whether a run was found. Both texts go through :func:`escape` because
-    they are assembled from analysis data.
+    they are assembled from analysis data. The closing ``signed:`` line follows
+    the same rule: it lists the offsets that carry a signedness hint (or
+    ``none``), keeping the hint out of the table columns.
     """
     console.print(f"[dim]alignment: {escape(_struct_alignment_text(result))}[/]")
-    if not result.array_groups:
+    if result.array_groups:
+        for group in result.array_groups:
+            console.print(f"[dim]{escape(_struct_array_line(group))}[/]")
+    else:
         console.print("[dim]arrays: none[/]")
-        return
-    for group in result.array_groups:
-        console.print(f"[dim]{escape(_struct_array_line(group))}[/]")
+    console.print(f"[dim]signed: {escape(_struct_signed_text(result))}[/]")
 
 
 def _print_struct_suggestion(
@@ -916,13 +1035,16 @@ def struct(
     number of offsets kept (the rest are dropped and reported as truncated).
 
     ``--json`` emits ``StructSuggestion.to_dict()`` unchanged, which already
-    carries the derived ``alignment`` and ``array_groups``. The table adds a
-    footer naming the base registers seen, the field and instruction counts, the
-    truncation flag, the inferred ``alignment`` (``unknown`` when fewer than two
-    distinct non-zero offsets were seen) and one ``array at 0x..`` line per array
-    candidate -- ``arrays: none`` when no run was found -- followed by one
-    ``warning:`` line per limitation. Load and input errors -- unreadable file,
-    bad address, unknown function, address outside an executable section -- exit 2.
+    carries the derived ``alignment``, ``array_groups`` and per-field ``signed``
+    hint. The table adds a footer naming the base registers seen, the field and
+    instruction counts, the truncation flag, the inferred ``alignment``
+    (``unknown`` when fewer than two distinct non-zero offsets were seen), one
+    ``array at 0x..`` line per array candidate -- ``arrays: none`` when no run
+    was found -- and one ``signed:`` line listing the offsets whose mnemonics
+    hinted a signed or unsigned access (``none`` when nothing hinted), followed
+    by one ``warning:`` line per limitation. Load and input errors -- unreadable
+    file, bad address, unknown function, address outside an executable section --
+    exit 2.
     """
     start_address = None if address is None else _parse_address(address)
     loaded = _load(path)
