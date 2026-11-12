@@ -4,7 +4,6 @@
 >
 > **Decode. Analyze. Understand.**
 
-[🇮🇩 Bahasa Indonesia](README.id.md) · 🇬🇧 English
 
 CODEVANTA is an **AI-powered code intelligence, reverse engineering, and binary analysis platform**. It helps engineers, security researchers, and analysts understand software faster—from source code to executables with missing symbols or incomplete documentation.
 
