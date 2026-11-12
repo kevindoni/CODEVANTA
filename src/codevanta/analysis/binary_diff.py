@@ -27,6 +27,22 @@ every bound that cuts work short is reported through ``warnings``. Functions
 matched by name after moving, and one-sided functions, are fingerprinted by
 neither side of deep mode and keep their structural verdict.
 
+``semantic=True`` adds a *pairing* signal rather than a new structural rule.
+After address and name matching, the candidates still unpaired on both sides are
+scored with :func:`~codevanta.analysis.function_hash.function_similarity` -- the
+multiset overlap of their normalized instruction shapes -- and the
+highest-scoring pairs at or above ``threshold`` (default
+:data:`DEFAULT_SEMANTIC_THRESHOLD`) are reported as one ``changed`` entry each,
+carrying that ``similarity`` (rounded to four decimals). Leftovers that are not
+paired keep their structural ``added``/``removed`` verdict, so semantic mode
+never hides a one-sided function; it can only turn a remove-plus-add pair into
+one change.
+Because every score decodes both regions, the pass is bounded twice: at most
+:data:`MAX_SEMANTIC_PAIRS` candidate pairs are scored -- the pass is skipped,
+with a warning, when the leftover cross product is larger -- and one score
+decodes at most :data:`SEMANTIC_MAX_INSTRUCTIONS` instructions per side. A score
+is a *shape* overlap, never proof that two functions are the same code.
+
 Matching rules, in order:
 
 1. **By address.** Candidates that share a virtual address are the same
@@ -36,7 +52,11 @@ Matching rules, in order:
 2. **By name.** Candidates left over on both sides are matched by name, so a
    function that was relocated is reported as one ``changed`` entry (with the
    old and new address) instead of one removal plus one addition.
-3. **Everything left over** on the left is ``removed`` and on the right is
+3. **By content similarity** (only with ``semantic=True``). The candidates still
+   left over on both sides are paired greedily, highest score first, while the
+   score is at least ``threshold`` and neither side has been used yet. Each pair
+   is reported as one ``changed`` entry carrying ``similarity``.
+4. **Everything left over** on the left is ``removed`` and on the right is
    ``added``.
 
 Sections are compared by name, imports by ``(library, name)`` and exports by
@@ -51,6 +71,8 @@ same inputs always produce the same output.
 
 from __future__ import annotations
 
+import math
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +81,7 @@ from typing import Any, Literal
 from codevanta.analysis.function_hash import (
     DEFAULT_MAX_INSTRUCTIONS,
     function_fingerprint,
+    normalized_tokens,
 )
 from codevanta.core.functions import FunctionCandidate, discover_functions
 from codevanta.core.loader import BinaryInfo, BinaryLoader
@@ -68,10 +91,15 @@ from codevanta.evidence.models import Evidence
 
 __all__ = [
     "DEFAULT_MAX_FUNCTIONS",
+    "DEFAULT_SEMANTIC_THRESHOLD",
     "DEEP_MAX_INSTRUCTIONS",
     "MAX_DEEP_FINGERPRINTS",
     "MAX_MAX_FUNCTIONS",
+    "MAX_SEMANTIC_PAIRS",
+    "MAX_SEMANTIC_THRESHOLD",
     "MIN_MAX_FUNCTIONS",
+    "MIN_SEMANTIC_THRESHOLD",
+    "SEMANTIC_MAX_INSTRUCTIONS",
     "BinaryDiff",
     "FunctionDelta",
     "diff_binaries",
@@ -98,9 +126,36 @@ MAX_DEEP_FINGERPRINTS = 1_000
 #: fingerprint taken during a diff matches one taken on its own.
 DEEP_MAX_INSTRUCTIONS = DEFAULT_MAX_INSTRUCTIONS
 
+#: Default minimum shape-similarity score for semantic pairing.
+DEFAULT_SEMANTIC_THRESHOLD = 0.9
+
+#: Smallest accepted ``threshold``; anything lower is rejected.
+MIN_SEMANTIC_THRESHOLD = 0.0
+
+#: Largest accepted ``threshold``; anything higher is rejected.
+MAX_SEMANTIC_THRESHOLD = 1.0
+
+#: Largest number of leftover function pairs scored in semantic mode. Scoring a
+#: pair is scored from tokens decoded once per leftover, so the pass needs a bound
+#: of its own: when the leftover cross product is larger, semantic pairing is
+#: skipped (with a warning)
+#: and every leftover keeps its structural ``added``/``removed`` verdict.
+MAX_SEMANTIC_PAIRS = 4_096
+
+#: Instruction ceiling per side for one semantic similarity score. Equal to
+#: :data:`~codevanta.analysis.function_hash.DEFAULT_MAX_INSTRUCTIONS`, so a score
+#: taken during a diff matches one taken on its own.
+SEMANTIC_MAX_INSTRUCTIONS = DEFAULT_MAX_INSTRUCTIONS
+
+#: Decimals kept in :attr:`FunctionDelta.similarity`, matching the rounding
+#: ``SimilarityResult.to_dict()`` applies, so the field, the evidence note and the
+#: JSON report cannot disagree about a score.
+_SIMILARITY_DECIMALS = 4
+
 #: ``"added"`` and ``"removed"`` are one-sided; ``"changed"`` covers a metadata
 #: edit at the same address, a differing content fingerprint at the same address
-#: (deep mode), and a relocation matched by name.
+#: (deep mode), a relocation matched by name, and a pair matched by shape
+#: similarity (semantic mode).
 ChangeKind = Literal["added", "removed", "changed"]
 
 _EVIDENCE_SOURCE = "binary_diff.structural"
@@ -113,6 +168,11 @@ _CONTENT_CAVEAT = (
     "structural metadata plus normalized instruction shapes: numeric literals were masked to "
     "'#', so equal digests are not byte equality and different digests are not a semantic "
     "difference; nothing was executed"
+)
+_SIMILARITY_CAVEAT = (
+    "structural metadata plus normalized instruction-shape similarity: numeric literals were "
+    "masked to '#', so a pairing is a shape overlap of decoded instructions and not proof that "
+    "two functions are the same code; nothing was executed"
 )
 
 
@@ -138,6 +198,11 @@ class FunctionDelta:
             set only by deep mode and only when the pair was fingerprinted.
         right_digest: Same for the right-hand function. ``left_digest`` and
             ``right_digest`` are always both set or both ``None``.
+        similarity: Shape-similarity score (``0.0 .. 1.0``) of the pair, set only
+            by semantic mode and only for a pair that was matched by that score.
+            Rounded to four decimals; ``None`` on every structurally matched
+            delta, including a name-matched relocation, because those were not
+            scored.
     """
 
     address: int
@@ -148,6 +213,7 @@ class FunctionDelta:
     evidence: Evidence
     left_digest: str | None = None
     right_digest: str | None = None
+    similarity: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"address": f"0x{self.address:x}", "change": self.change}
@@ -161,6 +227,8 @@ class FunctionDelta:
             data["left_digest"] = self.left_digest
         if self.right_digest is not None:
             data["right_digest"] = self.right_digest
+        if self.similarity is not None:
+            data["similarity"] = self.similarity
         data["evidence"] = self.evidence.to_dict()
         return data
 
@@ -178,8 +246,9 @@ class BinaryDiff:
         functions_added: Candidates present only on the right.
         functions_removed: Candidates present only on the left.
         functions_changed: Candidates matched by address with different metadata
-            or -- in deep mode -- a different normalized content fingerprint, or
-            matched by name after moving.
+            or -- in deep mode -- a different normalized content fingerprint,
+            matched by name after moving, or -- in semantic mode -- paired by
+            instruction-shape similarity.
         sections_added: Section names present only on the right.
         sections_removed: Section names present only on the left.
         imports_added: Imports present only on the right, as ``"lib!name"`` when
@@ -189,8 +258,9 @@ class BinaryDiff:
         exports_removed: Export names present only on the left.
         evidence: Evidence describing the comparison as a whole, with the
             applicable caveat (structural, or structural plus normalized
-            content in deep mode), the effective ``max_functions`` bound, and the
-            deep-mode bounds when deep mode ran.
+            content in deep mode, or structural plus shape similarity in semantic
+            mode), the effective ``max_functions`` bound, and the deep-mode or
+            semantic-mode bounds when that mode ran.
         warnings: Non-fatal problems, including truncation notices.
     """
 
@@ -294,6 +364,34 @@ def _clamp_limit(requested: int, warnings: list[str]) -> int:
     return requested
 
 
+def _validate_threshold(threshold: float) -> float:
+    """Return ``threshold`` as a float, rejecting values outside ``0.0 .. 1.0``.
+
+    The threshold is validated in every mode, not only with ``semantic=True``, so
+    a caller never gets a silently ignored out-of-range value that would behave
+    differently the moment semantic matching is switched on.
+
+    Args:
+        threshold: Smallest similarity score that may pair two functions.
+
+    Returns:
+        The threshold as a ``float``.
+
+    Raises:
+        AnalysisError: When ``threshold`` is not a finite number in
+            ``MIN_SEMANTIC_THRESHOLD .. MAX_SEMANTIC_THRESHOLD``.
+    """
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise AnalysisError(f"threshold must be a number, got {threshold!r}")
+    value = float(threshold)
+    if not math.isfinite(value) or not (MIN_SEMANTIC_THRESHOLD <= value <= MAX_SEMANTIC_THRESHOLD):
+        raise AnalysisError(
+            f"threshold must be within {MIN_SEMANTIC_THRESHOLD} .. "
+            f"{MAX_SEMANTIC_THRESHOLD}, got {threshold!r}"
+        )
+    return value
+
+
 def _bounded(
     functions: Sequence[FunctionCandidate],
     limit: int,
@@ -349,6 +447,7 @@ def _delta(
     caveat: str = _CAVEAT,
     left_digest: str | None = None,
     right_digest: str | None = None,
+    similarity: float | None = None,
 ) -> FunctionDelta:
     """Assemble one :class:`FunctionDelta` with its caveated evidence record."""
     primary = right if right is not None else left
@@ -367,6 +466,7 @@ def _delta(
         ),
         left_digest=left_digest,
         right_digest=right_digest,
+        similarity=similarity,
     )
 
 
@@ -431,11 +531,172 @@ def _address_digests(
     return digests
 
 
+@dataclass(frozen=True)
+class _SemanticRequest:
+    """Inputs needed to pair leftover functions by shape similarity.
+
+    Attributes:
+        left_info: Metadata of the left-hand binary; its ``path`` is read for
+            the left-hand scores (read-only, never executed).
+        right_info: Metadata of the right-hand binary, same contract.
+        threshold: Smallest score that may pair two candidates.
+        warnings: Warning sink shared with the enclosing diff, so every bound
+            that cuts the pass short reaches the caller.
+    """
+
+    left_info: BinaryInfo
+    right_info: BinaryInfo
+    threshold: float
+    warnings: list[str]
+
+
+def _semantic_pairs(
+    left_leftovers: Sequence[FunctionCandidate],
+    right_leftovers: Sequence[FunctionCandidate],
+    request: _SemanticRequest,
+) -> list[tuple[FunctionCandidate, FunctionCandidate, float]]:
+    """Pair leftover candidates greedily by normalized instruction similarity.
+
+    Each leftover is decoded once with
+    :func:`~codevanta.analysis.function_hash.normalized_tokens` and its token
+    multiset is kept, so scoring the cross product costs one multiset overlap per
+    pair instead of a fresh decode per pair. Pairs are then considered from the
+    highest score down and taken while the score rounds to at least the threshold
+    and neither candidate has been paired already. A greedy pass keeps the result
+    deterministic and mutually exclusive: one candidate never appears in two
+    deltas.
+
+    Work is bounded before it starts: the leftover cross product must fit in
+    :data:`MAX_SEMANTIC_PAIRS`, otherwise nothing is scored and a warning says
+    so. Each decode is bounded by :data:`SEMANTIC_MAX_INSTRUCTIONS` instructions.
+    A leftover that cannot be decoded (unreadable file, address outside an
+    executable section, undecodable architecture) is skipped rather than raised,
+    so one bad candidate never loses the whole comparison.
+
+    Args:
+        left_leftovers: Left-hand candidates no structural rule matched.
+        right_leftovers: Right-hand candidates no structural rule matched.
+        request: Bounds, metadata and warning sink for the pass.
+
+    Returns:
+        ``(left, right, score)`` triples in descending score order, each pair
+        reported at the right-hand candidate's address by the caller. ``score`` is
+        rounded to ``_SIMILARITY_DECIMALS`` decimals and the threshold is compared
+        at the same precision, so a reported score never falls below the
+        threshold that authorised it; the ordering uses the unrounded value. A
+        pair is never accepted at a rounded score of ``0.0``, so leftovers that
+        share no token stay ``added``/``removed`` even with ``threshold=0.0``.
+    """
+    if not left_leftovers or not right_leftovers:
+        return []
+    left_sorted = sorted(left_leftovers, key=_sort_key)
+    right_sorted = sorted(right_leftovers, key=_sort_key)
+    total_pairs = len(left_sorted) * len(right_sorted)
+    if total_pairs > MAX_SEMANTIC_PAIRS:
+        request.warnings.append(
+            f"semantic matching skipped: {len(left_sorted)} left and {len(right_sorted)} "
+            f"right leftover function(s) need {total_pairs} pair comparison(s), more than "
+            f"MAX_SEMANTIC_PAIRS={MAX_SEMANTIC_PAIRS}; every leftover keeps its "
+            "added/removed verdict"
+        )
+        return []
+
+    left_counts: dict[int, Counter[str]] = {}
+    right_counts: dict[int, Counter[str]] = {}
+    failed = 0
+    first_error: str | None = None
+    for candidate in left_sorted:
+        try:
+            left_counts[candidate.address] = Counter(
+                normalized_tokens(
+                    request.left_info.path,
+                    request.left_info,
+                    candidate.address,
+                    SEMANTIC_MAX_INSTRUCTIONS,
+                )
+            )
+        except (AnalysisError, OSError) as exc:
+            failed += 1
+            if first_error is None:
+                first_error = str(exc)
+    for candidate in right_sorted:
+        try:
+            right_counts[candidate.address] = Counter(
+                normalized_tokens(
+                    request.right_info.path,
+                    request.right_info,
+                    candidate.address,
+                    SEMANTIC_MAX_INSTRUCTIONS,
+                )
+            )
+        except (AnalysisError, OSError) as exc:
+            failed += 1
+            if first_error is None:
+                first_error = str(exc)
+
+    if failed:
+        request.warnings.append(
+            f"semantic matching: {failed} function(s) could not be scored and were left "
+            f"unmatched (first error: {first_error})"
+        )
+
+    # One decode per leftover: the cross product only overlaps the kept multisets,
+    # so the pass is quadratic in comparisons but linear in decoding.
+    truncated_sides = sum(
+        1
+        for counts in (*left_counts.values(), *right_counts.values())
+        if sum(counts.values()) >= SEMANTIC_MAX_INSTRUCTIONS
+    )
+    if truncated_sides:
+        request.warnings.append(
+            f"semantic matching: {truncated_sides} function(s) were decoded only up to "
+            f"SEMANTIC_MAX_INSTRUCTIONS={SEMANTIC_MAX_INSTRUCTIONS} instructions, so their "
+            "scores compare prefixes"
+        )
+
+    scored: list[tuple[float, FunctionCandidate, FunctionCandidate]] = []
+    for left_candidate in left_sorted:
+        left_count = left_counts.get(left_candidate.address)
+        if left_count is None:
+            continue
+        for right_candidate in right_sorted:
+            right_count = right_counts.get(right_candidate.address)
+            if right_count is None:
+                continue
+            union = sum((left_count | right_count).values())
+            if not union:
+                # Defensive: a decoded region always carries tokens, but a union of
+                # zero would turn every score into 0/0.
+                continue
+            shared = sum((left_count & right_count).values())
+            scored.append((shared / union, left_candidate, right_candidate))
+
+    scored.sort(key=lambda item: (-item[0], item[1].address, item[2].address))
+    rounded_threshold = round(request.threshold, _SIMILARITY_DECIMALS)
+    used_left: set[int] = set()
+    used_right: set[int] = set()
+    pairs: list[tuple[FunctionCandidate, FunctionCandidate, float]] = []
+    for score, left_candidate, right_candidate in scored:
+        rounded_score = round(score, _SIMILARITY_DECIMALS)
+        if rounded_score <= 0.0 or rounded_score < rounded_threshold:
+            # Scores are sorted descending, so no later pair can qualify either.
+            # A rounded zero means the pair shares no token: pairing it would claim
+            # a likeness the score denies.
+            break
+        if left_candidate.address in used_left or right_candidate.address in used_right:
+            continue
+        used_left.add(left_candidate.address)
+        used_right.add(right_candidate.address)
+        pairs.append((left_candidate, right_candidate, rounded_score))
+    return pairs
+
+
 def _diff_functions(
     left: Sequence[FunctionCandidate],
     right: Sequence[FunctionCandidate],
     left_digests: Mapping[int, str] | None = None,
     right_digests: Mapping[int, str] | None = None,
+    semantic: _SemanticRequest | None = None,
 ) -> tuple[tuple[FunctionDelta, ...], tuple[FunctionDelta, ...], tuple[FunctionDelta, ...]]:
     """Diff two bounded candidate lists.
 
@@ -445,6 +706,9 @@ def _diff_functions(
         left_digests: Optional address-to-digest map for the left side (deep
             mode). Addresses missing from the map keep their structural verdict.
         right_digests: Same for the right side.
+        semantic: Optional request enabling the similarity pass over candidates
+            that address and name matching left unpaired. ``None`` keeps the
+            structural verdict for those candidates.
 
     Returns:
         ``(added, removed, changed)`` tuples, each sorted by address.
@@ -540,7 +804,41 @@ def _diff_functions(
             )
         )
 
-    # Pass 3: whatever is left is one-sided.
+    # Pass 3 (semantic mode only): pair what is left by shape similarity. Only
+    # candidates no structural rule matched are eligible, so the pass can turn a
+    # remove-plus-add pair into one change but never overrides an address or name
+    # match.
+    if semantic is not None:
+        right_leftover = [
+            candidate
+            for candidate in sorted(right_unmatched, key=_sort_key)
+            if candidate.address not in matched_right
+        ]
+        pairs = _semantic_pairs(still_left, right_leftover, semantic)
+        if pairs:
+            paired_left = {candidate.address for candidate, _partner, _score in pairs}
+            matched_right.update(partner.address for _candidate, partner, _score in pairs)
+            still_left = [
+                candidate for candidate in still_left if candidate.address not in paired_left
+            ]
+            for left_candidate, right_candidate, score in pairs:
+                changed.append(
+                    _delta(
+                        "changed",
+                        right_candidate.address,
+                        left_candidate,
+                        right_candidate,
+                        f"paired by instruction-shape similarity {score:.4f} >= "
+                        f"threshold {semantic.threshold:.4f}, moving from "
+                        f"0x{left_candidate.address:x} to 0x{right_candidate.address:x}; "
+                        "the score compares normalized shapes, it is not proof that the two "
+                        "functions are the same code",
+                        caveat=_SIMILARITY_CAVEAT,
+                        similarity=score,
+                    )
+                )
+
+    # Pass 4: whatever is left is one-sided.
     for candidate in still_left:
         removed.append(
             _delta(
@@ -601,14 +899,18 @@ def diff_infos(
     right_functions: Sequence[FunctionCandidate],
     max_functions: int = DEFAULT_MAX_FUNCTIONS,
     deep: bool = False,
+    semantic: bool = False,
+    threshold: float = DEFAULT_SEMANTIC_THRESHOLD,
 ) -> BinaryDiff:
     """Compare two loaded binaries and their function candidates.
 
-    Structural and pure by default: with ``deep=False`` nothing is read from disk
-    or executed, and the input sequences are never mutated. With ``deep=True`` the
-    function bytes of both sides are read (never executed) to fingerprint the
-    address-matched functions; see the module docstring for what that adds and
-    what it does not.
+    Structural and pure by default: with ``deep=False`` and ``semantic=False``
+    nothing is read from disk or executed, and the input sequences are never
+    mutated. With ``deep=True`` the function bytes of both sides are read (never
+    executed) to fingerprint the address-matched functions; with ``semantic=True``
+    they are read to score the functions that address and name matching left
+    unpaired. See the module docstring for what each mode adds and what it does
+    not.
 
     Args:
         left_info: Metadata of the left-hand (baseline) binary.
@@ -622,11 +924,25 @@ def diff_infos(
         deep: When true, also fingerprint address-matched functions and report a
             differing normalized fingerprint as ``"changed"`` with both digests
             and a content note.
+        semantic: When true, also pair the candidates that address and name
+            matching left unpaired when their normalized instruction shapes score
+            at least ``threshold``. A pair becomes one ``"changed"`` delta
+            carrying ``similarity``; every candidate that is not paired keeps its
+            ``"added"``/``"removed"`` verdict.
+        threshold: Smallest similarity score that may pair two leftovers, in
+            ``[MIN_SEMANTIC_THRESHOLD, MAX_SEMANTIC_THRESHOLD]``. Validated in
+            every mode, so an out-of-range value raises even with
+            ``semantic=False``.
 
     Returns:
         A :class:`BinaryDiff` whose ``identical`` flag is ``True`` only when no
         function, section, import or export delta was observed.
+
+    Raises:
+        AnalysisError: When ``threshold`` is not a finite number within
+            ``0.0 .. 1.0``.
     """
+    effective_threshold = _validate_threshold(threshold)
     warnings: list[str] = []
     limit = _clamp_limit(max_functions, warnings)
     left_bounded = _bounded(left_functions, limit, "left", warnings)
@@ -650,7 +966,18 @@ def diff_infos(
         right_digests = _address_digests(right_info, right_bounded, matched, "right", warnings)
 
     functions_added, functions_removed, functions_changed = _diff_functions(
-        left_bounded, right_bounded, left_digests, right_digests
+        left_bounded,
+        right_bounded,
+        left_digests,
+        right_digests,
+        _SemanticRequest(
+            left_info=left_info,
+            right_info=right_info,
+            threshold=effective_threshold,
+            warnings=warnings,
+        )
+        if semantic
+        else None,
     )
 
     left_sections = _section_names(left_info)
@@ -683,10 +1010,20 @@ def diff_infos(
     )
 
     extra: dict[str, Any] = {"max_functions": limit}
+    caveat = _CAVEAT
     if deep:
         extra["deep"] = True
         extra["deep_instructions"] = DEEP_MAX_INSTRUCTIONS
         extra["max_deep_fingerprints"] = MAX_DEEP_FINGERPRINTS
+        caveat = _CONTENT_CAVEAT
+    if semantic:
+        extra["semantic"] = True
+        extra["semantic_threshold"] = effective_threshold
+        extra["semantic_instructions"] = SEMANTIC_MAX_INSTRUCTIONS
+        extra["max_semantic_pairs"] = MAX_SEMANTIC_PAIRS
+        # Both modes read instruction shapes, so the record must keep saying that
+        # the content comparison ran instead of dropping its caveat.
+        caveat = f"{_CONTENT_CAVEAT}; {_SIMILARITY_CAVEAT}" if deep else _SIMILARITY_CAVEAT
     return BinaryDiff(
         left_path=str(left_info.path),
         right_path=str(right_info.path),
@@ -704,7 +1041,7 @@ def diff_infos(
             source=_EVIDENCE_SOURCE,
             method=_EVIDENCE_METHOD,
             confidence=Confidence.MEDIUM,
-            detail=_CONTENT_CAVEAT if deep else _CAVEAT,
+            detail=caveat,
             extra=extra,
         ),
         warnings=tuple(warnings),
@@ -716,6 +1053,8 @@ def diff_binaries(
     right_path: str | Path,
     max_functions: int = DEFAULT_MAX_FUNCTIONS,
     deep: bool = False,
+    semantic: bool = False,
+    threshold: float = DEFAULT_SEMANTIC_THRESHOLD,
 ) -> BinaryDiff:
     """Load two binaries with LIEF and return their structural difference.
 
@@ -730,10 +1069,22 @@ def diff_binaries(
         deep: When true, also compare the normalized content of address-matched
             functions (their bytes are read, never executed); see
             :func:`diff_infos`.
+        semantic: When true, also pair the functions that address and name
+            matching left unpaired when their normalized instruction shapes score
+            at least ``threshold``; see :func:`diff_infos`.
+        threshold: Smallest similarity score that may pair two leftovers, in
+            ``0.0 .. 1.0``; see :func:`diff_infos`.
 
     Returns:
         The :class:`BinaryDiff` produced by :func:`diff_infos`.
+
+    Raises:
+        AnalysisError: When ``threshold`` is not a finite number within
+            ``0.0 .. 1.0``.
     """
+    # Validate before parsing: a bad threshold must not cost two full loads, and a
+    # missing or unreadable file must not mask the threshold error.
+    effective_threshold = _validate_threshold(threshold)
     loader = BinaryLoader()
     left_info = loader.load(left_path)
     right_info = loader.load(right_path)
@@ -744,4 +1095,6 @@ def diff_binaries(
         discover_functions(right_info),
         max_functions=max_functions,
         deep=deep,
+        semantic=semantic,
+        threshold=effective_threshold,
     )

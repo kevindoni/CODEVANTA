@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import struct
+import warnings
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from codevanta.analysis.type_recovery import (
     WRITE,
     ArrayGroup,
     FieldAccess,
+    SignednessConflictWarning,
     StructSuggestion,
     parse_memory_operands,
     suggest_struct,
@@ -95,6 +97,36 @@ TWO_ARRAY_RUNS = (
     + MOV_ECX_RDI_40
     + RET
 )
+
+#: ``movsx rax, word ptr [rdi + 0x10]`` -- sign-extending read of field 0x10.
+MOVSX_RAX_RDI_10 = bytes.fromhex("480fbf4710")
+
+#: ``movsxd rax, dword ptr [rdi + 0x10]`` -- sign-extending read of field 0x10.
+MOVSXD_RAX_RDI_10 = bytes.fromhex("48634710")
+
+#: ``movzx eax, word ptr [rdi + 0x10]`` -- zero-extending read of field 0x10.
+MOVZX_EAX_RDI_10 = bytes.fromhex("0fb74710")
+
+#: ``movzx eax, word ptr [rdi + 0x18]`` -- zero-extending read of field 0x18.
+MOVZX_EAX_RDI_18 = bytes.fromhex("0fb74718")
+
+#: ``sar dword ptr [rdi + 4], 1`` -- signed read-modify-write of field 4.
+SAR_RDI_4 = bytes.fromhex("c17f0401")
+
+#: ``shr dword ptr [rdi + 8], 1`` -- unsigned read-modify-write of field 8.
+SHR_RDI_8 = bytes.fromhex("d16f08")
+
+#: ``idiv qword ptr [rdi + 0x10]`` -- signed division by field 0x10.
+IDIV_RDI_10 = bytes.fromhex("48f77f10")
+
+#: ``mul qword ptr [rdi + 0x18]`` -- unsigned multiplication by field 0x18.
+MUL_RDI_18 = bytes.fromhex("48f76718")
+
+#: ``cqo`` -- a signedness mnemonic with only implicit operands, no memory access.
+CQO = bytes.fromhex("4899")
+
+#: One offset read as a signed *and* as an unsigned value: a contradiction.
+MIXED_SIGNEDNESS = MOVSX_RAX_RDI_10 + MOVZX_EAX_RDI_10 + RET
 
 
 def _make_elf64(path: Path, code: bytes, data: bytes = b"", entry: int = TEXT_VA) -> Path:
@@ -426,4 +458,133 @@ def test_alignment_and_array_groups_are_deterministic(tmp_path: Path) -> None:
     assert first == second
     assert first.alignment == second.alignment == 8
     assert first.array_groups == second.array_groups
+
+
+# ---- Signedness classification ---------------------------------------------
+
+
+def test_sign_extending_read_marks_the_field_signed(tmp_path: Path) -> None:
+    result = _suggest(tmp_path / "movsx.bin", MOVSX_RAX_RDI_10 + RET)
+
+    assert [(f.offset, f.width, f.signed) for f in result.fields] == [(0x10, 2, True)]
+    assert result.fields[0].evidence.extra["signed"] is True
+
+
+def test_zero_extending_read_marks_the_field_unsigned(tmp_path: Path) -> None:
+    result = _suggest(tmp_path / "movzx.bin", MOVZX_EAX_RDI_18 + RET)
+
+    assert [(f.offset, f.width, f.signed) for f in result.fields] == [(0x18, 2, False)]
+    assert result.fields[0].evidence.extra["signed"] is False
+
+
+def test_a_plain_move_carries_no_signedness_hint(tmp_path: Path) -> None:
+    result = _suggest(tmp_path / "plain_move.bin", MOV_RCX_RDI_20 + RET)
+
+    assert [(f.offset, f.width, f.signed) for f in result.fields] == [(0x20, 8, None)]
+
+
+def test_signed_and_unsigned_arithmetic_classify_their_operands(tmp_path: Path) -> None:
+    result = _suggest(
+        tmp_path / "arithmetic.bin",
+        MOVSXD_RAX_RDI_10
+        + SAR_RDI_4
+        + IDIV_RDI_10
+        + SHR_RDI_8
+        + MUL_RDI_18
+        + RET,
+    )
+
+    assert [(f.offset, f.signed) for f in result.fields] == [
+        (4, True),
+        (8, False),
+        (0x10, True),
+        (0x18, False),
+    ]
+
+
+def test_implicit_operand_mnemonics_never_add_a_field(tmp_path: Path) -> None:
+    # ``cqo`` is a signedness mnemonic, but it only widens a register, so it must
+    # not turn the unrelated ``mov`` access at offset 0 into a signed field.
+    result = _suggest(tmp_path / "cqo.bin", CQO + MOV_EAX_RDI + RET)
+
+    assert [(f.offset, f.signed) for f in result.fields] == [(0, None)]
+
+
+def test_mixed_signedness_at_one_offset_warns_and_reports_unknown(
+    tmp_path: Path,
+) -> None:
+    binary = _make_elf64(tmp_path / "mixed_signedness.bin", MIXED_SIGNEDNESS)
+    info = _load(binary)
+
+    with pytest.warns(SignednessConflictWarning, match="0x10"):
+        result = suggest_struct(binary, info, TEXT_VA)
+
+    assert [(f.offset, f.width, f.signed) for f in result.fields] == [(0x10, 2, None)]
+
+
+def test_consistent_and_absent_hints_do_not_warn(
+    tmp_path: Path, recwarn: pytest.WarningsRecorder
+) -> None:
+    # A plain field (no hint) and a field with two agreeing hints: neither is a
+    # contradiction, so nothing may be reported.
+    result = _suggest(
+        tmp_path / "quiet.bin",
+        MOVSX_RAX_RDI_10 + MOVSXD_RAX_RDI_10 + MOV_RCX_RDI_20 + RET,
+    )
+
+    assert [(f.offset, f.signed) for f in result.fields] == [(0x10, True), (0x20, None)]
+    assert [w for w in recwarn.list if isinstance(w.message, SignednessConflictWarning)] == []
+
+
+def test_to_dict_reports_signedness_only_when_it_is_known(tmp_path: Path) -> None:
+    signed = _suggest(tmp_path / "signed_json.bin", MOVSX_RAX_RDI_10 + RET).to_dict()
+    unsigned = _suggest(tmp_path / "unsigned_json.bin", MOVZX_EAX_RDI_18 + RET).to_dict()
+    unknown = _suggest(tmp_path / "unknown_json.bin", THREE_FIELDS).to_dict()
+
+    assert signed["fields"][0]["signed"] is True
+    assert unsigned["fields"][0]["signed"] is False
+    # An unknown hint is an absent key, never ``"signed": null``.
+    assert all("signed" not in field for field in unknown["fields"])
+    assert json.loads(json.dumps(signed))["fields"][0]["signed"] is True
+
+
+def test_to_dict_omits_signed_when_the_hints_contradict(tmp_path: Path) -> None:
+    binary = _make_elf64(tmp_path / "contradiction_json.bin", MIXED_SIGNEDNESS)
+    info = _load(binary)
+
+    with pytest.warns(SignednessConflictWarning):
+        payload = suggest_struct(binary, info, TEXT_VA).to_dict()
+
+    assert "signed" not in payload["fields"][0]
+
+
+def test_field_evidence_names_the_signedness_hint(tmp_path: Path) -> None:
+    result = _suggest(
+        tmp_path / "signedness_evidence.bin", MOVSX_RAX_RDI_10 + MOV_RCX_RDI_20 + RET
+    )
+
+    assert "signedness signed" in (result.fields[0].evidence.detail or "")
+    assert "signedness unknown" in (result.fields[1].evidence.detail or "")
+    assert "heuristic" in (result.fields[0].evidence.detail or "")
+
+
+def test_signedness_is_deterministic(tmp_path: Path) -> None:
+    binary = _make_elf64(tmp_path / "signedness_deterministic.bin", MIXED_SIGNEDNESS)
+    info = _load(binary)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SignednessConflictWarning)
+        first = suggest_struct(binary, info, TEXT_VA)
+        second = suggest_struct(binary, info, TEXT_VA)
+
+    assert first == second
+    assert first.fields[0].signed is None
+
+
+def test_signed_hint_covers_imul(tmp_path: Path) -> None:
+    # imul rax, qword ptr [rdi + 0x20]: signed multiplication of field 0x20.
+    result = _suggest(tmp_path / "imul.bin", bytes.fromhex("480faf4720") + RET)
+
+    assert [(f.offset, f.signed) for f in result.fields] == [(0x20, True)]
+
 

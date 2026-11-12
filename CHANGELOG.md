@@ -347,6 +347,71 @@ All notable changes to CODEVANTA are documented here. The format follows
   similarity and its normalization, the fourteen MCP tools including
   `codevanta_struct`, the `codevanta struct` footer, the `medium` labels, bounds
   and determinism, limitations, and next steps.
+- Semantic diff pairing (`codevanta.analysis.binary_diff`): `diff_infos` and
+  `diff_binaries` gain `semantic=False` and
+  `threshold=DEFAULT_SEMANTIC_THRESHOLD` (0.9). With `semantic=True` the
+  candidates that address and name matching left unpaired are scored with
+  `function_similarity`, sorted by descending score (ties broken by left then
+  right address) and taken greedily while the score is at least `threshold` and
+  neither side has been used. Each accepted pair becomes one `changed` delta at
+  the right-hand address with `FunctionDelta.similarity` rounded to four decimals
+  and an evidence detail naming the score, the threshold, both addresses, and the
+  fact that a shape overlap is not proof of equal code; structurally matched
+  deltas keep `similarity=None` and omit the key from `to_dict()`. A pairing can
+  only replace a remove-plus-add pair, never an address or name match, so
+  structural mode and the `identical` flag semantics are unchanged. The pass is
+  bounded by `MAX_SEMANTIC_PAIRS` (4096): above that leftover cross product the
+  whole pass is skipped with a warning and every leftover keeps its
+  `added`/`removed` verdict, and each score decodes at most
+  `SEMANTIC_MAX_INSTRUCTIONS` (2000) instructions per side. A pair that cannot be
+  scored is skipped and summarised in a warning, `threshold` is validated in every
+  mode (finite number in `0.0 .. 1.0`, else `AnalysisError`), and the comparison
+  evidence gains `semantic`, `semantic_threshold`, `semantic_instructions`, and
+  `max_semantic_pairs`.
+- Signedness hints (`codevanta.analysis.type_recovery`): `SuggestedField` gains
+  `signed: bool | None`, read from the mnemonic of each access —
+  `movsx`/`movsxd`/`sar`/`idiv`/`imul` mark signed,
+  `movzx`/`shr`/`div`/`mul` mark unsigned, every other mnemonic carries no hint.
+  Hints are aggregated per offset: one kind gives `True`/`False`, no hint gives
+  `None`, and a contradiction gives `None` plus one
+  `SignednessConflictWarning` (a `UserWarning`) naming the offset. `signed` is
+  omitted from `SuggestedField.to_dict()` when it is `None`, so an unclassified
+  field's JSON is unchanged, while the field evidence detail now names the hint
+  (`signedness signed|unsigned|unknown`) and `evidence.extra["signed"]` carries
+  the same value. `None` means "no evidence", never "safe".
+- MCP: `codevanta_similarity` takes `path_a`, `address_a`, `path_b`, `address_b`,
+  and `max_instructions=2000`, exposes `function_similarity`, and returns its
+  `to_dict()` (`score`, `shared`, `left_total`, `right_total`, `union`,
+  `warnings`, evidence at `function_hash.similarity` / `token_multiset`,
+  `medium`). Addresses must be non-negative integers and are validated per side,
+  `max_instructions` stays in `1 .. 20000`, and bad input raises
+  `AnalysisError` — fifteen tools total. `codevanta_diff` keeps only
+  `max_functions` and `deep`, so the semantic pass has no MCP argument yet.
+- CLI: `codevanta diff --semantic` / `--threshold`. The threshold defaults to
+  `DEFAULT_SEMANTIC_THRESHOLD` (0.9), is validated before either binary is loaded
+  (a value outside `0.0 .. 1.0`, `nan`, or `inf` exits 2 with
+  `invalid threshold ...`), and is checked even without `--semantic`.
+  `--semantic` passes `semantic=True` / `threshold` to `diff_binaries`, so a
+  relocated function becomes one `changed` row instead of a removal plus an
+  addition, and each scored pair prints one dim
+  `semantic pair 0x401000 -> 0x401010 (<name>): similarity 1.0000` line after the
+  otherwise unchanged function table (no `Similarity` column), followed by a dim
+  caveat that a pairing is not proof of equal code. `AnalysisError` from the
+  analysis layer now also maps to exit 2, and `--json` carries `similarity` plus
+  the `semantic` evidence keys.
+- CLI: `codevanta struct` closes its footer with a `signed:` line listing
+  `<offset> signed|unsigned` for every field whose mnemonics carried a hint, in
+  table order — for example `signed: 0x10 signed, 0x18 unsigned` — or
+  `signed: none` when nothing hinted (`none` means "no evidence", never "safe").
+  The four `Offset`/`Width`/`Reads`/`Writes` columns and the phase 2h/2i footer
+  lines are unchanged, and contradictory offsets stay absent from the line because
+  the analysis layer already collapsed them to `signed=None`.
+- Documentation: `docs/phase2j.md` covers the semantic pairing rule, its two
+  bounds and warnings, threshold validation, the semantic caveat and evidence
+  keys, the fifteen MCP tools including `codevanta_similarity`, the mnemonic
+  signedness sets and their `None`/conflict semantics, the `diff --semantic` /
+  `--threshold` switches and the `struct` `signed:` footer, limitations, and next
+  steps.
 
 ### Notes
 
@@ -371,12 +436,17 @@ All notable changes to CODEVANTA are documented here. The format follows
   two exist) and `array_groups` (maximal runs of at least three equally wide,
   equally spaced fields) to those suggestions — both are `medium` heuristics over
   one bounded window, so they cannot prove padding, a struct size or a declared
-  array — plus `function_similarity`, a multiset overlap of normalized tokens
-  that is library-only for now, and the `codevanta_struct` MCP tool (fourteen
-  tools).
+  array — plus `function_similarity`, a multiset overlap of normalized tokens, and
+  the `codevanta_struct` MCP tool. Phase 2j adds the opt-in semantic pairing pass
+  on the binary diff (`semantic=True`, `threshold` defaulting to `0.9`, greedy,
+  capped at 4096 leftover pairs), the `codevanta_similarity` MCP tool (fifteen
+  tools), and the `signed` mnemonic hint on struct fields, reachable as
+  `diff --semantic --threshold` and as the `codevanta struct` footer `signed:`
+  line. `codevanta_diff` still takes no `semantic` argument, so MCP pairing goes
+  through `codevanta_similarity`.
   See `docs/phase2.md`, `docs/phase2b.md`, `docs/phase2c.md`,
   `docs/phase2d.md`, `docs/phase2e.md`, `docs/phase2f.md`, `docs/phase2g.md`,
-  `docs/phase2h.md`, and `docs/phase2i.md`.
+  `docs/phase2h.md`, `docs/phase2i.md`, and `docs/phase2j.md`.
 - Node boundaries and caller attribution are heuristics, not proven function
   extents. Sessions and annotations live in one local SQLite file with no schema
   migrations yet.

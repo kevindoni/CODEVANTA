@@ -54,7 +54,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
     assert report["disassembly"]["instruction_count"] == 3
 
 
-def test_server_lists_fourteen_tools() -> None:
+def test_server_lists_fifteen_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
     assert names == [
@@ -69,11 +69,12 @@ def test_server_lists_fourteen_tools() -> None:
         "codevanta_jump_table",
         "codevanta_session_list",
         "codevanta_session_save",
+        "codevanta_similarity",
         "codevanta_strings",
         "codevanta_struct",
         "codevanta_xrefs",
     ]
-    assert len(names) == 14
+    assert len(names) == 15
 
 
 def _payload(result: object) -> dict:
@@ -539,6 +540,95 @@ def test_function_hash_matches_shape_not_bytes(tmp_path: Path) -> None:
             )
     with pytest.raises(AnalysisError, match="file not found"):
         tools.function_hash(str(tmp_path / "missing.bin"), TEXT_ADDRESS)
+
+def test_similarity_scores_same_file_and_address_as_one(tmp_path: Path) -> None:
+    binary = _write_elf64(tmp_path / "similarity.bin", bytes.fromhex("b82a000000c3"))
+
+    payload = tools.similarity(str(binary), TEXT_ADDRESS, str(binary), TEXT_ADDRESS)
+
+    assert payload["score"] == 1.0
+    assert payload["shared"] == 2
+    assert payload["left_total"] == 2
+    assert payload["right_total"] == 2
+    assert payload["union"] == 2
+    assert payload["warnings"] == []
+    assert payload["evidence"]["source"] == "function_hash.similarity"
+    assert payload["evidence"]["method"] == "token_multiset"
+    assert payload["evidence"]["confidence"] == "medium"
+    assert payload["evidence"]["address"] == "0x401000"
+    assert json.loads(json.dumps(payload)) == payload
+
+    result = asyncio.run(
+        build_server().call_tool(
+            "codevanta_similarity",
+            {
+                "path_a": str(binary),
+                "address_a": TEXT_ADDRESS,
+                "path_b": str(binary),
+                "address_b": TEXT_ADDRESS,
+            },
+        )
+    )
+    assert _payload(result)["score"] == 1.0
+
+
+def test_similarity_masks_immediates_and_validates_arguments(tmp_path: Path) -> None:
+    imm42 = _write_elf64(tmp_path / "sim_imm42.bin", bytes.fromhex("b82a000000c3"))
+    imm99 = _write_elf64(tmp_path / "sim_imm99.bin", bytes.fromhex("b863000000c3"))
+    narrow = _write_elf64(tmp_path / "sim_narrow.bin", bytes.fromhex("90c3"))
+
+    # Only the masked immediate differs, so the shape score is still 1.0.
+    recompiled = tools.similarity(
+        str(imm42), TEXT_ADDRESS, str(imm99), TEXT_ADDRESS
+    )
+    assert recompiled["score"] == 1.0
+
+    # ``nop; ret`` shares only ``ret`` with ``mov eax, #; ret``: 1 of 3 tokens.
+    partial = tools.similarity(str(imm42), TEXT_ADDRESS, str(narrow), TEXT_ADDRESS)
+    assert partial["score"] == 0.3333
+    assert partial["shared"] == 1
+    assert partial["union"] == 3
+    assert partial["evidence"]["extra"]["right_address"] == "0x401000"
+
+    # A one-instruction budget truncates both sides, so only prefixes compare.
+    truncated = tools.similarity(
+        str(imm42),
+        TEXT_ADDRESS,
+        str(imm42),
+        TEXT_ADDRESS,
+        max_instructions=1,
+    )
+    assert truncated["score"] == 1.0
+    assert len(truncated["warnings"]) == 2
+
+    for side in ("address_a", "address_b"):
+        for bad in (True, -1):
+            with pytest.raises(AnalysisError, match=side):
+                tools.similarity(
+                    str(imm42),
+                    bad if side == "address_a" else TEXT_ADDRESS,
+                    str(imm42),
+                    bad if side == "address_b" else TEXT_ADDRESS,
+                )
+    for max_instructions in (0, True, tools.MAX_TOOL_LIMIT + 1):
+        with pytest.raises(AnalysisError, match="max_instructions"):
+            tools.similarity(
+                str(imm42),
+                TEXT_ADDRESS,
+                str(imm42),
+                TEXT_ADDRESS,
+                max_instructions=max_instructions,
+            )
+    with pytest.raises(AnalysisError, match="file not found"):
+        tools.similarity(
+            str(tmp_path / "missing.bin"), TEXT_ADDRESS, str(imm42), TEXT_ADDRESS
+        )
+    with pytest.raises(AnalysisError, match="file not found"):
+        tools.similarity(
+            str(imm42), TEXT_ADDRESS, str(tmp_path / "missing.bin"), TEXT_ADDRESS
+        )
+    with pytest.raises(AnalysisError, match="not inside an executable section"):
+        tools.similarity(str(imm42), 0, str(imm42), TEXT_ADDRESS)
 
 
 #: ``mov rax, [rdi + 0x10]``, ``mov [rdi + 0x18], rbx``, ``mov ecx, [rdi + 0x20]``, ``ret``.

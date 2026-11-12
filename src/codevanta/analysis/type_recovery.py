@@ -16,6 +16,15 @@ the memory operands of every decoded instruction:
    operand -- ``cmp``, ``cmpsb``/``cmpsw``/``cmpsd``/``cmpsq``, ``test``,
    ``call``, ``jmp`` and ``push`` -- are always reads, even though the memory
    operand comes first.
+4. The signedness of an access comes from the **mnemonic**: sign-extending
+   operations (``movsx``, ``movsxd``, ``sar``, ``idiv``, ``cqo``, ``cdq``,
+   ``cwd``, ``cbw``) mark the operand as signed, zero-extending or unsigned
+   operations (``movzx``, ``shr``, ``div``, ``mul``) mark it as unsigned, and
+   every other mnemonic (``mov``, ``add``, ``cmp``, ...) carries no hint at all.
+   The hint is aggregated per offset like the width: only-signed accesses give
+   ``signed=True``, only-unsigned accesses give ``signed=False``, no hint gives
+   ``None``, and a contradiction gives ``None`` plus a
+   :class:`SignednessConflictWarning` naming the offset.
 
 The accesses are then aggregated **per offset**: the dominant width of an offset
 is the one seen most often (ties go to the wider access, which is the safer
@@ -41,8 +50,11 @@ the ``max_fields`` cap, so a group never refers to a field that was dropped.
 
 Everything here is a *heuristic*: a struct field recovered from operand shapes
 is a hypothesis about how a function treats memory around one base register. It
-is not a verified type, and it says nothing about a field's signedness, purpose
-or lifetime. Every evidence record says so and sits at
+is not a verified type, and it says nothing about a field's purpose or lifetime.
+The ``signed`` hint is only a reading of the mnemonics that happened to be in the
+window, so ``None`` there means "no signedness evidence", never "safe", and a
+sign-extending *read* does not prove the field is a signed integer. Every
+evidence record says so and sits at
 :attr:`~codevanta.evidence.confidence.Confidence.MEDIUM`, never higher.
 
 Work is bounded three ways: the caller's ``max_instructions`` budget (default
@@ -62,7 +74,8 @@ non-Intel-shaped binary simply yields no fields instead of wrong ones.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+import warnings
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from math import gcd
 from pathlib import Path
@@ -84,6 +97,7 @@ __all__ = [
     "MIN_MAX_FIELDS",
     "MIN_MAX_INSTRUCTIONS",
     "READ",
+    "SignednessConflictWarning",
     "STACK_REGISTERS",
     "WRITE",
     "FieldAccess",
@@ -147,6 +161,18 @@ _COMPARE_MNEMONICS = frozenset({"cmp", "cmps", "cmpsb", "cmpsw", "cmpsd", "cmpsq
 #: Mnemonics that carry a bracket expression without touching memory.
 _NON_ACCESSING_MNEMONICS = frozenset({"lea", "nop"})
 
+#: Mnemonics whose result is sign-extended from the memory operand, or which do
+#: signed arithmetic on it. Any access they make is treated as ``signed=True``.
+#:
+#: The implicit-operand sign-extension mnemonics (``cbw``, ``cwd``, ``cdq``,
+#: ``cqo``) are absent on purpose: they never carry a memory operand, so they can
+#: neither label a field nor appear in an access record.
+_SIGNED_MNEMONICS = frozenset({"movsx", "movsxd", "sar", "idiv", "imul"})
+
+#: Mnemonics whose result is zero-extended from the memory operand, or which do
+#: unsigned arithmetic on it. Any access they make is treated as ``signed=False``.
+_UNSIGNED_MNEMONICS = frozenset({"movzx", "shr", "div", "mul"})
+
 #: A memory operand with an optional size keyword, a single base register and an
 #: optional signed displacement: ``qword ptr [rdi + 0x18]``, ``[rax]``,
 #: ``dword ptr [rbp - 8]``.
@@ -171,6 +197,17 @@ _ARRAY_EVIDENCE_METHOD = "stride_run_detection"
 #: :class:`ArrayGroup`. Two fields are only a coincidence; three is the minimum
 #: at which a repeated stride starts to carry information.
 _MIN_ARRAY_ELEMENTS = 3
+
+
+class SignednessConflictWarning(UserWarning):
+    """Emitted when one field offset is accessed as both signed and unsigned.
+
+    The two sources of evidence contradict each other, so the offset is reported
+    with ``signed=None`` -- exactly like an offset with no evidence at all --
+    and this warning says which offset lost its hint. It is a
+    :class:`UserWarning`, so callers that do not care about signedness can
+    ignore it; callers that do can filter on it.
+    """
 
 
 @dataclass(frozen=True)
@@ -218,6 +255,12 @@ class SuggestedField:
         first_access: Virtual address of the first instruction that touched the
             offset, or ``None`` when no access was recorded.
         evidence: Justification, always at ``Confidence.MEDIUM``.
+        signed: ``True`` when every signedness hint recorded at this offset came
+            from a sign-extending mnemonic, ``False`` when every hint came from a
+            zero-extending/unsigned one, and ``None`` when there was no hint or
+            the hints contradicted each other (in which case
+            :class:`SignednessConflictWarning` was raised). Omitted from
+            :meth:`to_dict` when ``None``.
     """
 
     offset: int
@@ -226,6 +269,7 @@ class SuggestedField:
     write_count: int
     first_access: int | None
     evidence: Evidence
+    signed: bool | None = None
 
     @property
     def access_count(self) -> int:
@@ -234,7 +278,7 @@ class SuggestedField:
 
     def to_dict(self) -> dict[str, Any]:
         first = self.first_access
-        return {
+        payload: dict[str, Any] = {
             "offset": f"0x{self.offset:x}",
             "width": self.width,
             "read_count": self.read_count,
@@ -243,6 +287,11 @@ class SuggestedField:
             "first_access": f"0x{first:x}" if first is not None else None,
             "evidence": self.evidence.to_dict(),
         }
+        # An unknown signedness is an absent key, not a ``null``: it keeps the
+        # JSON of an unclassified field byte-identical to the pre-signedness one.
+        if self.signed is not None:
+            payload["signed"] = self.signed
+        return payload
 
 
 @dataclass(frozen=True)
@@ -380,6 +429,31 @@ def _direction(mnemonic: str, operand_index: int) -> str:
     return WRITE if operand_index == 0 else READ
 
 
+def _signedness(mnemonic: str) -> bool | None:
+    """Signedness hint for one mnemonic: ``True``, ``False``, or ``None``.
+
+    The hint is read off the mnemonic alone, because that is all the decoder
+    tells us: a sign-extending operation (``movsx``, ``movsxd``, ``sar``,
+    ``idiv``, ``cqo``, ``cdq``, ``cwd``, ``cbw``) is evidence for a signed
+    field, a zero-extending or unsigned one (``movzx``, ``shr``, ``div``,
+    ``mul``) is evidence for an unsigned field, and everything else is no
+    evidence either way.
+    """
+    name = mnemonic.strip().lower()
+    if name in _SIGNED_MNEMONICS:
+        return True
+    if name in _UNSIGNED_MNEMONICS:
+        return False
+    return None
+
+
+def _signedness_text(signed: bool | None) -> str:
+    """Render a signedness hint for evidence prose."""
+    if signed is None:
+        return "unknown"
+    return "signed" if signed else "unsigned"
+
+
 def _width(match: re.Match[str], pointer_width: int) -> int:
     """Width from the operand's size keyword, else the pointer width."""
     size_keyword = match.group("size")
@@ -438,16 +512,46 @@ def parse_memory_operands(
     return tuple(accesses)
 
 
-def _aggregate(accesses: Iterable[FieldAccess]) -> list[SuggestedField]:
-    """Reduce accesses to one field per offset, sorted by ascending offset."""
+def _resolve_signedness(offset: int, observed: Collection[bool]) -> bool | None:
+    """Collapse the signedness hints of one offset, warning on a contradiction.
+
+    One kind of hint means the offset is taken to be signed (or unsigned), no
+    hint means it stays unknown, and a mix is reported as unknown *and*
+    announced through :class:`SignednessConflictWarning` -- a contradictory
+    offset is not the same thing as an unclassified one, even though both end up
+    as ``None``.
+    """
+    if len(observed) == 1:
+        return next(iter(observed))
+    if len(observed) > 1:
+        warnings.warn(
+            f"offset 0x{offset:x} is accessed both as signed and as unsigned; "
+            "reporting its signedness as unknown",
+            SignednessConflictWarning,
+            stacklevel=4,
+        )
+    return None
+
+
+def _aggregate(accesses: Iterable[tuple[FieldAccess, bool | None]]) -> list[SuggestedField]:
+    """Reduce ``(access, signedness hint)`` pairs to one field per offset.
+
+    Fields come back sorted by ascending offset, so the result is deterministic.
+    Widths are collapsed per offset (dominant width wins, ties go to the wider
+    access), read/write counters are totals over all widths, and signedness is
+    resolved by :func:`_resolve_signedness`.
+    """
     per_offset: dict[int, dict[int, list[int]]] = {}
+    hints: dict[int, set[bool]] = {}
     first_access: dict[int, int] = {}
-    for access in accesses:
+    for access, signed in accesses:
         counts = per_offset.setdefault(access.offset, {}).setdefault(access.width, [0, 0])
         if access.direction == WRITE:
             counts[1] += 1
         else:
             counts[0] += 1
+        if signed is not None:
+            hints.setdefault(access.offset, set()).add(signed)
         first_access.setdefault(access.offset, access.address)
     fields: list[SuggestedField] = []
     for offset in sorted(per_offset):
@@ -457,6 +561,7 @@ def _aggregate(accesses: Iterable[FieldAccess]) -> list[SuggestedField]:
         reads = sum(count[0] for count in widths.values())
         writes = sum(count[1] for count in widths.values())
         first = first_access.get(offset)
+        signed = _resolve_signedness(offset, hints.get(offset, ()))
         fields.append(
             SuggestedField(
                 offset=offset,
@@ -471,7 +576,8 @@ def _aggregate(accesses: Iterable[FieldAccess]) -> list[SuggestedField]:
                     address=first,
                     detail=(
                         f"offset 0x{offset:x}: {dominant}-byte field, "
-                        f"{reads} read(s), {writes} write(s); "
+                        f"{reads} read(s), {writes} write(s), "
+                        f"signedness {_signedness_text(signed)}; "
                         "field is heuristic, not a verified type"
                     ),
                     extra={
@@ -479,8 +585,10 @@ def _aggregate(accesses: Iterable[FieldAccess]) -> list[SuggestedField]:
                         "width": dominant,
                         "read_count": reads,
                         "write_count": writes,
+                        "signed": signed,
                     },
                 ),
+                signed=signed,
             )
         )
     return fields
@@ -609,8 +717,9 @@ def suggest_struct(
 
     Returns:
         The :class:`StructSuggestion` for the region, with fields sorted by
-        ascending offset, the offset-gcd ``alignment`` and the ``array_groups``
-        runs derived from those reported fields.
+        ascending offset, each carrying its aggregated ``signed`` hint, plus the
+        offset-gcd ``alignment`` and the ``array_groups`` runs derived from those
+        reported fields.
 
     Raises:
         AnalysisError: When ``start``, ``max_instructions`` or ``max_fields`` is
@@ -618,12 +727,21 @@ def suggest_struct(
             the address has no file bytes, when the architecture cannot be
             disassembled, or when no instruction could be decoded.
 
+    Warns:
+        SignednessConflictWarning: Once per offset that is accessed both as
+            signed and as unsigned. Warnings are resolved during aggregation,
+            i.e. before the ``max_fields`` cap, so they are bounded by the
+            number of distinct offsets in the window rather than by the cap. The
+            warning is informational: the suggestion itself is still returned,
+            with ``signed=None`` at the contradictory offsets.
+
     Note:
         Two calls with the same arguments always produce the same suggestion:
-        the sweep is linear, aggregation is per offset, and fields, widths and
-        counters are all ordered deterministically. ``alignment`` and
-        ``array_groups`` are derived from the reported fields only, so capping
-        with ``max_fields`` cannot leave a group pointing at a dropped field.
+        the sweep is linear, aggregation is per offset, and fields, widths,
+        counters and warnings are all ordered deterministically. ``alignment``
+        and ``array_groups`` are derived from the reported fields only, so
+        capping with ``max_fields`` cannot leave a group pointing at a dropped
+        field.
     """
     if isinstance(start, bool) or not isinstance(start, int):
         raise AnalysisError(f"start must be an integer, got {start!r}")
@@ -655,7 +773,7 @@ def suggest_struct(
 
     pointer_width = _pointer_width(info.bitness)
     accesses = [
-        access
+        (access, _signedness(instruction.mnemonic))
         for instruction in instructions
         for access in parse_memory_operands(
             instruction, include_stack=include_stack, pointer_width=pointer_width
