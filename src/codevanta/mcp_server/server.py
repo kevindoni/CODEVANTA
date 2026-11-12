@@ -1,11 +1,18 @@
-"""CODEVANTA MCP server (Model Context Protocol, stdio transport)."""
+"""CODEVANTA MCP server (Model Context Protocol).
+
+``stdio`` is the default transport, so existing client configurations keep
+working. ``sse`` and ``streamable-http`` are also available for clients that
+speak HTTP; they bind a local TCP port and are opt-in.
+"""
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+import ipaddress
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from codevanta.core.report import AnalysisError
@@ -14,6 +21,30 @@ from . import tools
 
 SERVER_NAME = "CODEVANTA"
 SERVER_VERSION = "0.1.0"
+
+#: Transports the pinned ``mcp`` SDK can serve. ``MCPServer.run`` declares
+#: ``Literal["stdio", "sse", "streamable-http"]`` and raises ``ValueError`` for
+#: anything else, so this tuple is the SDK's list - not a CODEVANTA invention.
+#: ``stdio`` is first because it is the default.
+SUPPORTED_TRANSPORTS: tuple[str, ...] = ("stdio", "sse", "streamable-http")
+
+#: Transports that bind a TCP socket, i.e. that can be reached from off-box.
+HTTP_TRANSPORTS: frozenset[str] = frozenset({"sse", "streamable-http"})
+
+#: Default bind address for the HTTP transports; loopback keeps the tools local.
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
+
+#: The hosts the pinned MCP SDK hardens by itself. ``MCPServer.sse_app`` and
+#: ``MCPServer.streamable_http_app`` compare their ``host`` argument with exactly
+#: these strings before enabling DNS-rebinding protection, so ``127.0.0.2`` used
+#: to bind without protection while ``"[::1]"`` did not bind at all. CODEVANTA
+#: therefore never relies on that detection: it normalises the host once and
+#: passes explicit :class:`TransportSecuritySettings` for a loopback bind (see
+#: :func:`transport_security`).
+SDK_HARDENED_HOSTS: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
+
+HttpTransport = Literal["sse", "streamable-http"]
 
 INSTRUCTIONS = (
     "CODEVANTA performs static analysis of PE and ELF binaries and never executes "
@@ -318,6 +349,174 @@ def build_server() -> MCPServer:
     return server
 
 
-def run() -> None:
-    """Run the MCP server over stdio."""
-    build_server().run(transport="stdio")
+def normalise_host(host: str) -> str:
+    """Return ``host`` as the bare bind address uvicorn and the SDK expect.
+
+    The rule, applied in this order:
+
+    1. surrounding whitespace is stripped;
+    2. one pair of surrounding IPv6 brackets is dropped, because ``[::1]`` is
+       ``Host``-header/URL notation rather than a bindable address - uvicorn
+       refused ``--host "[::1]"`` with "invalid IP address";
+    3. ``localhost`` (in any case) becomes ``127.0.0.1``, the literal the SDK
+       recognises as loopback, so neither the bind nor the ``Host`` allow-list
+       depends on what a resolver returns for ``localhost``.
+
+    Anything else is returned unchanged. Normalising once means the loopback
+    guard, the ``Host``/``Origin`` allow-list and the ``bind()`` call all see the
+    same string. This function does not validate: a blank or remote result is
+    returned as-is and rejected by :func:`run`.
+
+    Args:
+        host: Requested bind host, possibly bracketed or ``localhost``.
+
+    Returns:
+        The bare address to bind, or ``""`` when ``host`` is blank.
+    """
+    candidate = host.strip()
+    if len(candidate) > 2 and candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if candidate.lower() == "localhost":
+        return "127.0.0.1"
+    return candidate
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return True when ``host`` is an address only reachable from this machine.
+
+    The check runs on :func:`normalise_host` output, so ``[::1]``, `` 127.0.0.1 ``
+    and ``LOCALHOST`` behave like their bare lower-case forms, and ``127.0.0.2``
+    is loopback because the whole of ``127.0.0.0/8`` is. Everything else -
+    including the wildcards ``0.0.0.0`` and ``::``, and any hostname such as
+    ``example.com`` or ``localhost.evil.com`` - is treated as remote: a wildcard
+    listens on every interface and a hostname may resolve to a routable address.
+
+    Accepting ``127.0.0.2`` is only safe because :func:`run` also passes explicit
+    :class:`TransportSecuritySettings`; the SDK's own hardening knows three
+    literal hosts (:data:`SDK_HARDENED_HOSTS`), not the whole loopback range.
+    """
+    if not isinstance(host, str):
+        return False
+    candidate = normalise_host(host)
+    if not candidate:
+        return False
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False
+
+
+def transport_security(host: str) -> TransportSecuritySettings | None:
+    """Return DNS-rebinding protection for the loopback bind ``host``.
+
+    The SDK builds its own settings only when its ``host`` argument is literally
+    one of :data:`SDK_HARDENED_HOSTS`, which left ``127.0.0.2`` - accepted by
+    :func:`is_loopback_host` - serving without any ``Host``/``Origin`` check.
+    Passing the settings explicitly closes that gap: ``MCPServer.sse_app`` and
+    ``MCPServer.streamable_http_app`` only fall back to their own detection when
+    ``transport_security is None``, and the pinned SDK's ``run`` forwards the
+    keyword to both HTTP transports.
+
+    The lists describe the *actual* bind address in the SDK's own ``:<port>``
+    wildcard shape, so ``Host: 127.0.0.2:8000`` and ``Origin:
+    http://127.0.0.2:8000`` pass while ``Host: attacker.example`` and ``Origin:
+    http://attacker.example`` get the SDK's ``421``/``403``. Only ``http://``
+    origins are listed, matching the SDK's defaults for its own three hosts, and
+    a request without an ``Origin`` header - every non-browser MCP client - is
+    always accepted.
+
+    A non-loopback bind returns ``None``: the SDK then leaves protection off,
+    which is exactly what ``allow_remote=True`` promises - front a remote bind
+    with your own authentication and ``Host``/``Origin`` validation.
+
+    Args:
+        host: Bind host, normalised or not.
+
+    Returns:
+        Settings for :meth:`MCPServer.run`, or ``None`` for a remote bind.
+    """
+    if not is_loopback_host(host):
+        return None
+    bind_host = normalise_host(host)
+    authority = f"[{bind_host}]" if ":" in bind_host else bind_host
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[authority, f"{authority}:*"],
+        allowed_origins=[f"http://{authority}", f"http://{authority}:*"],
+    )
+
+
+def run(
+    transport: str = "stdio",
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    *,
+    allow_remote: bool = False,
+) -> None:
+    """Serve the CODEVANTA tools over MCP.
+
+    ``transport="stdio"`` is the default and behaves exactly as before: the
+    server speaks JSON-RPC over stdin/stdout and ``host``/``port`` are unused,
+    so no existing client configuration changes meaning. ``"sse"`` and
+    ``"streamable-http"`` bind ``host:port`` instead.
+
+    The HTTP transports are network-exposed and these tools read arbitrary
+    local files, so a non-loopback ``host`` is refused unless ``allow_remote``
+    is set.
+
+    ``host`` is normalised once through :func:`normalise_host` - whitespace
+    stripped, surrounding IPv6 brackets dropped, ``localhost`` mapped to
+    ``127.0.0.1`` - and that single value is used for the loopback guard, the
+    ``Host``/``Origin`` allow-list and the bind. Two consequences of the SDK's
+    own behaviour are worth spelling out, because the pinned SDK hardens only
+    the three literal strings in :data:`SDK_HARDENED_HOSTS`:
+
+    * ``127.0.0.2`` (and the rest of ``127.0.0.0/8``) is accepted *and* hardened:
+      :func:`transport_security` passes explicit
+      :class:`TransportSecuritySettings` naming the real bind address, instead
+      of relying on the SDK's detection, which does not fire for it.
+    * ``"[::1]"`` is un-bracketed to ``::1`` before binding, so it binds and is
+      hardened; the bracketed form used to fail inside uvicorn.
+
+    A non-loopback bind (``allow_remote=True``) gets no automatic hardening -
+    front it with your own authentication and ``Host``/``Origin`` validation.
+
+    Args:
+        transport: One of :data:`SUPPORTED_TRANSPORTS`.
+        host: Bind address for the HTTP transports (default loopback).
+        port: Bind port for the HTTP transports; ``0`` picks a free port.
+        allow_remote: Permit a non-loopback ``host``.
+
+    Raises:
+        AnalysisError: Unknown transport, malformed host/port, or a
+            non-loopback host without ``allow_remote``.
+    """
+    if transport not in SUPPORTED_TRANSPORTS:
+        supported = ", ".join(SUPPORTED_TRANSPORTS)
+        raise AnalysisError(
+            f"unknown MCP transport {transport!r}; supported transports: {supported}"
+        )
+
+    if transport == "stdio":
+        # Identical to the previous no-argument behaviour.
+        build_server().run(transport="stdio")
+        return
+
+    if not isinstance(host, str) or not host.strip():
+        raise AnalysisError(f"invalid MCP bind host {host!r}; expected a hostname or IP address")
+    bind_host = normalise_host(host)
+    if not is_loopback_host(bind_host) and not allow_remote:
+        raise AnalysisError(
+            f"refusing to bind the MCP server to non-loopback host {host!r}: these tools "
+            "read local files. Pass allow_remote=True to override."
+        )
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+        raise AnalysisError(f"invalid MCP port {port!r}; expected an integer in 0..65535")
+
+    build_server().run(
+        transport=cast("HttpTransport", transport),
+        host=bind_host,
+        port=port,
+        transport_security=transport_security(bind_host),
+    )
+

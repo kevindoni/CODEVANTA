@@ -9,10 +9,16 @@ from pathlib import Path
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import (
+    TransportSecurityMiddleware,
+    TransportSecuritySettings,
+)
+from starlette.requests import Request
 
 from codevanta.analysis.binary_diff import DEFAULT_SEMANTIC_THRESHOLD
 from codevanta.analysis.type_recovery import MAX_MAX_FIELDS, MAX_MAX_INSTRUCTIONS
 from codevanta.core.report import AnalysisError
+from codevanta.mcp_server import server as mcp_server
 from codevanta.mcp_server import tools
 from codevanta.mcp_server.server import build_server
 from codevanta.storage.session import SessionError
@@ -914,3 +920,214 @@ def test_struct_caps_fields_and_validates_arguments(tmp_path: Path) -> None:
         tools.struct(str(binary), 0)
     with pytest.raises(AnalysisError, match="file not found"):
         tools.struct(str(tmp_path / "missing.bin"), TEXT_ADDRESS)
+
+
+# --- bind host normalisation, loopback guard and SDK hardening -----------------
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("[::1]", "::1"),
+        ("  [::1]  ", "::1"),
+        ("localhost", "127.0.0.1"),
+        ("LOCALHOST", "127.0.0.1"),
+        (" LocalHost ", "127.0.0.1"),
+        ("127.0.0.1", "127.0.0.1"),
+        (" 127.0.0.2 ", "127.0.0.2"),
+        ("::1", "::1"),
+        ("0.0.0.0", "0.0.0.0"),
+        ("localhost.evil.com", "localhost.evil.com"),
+        ("", ""),
+        ("   ", ""),
+        # A lone bracket or an empty pair is not an IPv6 literal and is left alone.
+        ("[::1", "[::1"),
+        ("[]", "[]"),
+    ],
+)
+def test_normalise_host_drops_brackets_and_maps_localhost(host: str, expected: str) -> None:
+    assert mcp_server.normalise_host(host) == expected
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("127.0.0.1", True),
+        ("localhost", True),
+        ("LOCALHOST", True),
+        ("::1", True),
+        ("[::1]", True),
+        ("127.0.0.2", True),
+        ("127.255.255.254", True),
+        ("  127.0.0.1  ", True),
+        ("0.0.0.0", False),
+        ("::", False),
+        ("[::]", False),
+        ("localhost.evil.com", False),
+        ("127.0.0.1.evil.com", False),
+        ("example.com", False),
+        ("[::1", False),
+        ("", False),
+        ("   ", False),
+    ],
+)
+def test_is_loopback_host(host: str, expected: bool) -> None:
+    assert mcp_server.is_loopback_host(host) is expected
+
+
+def test_is_loopback_host_rejects_non_strings() -> None:
+    assert mcp_server.is_loopback_host(None) is False  # type: ignore[arg-type]
+    assert mcp_server.is_loopback_host(127) is False  # type: ignore[arg-type]
+
+
+def test_the_guard_covers_every_host_the_sdk_hardens() -> None:
+    """Our loopback rule must be a superset of the SDK's three literal hosts."""
+    assert all(mcp_server.is_loopback_host(host) for host in mcp_server.SDK_HARDENED_HOSTS)
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["127.0.0.1", "localhost", "127.0.0.2", "::1", "[::1]", " 127.0.0.1 "],
+)
+def test_transport_security_always_lists_the_real_bind_address(host: str) -> None:
+    settings = mcp_server.transport_security(host)
+
+    assert isinstance(settings, TransportSecuritySettings)
+    assert settings.enable_dns_rebinding_protection is True
+    bind_host = mcp_server.normalise_host(host)
+    authority = f"[{bind_host}]" if ":" in bind_host else bind_host
+    assert authority in settings.allowed_hosts
+    assert f"{authority}:*" in settings.allowed_hosts
+    assert f"http://{authority}" in settings.allowed_origins
+    assert f"http://{authority}:*" in settings.allowed_origins
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "example.com", "8.8.8.8"])
+def test_transport_security_stays_off_for_a_remote_bind(host: str) -> None:
+    assert mcp_server.transport_security(host) is None
+
+
+def _rejection_status(settings: TransportSecuritySettings, host: str, origin: str | None = None):
+    """Run the SDK's own middleware for one request; return the status or ``None``.
+
+    This is the check the SDK applies to every HTTP request, so ``None`` here
+    means the ``Host``/``Origin`` headers really would have been accepted.
+    """
+    headers = [(b"host", host.encode())]
+    if origin is not None:
+        headers.append((b"origin", origin.encode()))
+    request = Request({"type": "http", "method": "GET", "path": "/sse", "headers": headers})
+    response = asyncio.run(TransportSecurityMiddleware(settings).validate_request(request))
+    return None if response is None else response.status_code
+
+
+def test_127_0_0_2_is_hardened_not_just_accepted() -> None:
+    """The finding: the SDK's own detection skips 127.0.0.2, so ``run`` passes settings."""
+    assert mcp_server.normalise_host("127.0.0.2") not in mcp_server.SDK_HARDENED_HOSTS
+    settings = mcp_server.transport_security("127.0.0.2")
+    assert settings is not None
+
+    assert _rejection_status(settings, "127.0.0.2:8000") is None
+    assert _rejection_status(settings, "127.0.0.2:8000", "http://127.0.0.2:8000") is None
+    # A rebinding page cannot reach the server under a foreign name or origin.
+    assert _rejection_status(settings, "attacker.example:8000") == 421
+    assert _rejection_status(settings, "127.0.0.2:8000", "http://attacker.example") == 403
+
+
+def test_bracketed_ipv6_settings_use_the_bracketed_authority() -> None:
+    settings = mcp_server.transport_security("[::1]")
+
+    assert settings is not None
+    assert _rejection_status(settings, "[::1]:8000") is None
+    assert _rejection_status(settings, "[::1]:8000", "http://[::1]:8000") is None
+    assert _rejection_status(settings, "attacker.example:8000") == 421
+
+
+class _RecordingServer:
+    """Stand-in for :class:`MCPServer` that records how :func:`run` calls it."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def run(self, **kwargs: object) -> None:
+        self.calls.append(kwargs)
+
+
+@pytest.fixture()
+def recording_server(monkeypatch: pytest.MonkeyPatch) -> _RecordingServer:
+    """Replace ``build_server`` so ``run`` records a call instead of binding."""
+    server = _RecordingServer()
+    monkeypatch.setattr(mcp_server, "build_server", lambda: server)
+    return server
+
+
+def test_run_stdio_delegates_to_the_server(recording_server: _RecordingServer) -> None:
+    mcp_server.run("stdio")
+
+    assert recording_server.calls == [{"transport": "stdio"}]
+
+
+@pytest.mark.parametrize("transport", ["bogus", "http", "", "sse ", "STDIO"])
+def test_run_rejects_an_unknown_transport(
+    transport: str, recording_server: _RecordingServer
+) -> None:
+    with pytest.raises(AnalysisError, match="transport"):
+        mcp_server.run(transport)
+
+    assert recording_server.calls == []
+
+
+@pytest.mark.parametrize("port", [True, False, -1, 70000, 65536, "8000", 80.5])
+def test_run_rejects_an_invalid_port(port: object, recording_server: _RecordingServer) -> None:
+    with pytest.raises(AnalysisError, match="port"):
+        mcp_server.run("sse", port=port)  # type: ignore[arg-type]
+
+    assert recording_server.calls == []
+
+
+@pytest.mark.parametrize("host", ["   ", "", "[]"])
+def test_run_rejects_a_host_that_normalises_to_nothing(
+    host: str, recording_server: _RecordingServer
+) -> None:
+    with pytest.raises(AnalysisError):
+        mcp_server.run("sse", host=host, port=0)
+
+    assert recording_server.calls == []
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "8.8.8.8", "example.com", "localhost.evil.com"])
+def test_run_refuses_a_remote_host_without_allow_remote(
+    host: str, recording_server: _RecordingServer
+) -> None:
+    with pytest.raises(AnalysisError, match="allow_remote"):
+        mcp_server.run("sse", host=host, port=0)
+
+    assert recording_server.calls == []
+
+
+@pytest.mark.parametrize("transport", ["sse", "streamable-http"])
+def test_run_allows_a_remote_host_when_allow_remote_is_set(
+    transport: str, recording_server: _RecordingServer
+) -> None:
+    mcp_server.run(transport, host="0.0.0.0", port=0, allow_remote=True)
+
+    assert recording_server.calls == [
+        {"transport": transport, "host": "0.0.0.0", "port": 0, "transport_security": None}
+    ]
+
+
+@pytest.mark.parametrize("host", ["127.0.0.2", "localhost", "[::1]", " 127.0.0.1 "])
+def test_run_passes_the_normalised_host_with_hardening(
+    host: str, recording_server: _RecordingServer
+) -> None:
+    mcp_server.run("sse", host=host, port=0)
+
+    assert len(recording_server.calls) == 1
+    call = recording_server.calls[0]
+    assert call["host"] == mcp_server.normalise_host(host)
+    assert call["port"] == 0
+    settings = call["transport_security"]
+    assert isinstance(settings, TransportSecuritySettings)
+    assert settings.enable_dns_rebinding_protection is True
+
+
