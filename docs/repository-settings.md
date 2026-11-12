@@ -1,22 +1,33 @@
 # Repository settings checklist (maintainers)
 
-These steps need repository admin rights and are performed once in the GitHub
-UI. They cannot be applied from the codebase.
+Branch protection for `main` is applied. The PyPI publishing steps still require
+repository and PyPI admin access.
 
-## 1. Branch protection for `main`
+## 1. Branch protection for `main` — applied
 
-Settings → Branches → Add branch ruleset (or classic protection) for `main`:
+Applied through the GitHub API (`PUT /repos/kevindoni/CODEVANTA/branches/main/protection`):
 
-- [ ] Require a pull request before merging (1 approval)
-- [ ] Dismiss stale approvals when new commits are pushed
-- [ ] Require status checks to pass:
-  - `test (py3.11)`
-  - `test (py3.13)`
-  - `build and smoke-test wheel`
-- [ ] Require branches to be up to date before merging
-- [ ] Require linear history
-- [ ] Block force pushes and deletions
-- [ ] (Optional) Require signed commits
+| Rule | Value |
+|------|-------|
+| Require a pull request before merging | yes (0 approvals, so a maintainer can self-merge) |
+| Dismiss stale approvals on new commits | yes |
+| Require status checks | `test (py3.11)`, `test (py3.13)`, `build and smoke-test wheel` |
+| Require branches to be up to date | yes (strict) |
+| Require linear history | yes (squash or rebase merges only) |
+| Block force pushes | yes |
+| Block deletions | yes |
+| Enforce for administrators | yes |
+
+Direct pushes to `main` are rejected, including for maintainers. Work on a branch:
+
+```powershell
+git checkout -b feat/my-change
+# ... commit ...
+git push -u origin feat/my-change
+gh pr create --fill --base main
+gh pr checks --watch
+gh pr merge --squash --delete-branch
+```
 
 ## 2. Environment `pypi`
 

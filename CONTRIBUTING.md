@@ -76,6 +76,18 @@ the body and mention user-visible changes.
 
 ## Pull requests
 
+`main` is protected: a pull request is required and the CI checks
+(`test (py3.11)`, `test (py3.13)`, `build and smoke-test wheel`) must pass before
+a squash merge. Direct pushes to `main` are rejected, including for maintainers.
+
+Work on a branch, push it, and open a pull request:
+
+```powershell
+git checkout -b feat/my-change
+git push -u origin feat/my-change
+gh pr create --fill --base main
+```
+
 Describe the problem, the approach, compatibility risks, and the validation you
 ran. Link related issues. Keep changes focused; large refactors should be
 discussed in an issue first.
