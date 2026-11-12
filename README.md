@@ -42,7 +42,7 @@ Delivered in phase 1:
 - Sections, imports, exports, and symbol extraction — every finding carries evidence.
 - x86/x64 disassembly of executable sections and the entry point.
 - Function candidates from exports, function symbols, and the entry point, each with source and confidence.
-- ASCII and UTF-16LE string extraction with file offset and mapped virtual address.
+- ASCII and UTF-16 string extraction (byte order follows the binary) with file offset and mapped virtual address.
 - CLI: `info`, `functions`, `strings`, `disasm`, `analyze` (+ JSON report).
 - **MCP server** (`codevanta mcp serve`) exposing the phase 1 tools to coding agents.
 - **Guided setup** (`codevanta setup`) for Claude Code, Cursor, Cline, and VS Code, with plan preview, backups, and verification.

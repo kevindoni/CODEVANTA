@@ -1,4 +1,11 @@
-"""ASCII and UTF-16LE string extraction with location mapping."""
+"""ASCII and UTF-16 string extraction with location mapping.
+
+The UTF-16 byte order follows the binary's endianness when metadata is
+available: little-endian targets are scanned as UTF-16LE, big-endian targets
+as UTF-16BE. Without metadata the scan defaults to UTF-16LE and never guesses
+a byte swap, so little-endian results cannot be fabricated from shifted
+matches inside big-endian data (and vice versa).
+"""
 
 from __future__ import annotations
 
@@ -37,7 +44,11 @@ class StringResult:
 
 
 class StringExtractor:
-    """Extracts printable ASCII and UTF-16LE strings from a file."""
+    """Extracts printable ASCII and UTF-16 strings from a file.
+
+    UTF-16 output uses the byte order of ``BinaryInfo.endianness`` when
+    metadata is supplied; see the module docstring for the no-metadata rule.
+    """
 
     def __init__(self, min_length: int = 4) -> None:
         if min_length < 1:
@@ -50,17 +61,29 @@ class StringExtractor:
         info: BinaryInfo | None = None,
         limit: int = 0,
     ) -> list[StringResult]:
-        """Extract strings from ``path``; ``limit`` caps the result count."""
+        """Extract strings from ``path``; ``limit`` caps the result count.
+
+        ASCII strings are always scanned. UTF-16 strings are scanned in the
+        byte order of the binary when ``info`` is given (little-endian targets
+        as UTF-16LE, big-endian targets as UTF-16BE); without ``info`` the
+        scan stays at UTF-16LE rather than guessing a byte swap.
+        """
         data = Path(path).read_bytes()
         results: list[StringResult] = []
         ascii_pattern = re.compile(rb"[\x20-\x7e]{%d,}" % self.min_length)
         for match in ascii_pattern.finditer(data):
             text = match.group().decode("ascii", errors="replace")
             results.append(self._result(match.start(), text, "ascii", info))
-        utf16_pattern = re.compile(rb"(?:[\x20-\x7e]\x00){%d,}" % self.min_length)
-        for match in utf16_pattern.finditer(data):
-            text = match.group().decode("utf-16-le", errors="replace")
-            results.append(self._result(match.start(), text, "utf-16le", info))
+        if info is not None and info.endianness == "big":
+            utf16_pattern = re.compile(rb"(?:\x00[\x20-\x7e]){%d,}" % self.min_length)
+            codec, label = "utf-16-be", "utf-16be"
+        else:
+            utf16_pattern = re.compile(rb"(?:[\x20-\x7e]\x00){%d,}" % self.min_length)
+            codec, label = "utf-16-le", "utf-16le"
+        results.extend(
+            self._result(match.start(), match.group().decode(codec, errors="replace"), label, info)
+            for match in utf16_pattern.finditer(data)
+        )
         results.sort(key=lambda r: (r.offset, r.encoding))
         if limit and len(results) > limit:
             return results[:limit]

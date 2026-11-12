@@ -35,7 +35,7 @@ IR layer     Evidence layer
 |--------|----------------|
 | `src/codevanta/core/loader.py` | Parse PE/ELF/Mach-O via LIEF; normalize metadata into `BinaryInfo` |
 | `src/codevanta/core/disassembler.py` | Decode machine code with Capstone into `IRInstruction` |
-| `src/codevanta/core/strings.py` | Extract ASCII/UTF-16LE strings with offset → VA mapping |
+| `src/codevanta/core/strings.py` | Extract ASCII/UTF-16 strings (byte order from the binary) with offset → VA mapping |
 | `src/codevanta/core/functions.py` | Discover function candidates with provenance |
 | `src/codevanta/core/report.py` | Shared report/disassembly helpers for CLI and MCP |
 | `src/codevanta/mcp_server/tools.py` | MCP tool functions (plain, testable) |
