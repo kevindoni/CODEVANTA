@@ -23,178 +23,413 @@ from __future__ import annotations
 __all__ = ["render_dashboard_html"]
 
 _STYLE = """
-:root { color-scheme: dark; }
+:root {
+  color-scheme: dark;
+  --bg: #0a0c10;
+  --card: #10141b;
+  --card-2: #161b25;
+  --line: #1e2634;
+  --line-2: #2c3648;
+  --ink: #dde6f2;
+  --mut: #9aa8bc;
+  --dim: #66748c;
+  --acc: #2dd4bf;
+  --acc-strong: #14b8a6;
+  --acc-bg: rgba(45, 212, 191, 0.09);
+  --err: #f87171;
+  --ok: #4ade80;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+  --radius: 10px;
+}
 * { box-sizing: border-box; }
+html { height: 100%; }
 body {
   margin: 0;
-  padding: 24px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  background: #0f1115;
-  color: #d7dce5;
+  min-height: 100%;
+  padding: 0 0 56px;
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  background:
+    radial-gradient(1100px 480px at 85% -10%, rgba(45, 212, 191, 0.07), transparent 60%),
+    radial-gradient(900px 420px at -10% 0%, rgba(99, 102, 241, 0.05), transparent 55%),
+    var(--bg);
+  color: var(--ink);
 }
-header { margin: 0 0 20px; }
-h1 {
-  margin: 0 0 6px;
-  font-size: 20px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: #7fe3c0;
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 28px; }
+
+/* ---- top bar ---------------------------------------------------------- */
+.topbar {
+  border-bottom: 1px solid var(--line);
+  background: rgba(10, 12, 16, 0.82);
+  position: sticky; top: 0; z-index: 5;
 }
-h2 {
-  margin: 0 0 12px;
-  font-size: 13px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: #8b97a8;
+.topbar .wrap {
+  display: flex; align-items: center; gap: 16px;
+  padding-top: 14px; padding-bottom: 14px;
 }
-.hint { margin: 0; font-size: 12px; color: #6b7686; }
-.grid {
-  display: grid;
-  gap: 16px;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+.mark {
+  width: 38px; height: 38px; flex: none;
+  display: grid; place-items: center;
+  border-radius: 10px;
+  border: 1px solid rgba(45, 212, 191, 0.55);
+  background: linear-gradient(160deg, rgba(45, 212, 191, 0.16), rgba(45, 212, 191, 0.03));
+  color: var(--acc);
+  font: 700 13px/1 var(--mono);
+  letter-spacing: 0.04em;
 }
+.brand h1 {
+  margin: 0;
+  font-size: 17px; font-weight: 700; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--ink);
+}
+.brand h1 em {
+  font-style: normal; color: var(--acc);
+}
+.brand p {
+  margin: 2px 0 0;
+  font-size: 12px; color: var(--dim);
+}
+.meta { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 5px 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--dim);
+  white-space: nowrap;
+}
+.pill .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 6px rgba(74, 222, 128, 0.8);
+}
+.pill.secure .dot { background: var(--acc); box-shadow: 0 0 6px rgba(45, 212, 191, 0.8); }
+
+/* ---- cards ------------------------------------------------------------ */
+main.wrap { padding-top: 24px; display: grid; gap: 16px; }
 .card {
-  border: 1px solid #232a35;
-  border-radius: 8px;
-  background: #151922;
-  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--card-2), var(--card));
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  padding: 20px 22px 22px;
 }
+.card-head {
+  display: flex; align-items: baseline; gap: 12px;
+  margin: 0 0 16px;
+}
+.card-head h2 {
+  margin: 0;
+  font-size: 13px; font-weight: 700; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--mut);
+}
+.card-head .hint { margin: 0; font-size: 12px; color: #7c8aa0; }
+
+/* ---- forms ------------------------------------------------------------ */
 label {
-  display: block;
-  margin: 0 0 4px;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: #8b97a8;
+  display: block; margin: 0 0 6px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.07em;
+  text-transform: uppercase; color: var(--mut);
 }
 input, select {
   width: 100%;
-  margin: 0 0 12px;
-  padding: 7px 9px;
-  border: 1px solid #2c3542;
-  border-radius: 5px;
-  background: #0f131a;
-  color: #e6ebf3;
-  font: inherit;
-  font-size: 13px;
+  height: 38px;
+  padding: 0 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: #0b0e13;
+  color: var(--ink);
+  font: 500 13px/1 var(--sans);
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
-input:focus, select:focus { outline: 1px solid #4fd1a5; border-color: #4fd1a5; }
-.row {
-  display: grid;
-  gap: 12px;
+input.mono, .mono input { font-family: var(--mono); }
+input:focus, select:focus {
+  outline: none;
+  border-color: var(--acc);
+  box-shadow: 0 0 0 3px rgba(45, 212, 191, 0.16);
+}
+input::placeholder { color: #46536b; }
+.selwrap { position: relative; }
+.selwrap select { appearance: none; padding-right: 32px; cursor: pointer; }
+.selwrap::after {
+  content: "";
+  position: absolute; right: 13px; top: 50%;
+  width: 7px; height: 7px;
+  border-right: 1.5px solid var(--dim);
+  border-bottom: 1.5px solid var(--dim);
+  transform: translateY(-70%) rotate(45deg);
+  pointer-events: none;
+}
+
+/* ---- hero path row ---------------------------------------------------- */
+.path-row { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 14px; }
+.path-row .grow { flex: 1; }
+#path {
+  height: 46px;
+  font-size: 14px;
+  border-color: var(--line-2);
+}
+.path-row kbd {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 6px;
+  border: 1px solid var(--line-2);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: #0b0e13;
+  font: 600 10px/1.4 var(--mono);
+  color: var(--dim);
+}
+
+/* ---- option grids ------------------------------------------------------ */
+.options {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 14px 14px 2px;
+  margin: 0 0 16px;
+}
+.options legend {
+  padding: 0 6px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--dim);
+}
+.grid-opts {
+  display: grid; gap: 12px;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
 }
-.buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.grid-opts > div { min-width: 0; }
+
+/* ---- buttons ----------------------------------------------------------- */
+.group-label {
+  margin: 0 0 8px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--dim);
+}
+.verbs {
+  display: grid; gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+}
 button {
-  padding: 7px 12px;
-  border: 1px solid #2f6f5c;
-  border-radius: 5px;
-  background: #16302a;
-  color: #9df0d2;
-  font: inherit;
-  font-size: 12px;
-  letter-spacing: 0.05em;
+  height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--mut);
+  font: 650 12px/1 var(--sans);
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.06s;
 }
-button:hover { background: #1d433a; }
-button[data-action="diff"] {
-  border-color: #6f5c2f;
-  background: #302a16;
-  color: #f0df9d;
+button:hover {
+  color: var(--acc);
+  border-color: rgba(45, 212, 191, 0.55);
+  background: var(--acc-bg);
+}
+button:active { transform: translateY(1px); }
+button.primary {
+  border-color: transparent;
+  background: linear-gradient(180deg, var(--acc), var(--acc-strong));
+  color: #052e28;
+  font-weight: 750;
+}
+button.primary:hover {
+  color: #052e28;
+  filter: brightness(1.08);
+  background: linear-gradient(180deg, var(--acc), var(--acc-strong));
+}
+.row-2col {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+/* ---- result ------------------------------------------------------------ */
+.card.result { display: grid; gap: 0; }
+.result-head {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin: 0 0 14px;
+}
+.result-head h2 {
+  margin: 0;
+  font-size: 13px; font-weight: 700; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--mut);
 }
 .status {
-  font-size: 11px;
-  letter-spacing: 0;
+  font: 600 11px/1 var(--mono);
+  color: var(--dim);
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #0b0e13;
+  letter-spacing: 0.02em;
   text-transform: none;
-  color: #6b7686;
 }
-.status.error { color: #ff9a9a; }
-pre#out {
-  margin: 0 0 12px;
-  padding: 12px;
-  max-height: 340px;
+.status.error { color: var(--err); border-color: rgba(248, 113, 113, 0.4); }
+.table-wrap {
   overflow: auto;
-  border: 1px solid #232a35;
-  border-radius: 6px;
-  background: #0b0e14;
-  font-size: 12px;
-  line-height: 1.45;
-  white-space: pre-wrap;
-  word-break: break-word;
+  max-height: 56vh;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0b0e13;
 }
-table#tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
+table#tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 table#tbl th, table#tbl td {
-  padding: 5px 8px;
-  border-bottom: 1px solid #232a35;
-  text-align: left;
-  vertical-align: top;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  text-align: left; vertical-align: top;
+  font-family: var(--mono);
 }
+table#tbl tbody tr:last-child td { border-bottom: none; }
+table#tbl tbody tr:hover td { background: rgba(45, 212, 191, 0.04); }
 table#tbl th {
-  color: #8b97a8;
-  font-size: 10px;
-  font-weight: 600;
+  position: sticky; top: 0; z-index: 1;
+  color: var(--dim);
+  font: 700 10px/1.2 var(--sans);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: var(--card-2);
+  border-bottom: 1px solid var(--line-2);
+}
+td.conf {
+  font: 600 10px/1 var(--sans);
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
-.wide { grid-column: 1 / -1; }
+td.conf::before {
+  content: "";
+  display: inline-block;
+  width: 7px; height: 7px; margin-right: 6px;
+  border-radius: 50%;
+  vertical-align: baseline;
+}
+td.conf-high { color: var(--ok); }
+td.conf-high::before { background: var(--ok); box-shadow: 0 0 5px rgba(74, 222, 128, 0.7); }
+td.conf-medium { color: #fbbf24; }
+td.conf-medium::before { background: #fbbf24; box-shadow: 0 0 5px rgba(251, 191, 36, 0.6); }
+td.conf-low { color: var(--err); }
+td.conf-low::before { background: var(--err); box-shadow: 0 0 5px rgba(248, 113, 113, 0.6); }
+details.raw {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0b0e13;
+}
+details.raw summary {
+  cursor: pointer;
+  padding: 9px 14px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--dim);
+  user-select: none;
+  list-style: none;
+  display: flex; align-items: center; gap: 8px;
+}
+details.raw summary::before {
+  content: "";
+  width: 0; height: 0;
+  border-left: 5px solid var(--dim);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 0.15s;
+}
+details.raw[open] summary::before { transform: rotate(90deg); }
+details.raw summary:hover { color: var(--mut); }
+pre#out {
+  margin: 0;
+  padding: 14px;
+  max-height: 340px;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  font: 400 12px/1.55 var(--mono);
+  color: #b9c5d6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---- responsive -------------------------------------------------------- */
+@media (max-width: 760px) {
+  .topbar .wrap { flex-wrap: wrap; }
+  .meta { margin-left: 0; }
+  .path-row { flex-direction: column; align-items: stretch; }
+}
 """
 
 _BODY = """
-<header>
-  <h1>__TITLE__</h1>
-  <p class="hint">
-    Local dashboard over the CODEVANTA analysis engines. Read-only: files are parsed,
-    never executed or modified, and nothing leaves this machine.
-  </p>
-</header>
-<main class="grid">
+<div class="topbar">
+  <div class="wrap">
+    <div class="mark">CV</div>
+    <div class="brand">
+      <h1>code<em>vanta</em></h1>
+      <p>Advanced code intelligence &middot; decode, analyze, understand</p>
+    </div>
+    <div class="meta">
+      <span class="pill"><span class="dot"></span>read-only</span>
+      <span class="pill secure"><span class="dot"></span>local &middot; static</span>
+    </div>
+  </div>
+</div>
+<main class="wrap">
   <section class="card">
-    <h2>Single binary</h2>
-    <label for="path">Path</label>
-    <input id="path" type="text" spellcheck="false" autocomplete="off"
-           placeholder="absolute path to a PE, ELF or Mach-O file">
-    <div class="row">
-      <div>
-        <label for="address">Address (hex or decimal)</label>
-        <input id="address" type="text" spellcheck="false" autocomplete="off" value="0x401000">
-      </div>
-      <div>
-        <label for="limit">Limit</label>
-        <input id="limit" type="number" min="0" max="200000" step="1" value="100">
+    <div class="card-head">
+      <h2>Analyze a binary</h2>
+      <p class="hint">files are parsed, never executed or modified &mdash; nothing leaves this machine</p>
+    </div>
+    <div class="path-row">
+      <div class="grow mono">
+        <label for="path">Binary path <kbd>Enter</kbd> runs Info</label>
+        <input id="path" type="text" spellcheck="false" autocomplete="off"
+               placeholder="absolute path to a PE, ELF or Mach-O file">
       </div>
     </div>
-    <div class="row">
-      <div>
-        <label for="min_length">Strings: min length</label>
-        <input id="min_length" type="number" min="1" max="200000" step="1" value="4">
+    <fieldset class="options">
+      <legend>Options</legend>
+      <div class="grid-opts">
+        <div>
+          <label for="address">Address (hex or decimal)</label>
+          <input id="address" type="text" spellcheck="false" autocomplete="off" value="0x401000">
+        </div>
+        <div>
+          <label for="limit">Limit</label>
+          <input id="limit" type="number" min="0" max="200000" step="1" value="100">
+        </div>
+        <div>
+          <label for="min_length">Strings &middot; min length</label>
+          <input id="min_length" type="number" min="1" max="200000" step="1" value="4">
+        </div>
+        <div>
+          <label for="max_fields">Struct &middot; max fields</label>
+          <input id="max_fields" type="number" min="1" max="512" step="1" value="64">
+        </div>
+        <div>
+          <label for="limit_edges">Callgraph &middot; max edges</label>
+          <input id="limit_edges" type="number" min="1" max="200000" step="1" value="5000">
+        </div>
+        <div>
+          <label for="traversal">CFG traversal</label>
+          <div class="selwrap">
+            <select id="traversal">
+              <option value="linear">linear</option>
+              <option value="recursive">recursive</option>
+            </select>
+          </div>
+        </div>
+        <div>
+          <label for="include_stack">Struct &middot; include stack</label>
+          <div class="selwrap">
+            <select id="include_stack">
+              <option value="0">no</option>
+              <option value="1">yes</option>
+            </select>
+          </div>
+        </div>
       </div>
-      <div>
-        <label for="max_fields">Struct: max fields</label>
-        <input id="max_fields" type="number" min="1" max="512" step="1" value="64">
-      </div>
-      <div>
-        <label for="limit_edges">Callgraph: max edges</label>
-        <input id="limit_edges" type="number" min="1" max="200000" step="1" value="5000">
-      </div>
-    </div>
-    <div class="row">
-      <div>
-        <label for="traversal">CFG traversal</label>
-        <select id="traversal">
-          <option value="linear">linear</option>
-          <option value="recursive">recursive</option>
-        </select>
-      </div>
-      <div>
-        <label for="include_stack">Struct: include stack</label>
-        <select id="include_stack">
-          <option value="0">no</option>
-          <option value="1">yes</option>
-        </select>
-      </div>
-    </div>
-    <div class="buttons">
+    </fieldset>
+    <p class="group-label">Run analysis</p>
+    <div class="verbs">
       <button type="button" data-action="info">Info</button>
       <button type="button" data-action="functions">Functions</button>
       <button type="button" data-action="strings">Strings</button>
@@ -206,36 +441,55 @@ _BODY = """
   </section>
 
   <section class="card">
-    <h2>Diff two binaries</h2>
-    <label for="left">Left (baseline)</label>
-    <input id="left" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path">
-    <label for="right">Right (candidate)</label>
-    <input id="right" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path">
-    <div class="row">
+    <div class="card-head">
+      <h2>Diff two binaries</h2>
+      <p class="hint">pair every function across two builds of the same program</p>
+    </div>
+    <div class="row-2col">
+      <div class="mono">
+        <label for="left">Baseline</label>
+        <input id="left" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path">
+      </div>
+      <div class="mono">
+        <label for="right">Candidate</label>
+        <input id="right" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path">
+      </div>
+    </div>
+    <div class="grid-opts" style="margin-top:12px">
       <div>
         <label for="semantic">Mode</label>
-        <select id="semantic">
-          <option value="0">structural</option>
-          <option value="1">semantic</option>
-        </select>
+        <div class="selwrap">
+          <select id="semantic">
+            <option value="0">structural</option>
+            <option value="1">semantic</option>
+          </select>
+        </div>
       </div>
       <div>
-        <label for="threshold">Semantic threshold</label>
+        <label for="threshold" title="0-1 similarity cutoff: 0 pairs everything, 1 demands identical shapes">Semantic threshold</label>
         <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.5">
       </div>
     </div>
-    <div class="buttons">
-      <button type="button" data-action="diff">Diff</button>
+    <div class="verbs" style="margin-top:14px; grid-template-columns: minmax(0, 200px)">
+      <button type="button" data-action="diff" class="primary">Diff</button>
     </div>
   </section>
 
-  <section class="card wide">
-    <h2>Result <span class="status" id="status">idle</span></h2>
-    <pre id="out">No request yet. Pick a binary and press a button.</pre>
-    <table id="tbl">
-      <thead><tr></tr></thead>
-      <tbody></tbody>
-    </table>
+  <section class="card result">
+    <div class="result-head">
+      <h2>Result</h2>
+      <span class="status" id="status">idle</span>
+    </div>
+    <div class="table-wrap">
+      <table id="tbl">
+        <thead><tr></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <details class="raw" open>
+      <summary>Raw JSON</summary>
+      <pre id="out">No request yet. Point the path field at a binary and pick an analysis above.</pre>
+    </details>
   </section>
 </main>
 """
@@ -424,6 +678,16 @@ _SCRIPT = """
         } else {
           td.textContent = cellText(row);
         }
+        if (name === "confidence" || name === "confidence_level") {
+          var level = String(td.textContent).toLowerCase();
+          if (level.indexOf("certain") !== -1 || level.indexOf("high") !== -1) {
+            td.className = "conf conf-high";
+          } else if (level.indexOf("medium") !== -1) {
+            td.className = "conf conf-medium";
+          } else if (level !== "") {
+            td.className = "conf conf-low";
+          }
+        }
         tr.appendChild(td);
       });
       body.appendChild(tr);
@@ -465,8 +729,15 @@ _SCRIPT = """
       .then(function (result) {
         showPayload(result.data);
         if (result.ok) {
-          setStatus("HTTP " + result.status, false);
-          renderTable(pickRows(result.data));
+          var rows = pickRows(result.data);
+          renderTable(rows);
+          var shown = Math.min(rows.length, MAX_TABLE_ROWS);
+          var summary = "HTTP " + result.status + (rows.length ? " · " + shown + (rows.length > MAX_TABLE_ROWS ? " of " + rows.length : "") + " rows" : "");
+          setStatus(summary, false);
+          var resultCard = document.querySelector(".card.result");
+          if (resultCard && resultCard.scrollIntoView) {
+            resultCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          }
         } else {
           var detail = result.data && result.data.error ? result.data.error : "request failed";
           setStatus("HTTP " + result.status + " " + detail, true);
@@ -499,7 +770,6 @@ _SCRIPT = """
 
 
 """
-
 
 _TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -558,4 +828,3 @@ def render_dashboard_html(title: str = "CODEVANTA") -> str:
     # Applied last so a title that happens to look like a placeholder cannot be
     # expanded by a later substitution.
     return page.replace("__TITLE__", _escape_html(title.strip() or "CODEVANTA"))
-
