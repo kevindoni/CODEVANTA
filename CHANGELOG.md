@@ -112,15 +112,37 @@ All notable changes to CODEVANTA are documented here. The format follows
   rejected downstream by an exporter default.
 - Documentation: `docs/phase2d.md` covers the viewer, the three columns, document
   anatomy, caps and sizing, offline guarantees, limits, and next steps.
+- Recursive CFG traversal (`codevanta.analysis.cfg`): new
+  `build_recursive_cfg(path, info, start, max_instructions=2000, max_blocks=500)`
+  returns the same `FunctionCFG` as `build_cfg`, but follows control flow from
+  `start` with a worklist of block starts and a visited set instead of decoding a
+  fixed window. Successors follow the block-terminating instruction: a
+  conditional jump yields fallthrough plus its direct target, an unconditional
+  `jmp` yields the target only, `ret`/`iret` yield none, and every other
+  instruction (including `call`) yields fallthrough only. Call targets are not
+  followed and indirect jumps are not resolved; direct targets outside executable
+  sections are dropped and reported in `warnings`. Blocks and successors are
+  sorted, the graph is bounded by `max_instructions` / `max_blocks` (with the
+  existing `truncated` flag), and evidence uses `cfg.recursive_traversal` at
+  `medium` confidence because indirect targets remain unresolved. Unreachable
+  padding after a `ret` or `jmp` is no longer decoded.
+- CLI: `codevanta cfg --traversal linear|recursive`. The default stays `linear`,
+  so existing invocations, tables, and JSON output are unchanged; `recursive`
+  selects `build_recursive_cfg` and reports the same payload with the
+  `cfg.recursive_traversal` evidence source.
+- Documentation: `docs/phase2e.md` covers the new traversal, its successor rules,
+  how it differs from the linear sweep, the CLI flag, evidence and confidence,
+  bounds, limitations, and next steps.
 
 ### Notes
 
-- Phase 2 is in progress: linear sweep only, direct branch targets plus absolute
-  and RIP-relative pointer slots only, no register-target or indexed-memory
-  resolution, no slot dereferencing, no recursive traversal, no interactive graph
-  viewer (the HTML/SVG export is a static, script-free file), and no debugger yet.
-  See `docs/phase2.md`, `docs/phase2b.md`, `docs/phase2c.md`, and
-  `docs/phase2d.md`.
+- Phase 2 is in progress: the CFG uses a linear sweep by default and an optional
+  bounded recursive traversal (`--traversal recursive`), with direct branch
+  targets plus absolute and RIP-relative pointer slots only; no indirect jump or
+  register-target resolution, no call following, no cross-function analysis, no
+  slot dereferencing, no interactive graph viewer (the HTML/SVG export is a
+  static, script-free file), and no debugger yet. See `docs/phase2.md`,
+  `docs/phase2b.md`, `docs/phase2c.md`, `docs/phase2d.md`, and `docs/phase2e.md`.
 - Node boundaries and caller attribution are heuristics, not proven function
   extents. Sessions and annotations live in one local SQLite file with no schema
   migrations yet.
