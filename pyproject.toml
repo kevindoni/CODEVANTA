@@ -53,6 +53,12 @@ dev = [
 emulation = [
   "unicorn>=2.0",
 ]
+# Real decompiler providers. Deliberately NOT part of `dev`: angr is heavy, so only
+# the `decompile-parity` CI job installs it. `pip install -e ".[decompilers]"` is
+# the local equivalent and makes `codevanta.analysis.decompilers` prefer angr.
+decompilers = [
+  "angr>=9.2",
+]
 
 [project.scripts]
 codevanta = "codevanta.cli.main:main"

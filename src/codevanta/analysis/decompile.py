@@ -12,7 +12,12 @@ module only *shapes* that structure into text.
    six. A register counts as *read* unless it is only the destination of the
    instruction, so ``mov rax, rdi`` reads ``rdi`` while ``mov rdi, rax`` does
    not. The name comes from the discovered function candidate, else
-   ``sub_<address>``.
+   ``sub_<address>``. Every parameter and the return value then carry an inferred
+   C type from :mod:`codevanta.analysis.type_propagation` -- the count rule is
+   shared with it, so the signature and the rendered ``a0``..``a5`` operands
+   always agree -- and the header repeats one short line per argument. An
+   argument nothing can be proven about keeps the ``unknown<bitness>``
+   placeholder with a low confidence rather than a guess.
 2. **Operands.** Argument registers become ``a0``..``a5``; every other register
    keeps its architectural name. ``[rbp - 8]``-style operands become frame slots
    (``local_0x8`` below the frame pointer, ``arg_0x8`` above it) and other
@@ -44,7 +49,9 @@ module only *shapes* that structure into text.
 Every result carries :class:`Evidence`; the confidence is :attr:`Confidence.LOW`
 because the whole rendering is a mnemonic-level heuristic. The header comment
 block repeats the address, the confidence and the evidence note, and the target
-binary is only ever read, never executed.
+binary is only ever read, never executed. ``evidence.extra`` carries the
+inferred signature as data (``argument_types``, ``return_type``) so JSON
+consumers do not have to parse the pseudo-C.
 
 Work is bounded by ``max_instructions`` and ``max_blocks`` (defaults
 :data:`DEFAULT_MAX_INSTRUCTIONS` / :data:`DEFAULT_MAX_BLOCKS`); a cut-short
@@ -61,6 +68,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from codevanta.analysis.cfg import BasicBlock, FunctionCFG, build_recursive_cfg
+from codevanta.analysis.type_propagation import (
+    ArgumentType,
+    ReturnType,
+    infer_argument_types,
+    infer_return_type,
+)
 from codevanta.core.functions import discover_functions
 from codevanta.core.loader import BinaryInfo
 from codevanta.core.report import MAX_DISASSEMBLY_COUNT, AnalysisError
@@ -171,9 +184,6 @@ _ADDRESS_TERM = re.compile(
     r"(?P<sign>[+-])?\s*(?P<value>0x[0-9a-fA-F]+|\d+|[a-zA-Z][a-zA-Z0-9]*)"
     r"(?:\s*\*\s*(?P<scale>\d+))?"
 )
-
-#: A whole identifier-ish token, used to find register reads.
-_WORD = re.compile(r"[a-zA-Z][a-zA-Z0-9]*")
 
 #: An operand that is exactly one register or one immediate.
 _SIMPLE_OPERAND = re.compile(r"^(?:[a-z][a-z0-9]*|-?(?:0x[0-9a-f]+|\d+))$")
@@ -468,40 +478,6 @@ def _argument_names(bitness: int) -> dict[str, str]:
             names.setdefault(alias, f"a{position}")
         names.setdefault(register, f"a{position}")
     return names
-
-
-def _register_reads(instruction: dict[str, Any]) -> set[str]:
-    """Return the lowercased register-sized tokens an instruction reads.
-
-    The first operand is skipped for the mnemonics that only write it
-    (``mov``-family, ``lea``, ``pop``, ``setcc``), so ``mov rdi, rax`` does not
-    count as a read of ``rdi``.
-    """
-    mnemonic = _mnemonic(instruction)
-    destination_only = (
-        mnemonic in _MOV_MNEMONICS or mnemonic in {"lea", "pop"} or mnemonic.startswith("set")
-    )
-    reads: set[str] = set()
-    for position, operand in enumerate(_split_operands(_operands(instruction))):
-        if position == 0 and destination_only:
-            continue
-        reads.update(token.lower() for token in _WORD.findall(operand))
-    return reads
-
-
-def _argument_count(blocks: list[BasicBlock], argument_names: dict[str, str]) -> int:
-    """Infer the argument count from ABI register reads before the first call."""
-    count = 0
-    for block in blocks:
-        for instruction in block.instructions:
-            if _mnemonic(instruction) in _CALL_MNEMONICS:
-                return min(count, _MAX_ARGUMENTS)
-            for name in _register_reads(instruction):
-                argument = argument_names.get(name)
-                if argument is None:
-                    continue
-                count = max(count, int(argument[1:]) + 1)
-    return min(count, _MAX_ARGUMENTS)
 
 
 def _identifier(name: str | None, fallback: str) -> str:
@@ -966,6 +942,8 @@ def _header(
     display: str,
     cfg: FunctionCFG,
     truncated: bool,
+    argument_types: tuple[ArgumentType, ...] = (),
+    return_type: ReturnType | None = None,
 ) -> list[str]:
     """Build the header comment block (ASCII only)."""
     warnings = list(cfg.warnings)
@@ -985,6 +963,16 @@ def _header(
         " * caveat: control flow, argument count and types are inferred from mnemonics;"
         " nothing is executed",
     ]
+    for argument in argument_types:
+        lines.append(
+            f" * argument {argument.name} ({argument.register}): {argument.c_type} "
+            f"[{argument.confidence.value}] - {argument.evidence_note}"
+        )
+    if return_type is not None:
+        lines.append(
+            f" * return: {return_type.c_type} [{return_type.confidence.value}] - "
+            f"{return_type.evidence_note}"
+        )
     for warning in warnings[:6]:
         lines.append(f" * warning: {warning}")
     if len(warnings) > 6:
@@ -1058,8 +1046,14 @@ def decompile_function(
     lines, call_sites = renderer.render()
 
     display = _identifier(cfg.function_name, f"sub_{address:x}")
-    arguments = _argument_count(blocks, argument_names)
-    parameters = ", ".join(f"undefined{info.bitness} a{index}" for index in range(arguments))
+    instructions = [
+        instruction for block in blocks for instruction in block.instructions
+    ]
+    argument_types = infer_argument_types(instructions, pointer_width)
+    return_type = infer_return_type(instructions, pointer_width)
+    parameters = ", ".join(
+        f"{argument.c_type} {argument.name}" for argument in argument_types
+    )
     if not parameters:
         parameters = "void"
     truncated = cfg.truncated
@@ -1070,14 +1064,19 @@ def decompile_function(
         address=address,
         detail=(
             f"pseudo-C rendered from {cfg.instruction_count} instruction(s) in "
-            f"{len(blocks)} block(s) of a recursive traversal; argument count from ABI "
-            "register reads, control flow from branch targets, widths from the pointer "
-            "size; mnemonics only, nothing is executed"
+            f"{len(blocks)} block(s) of a recursive traversal; argument count and "
+            "argument/return types from register use, control flow from branch "
+            "targets, widths from the pointer size; mnemonics only, nothing is "
+            "executed"
         ),
+        extra={
+            "argument_types": [argument.to_dict() for argument in argument_types],
+            "return_type": return_type.to_dict(),
+        },
     )
 
-    body_lines = _header(evidence, display, cfg, truncated)
-    body_lines.append(f"undefined{info.bitness} {display}({parameters})")
+    body_lines = _header(evidence, display, cfg, truncated, argument_types, return_type)
+    body_lines.append(f"{return_type.c_type} {display}({parameters})")
     body_lines.append("{")
     for line in lines:
         body_lines.append(f"{_INDENT}{line}" if line else "")

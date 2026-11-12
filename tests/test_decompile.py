@@ -212,7 +212,9 @@ def test_straight_line_renders_signature_and_three_lines(tmp_path: Path) -> None
 def test_signature_infers_two_arguments_from_register_reads(tmp_path: Path) -> None:
     result = _decompile(tmp_path / "signature.bin", STRAIGHT_LINE)
 
-    assert "undefined64 sub_401000(undefined64 a0, undefined64 a1)" in result.body
+    # Both registers are read before the ret, so the signature names two
+    # parameters; the types come from the use (a copy and an add).
+    assert "uint64_t sub_401000(uint64_t a0, uint64_t a1)" in result.body
     assert "confidence: low" in result.body
     assert "0x401000" in result.body
     assert "goto" not in result.body
@@ -315,7 +317,8 @@ def test_direct_call_is_named_after_its_target(tmp_path: Path) -> None:
 
     assert result.call_sites == (CallSite(0x401000, 0x401005, None, "call"),)
     assert "call_401005();" in result.body
-    assert "undefined64 sub_401000(void)" in result.body
+    # Nothing writes rax before the ret: the function is rendered as void.
+    assert "void sub_401000(void)" in result.body
 
 
 def test_memory_operand_uses_the_pointer_width(tmp_path: Path) -> None:
@@ -328,7 +331,9 @@ def test_stack_operand_becomes_a_frame_slot(tmp_path: Path) -> None:
     result = _decompile(tmp_path / "stack.bin", MOV_RAX_RBP_8 + RET)
 
     assert result.lines[0] == "rax = local_0x8;  /* mov rax, qword ptr [rbp - 8] */"
-    assert "undefined64 sub_401000(void)" in result.body
+    # A frame slot is not an argument register, but the load into rax is a
+    # 64-bit write, so the return type is uint64_t and there is no parameter.
+    assert "uint64_t sub_401000(void)" in result.body
 
 
 def test_lea_renders_an_indexed_address_without_dereferencing(tmp_path: Path) -> None:
@@ -406,7 +411,7 @@ def test_discovered_symbol_names_the_function(tmp_path: Path) -> None:
     result = decompile_function(binary, info, TEXT_VA)
 
     assert result.name == "add_two"
-    assert "undefined64 add_two(undefined64 a0, undefined64 a1)" in result.body
+    assert "uint64_t add_two(uint64_t a0, uint64_t a1)" in result.body
 
 
 def test_long_function_truncates_by_max_instructions(tmp_path: Path) -> None:
