@@ -290,6 +290,14 @@ codevanta session annotate 4f9c1a7b2d3e 0x401000 "decrypts config with XOR 0x5a"
 codevanta session notes 4f9c1a7b2d3e
 codevanta struct    C:\Windows\System32\notepad.exe --address 0x140001000
 codevanta struct    samples\handle.bin --function process --include-stack --json
+
+# Phase 3
+codevanta decompile C:\Windows\System32\notepad.exe 0x1400019c0 --backend native
+codevanta decompile samples\pe64_text.bin --json
+codevanta decompile samples\pe64_text.bin --max-instructions 20 --output rendering.c
+codevanta emulate   samples\pe64_text.bin                              # returns 42
+codevanta emulate   samples\pe64_text.bin --set rdi=2 --mem 0x600000=48454c4c4f
+codevanta emulate   C:\Windows\System32\notepad.exe --resolve-target   # jmp/call [rip+..]
 ```
 
 `diff --semantic` prints one dim
@@ -362,6 +370,22 @@ counted in `indirect_skipped`, which `codevanta xrefs --json` prints.
 `codevanta analyze --callgraph` embeds the graph in the report, bounded to 1000
 functions and 5000 edges, and marks it `truncated` when a cap cuts it short.
 The `xrefs` and `cfg` sections use the same opt-in shape (`--xrefs`, `--cfg`).
+
+Phase 3 adds the two commands that read a function instead of a file:
+`codevanta decompile` renders one function as pseudo-C and `codevanta emulate`
+computes what it returns. Decompilation is `low` confidence by design — control
+flow, argument count and types come from mnemonics only — and every result says
+so in its evidence record and in a header comment inside the text.
+`--backend auto` (the default) prefers an installed Ghidra/pyghidra or angr and
+falls back to the built-in renderer, printing one `warning:` per skipped backend
+so a fallback is never silent; `--backend ghidra|angr` is strict and exits `2`
+with the probe's reason instead of substituting a provider. Emulation runs the
+file's bytes on a private unicorn CPU — nothing executes on the host — and always
+ends with a stated reason (`return`, `budget`, `unmapped`, `unsupported`,
+`error`); a value left in `rax` after a budget stop is reported as a register,
+never as a return value. `codevanta emulate` needs the optional `unicorn` engine
+and exits `2` with the reason when it is missing. See
+[docs/phase3.md](docs/phase3.md).
 ### Try it in the browser
 
 ```powershell
@@ -372,11 +396,11 @@ codevanta gui --no-browser     # print the URL and wait
 
 `codevanta gui` serves one self-contained dashboard page over a loopback-only,
 read-only HTTP server — no extra dependencies, no network access, and the
-analysed file is never executed or written. The page drives nine JSON routes
+analysed file is never executed or written. The page drives ten JSON routes
 (`/api/health`, `/api/info`, `/api/functions`, `/api/strings`, `/api/xrefs`,
-`/api/cfg`, `/api/struct`, `/api/callgraph`, `/api/diff`), each a thin adapter
-over the engine of the same name, so the browser shows the same evidence payload
-the CLI prints. Try it on the committed samples:
+`/api/cfg`, `/api/struct`, `/api/callgraph`, `/api/diff`, `/api/decompile`), each
+a thin adapter over the engine of the same name, so the browser shows the same
+evidence payload the CLI prints. Try it on the committed samples:
 
 ```powershell
 codevanta info    samples\pe64_text.bin        # PE32+ with one export
@@ -413,10 +437,15 @@ MCP tools (sixteen): `codevanta_info`, `codevanta_functions`,
 `codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
 `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
 `codevanta_jump_table`, `codevanta_function_hash`, `codevanta_similarity`,
-`codevanta_struct`, `codevanta_entropy`, `codevanta_session_save`,
-`codevanta_session_list`. `codevanta_analyze` mirrors the CLI flags
-(`include_xrefs` / `include_cfg` / `include_callgraph`, default off) so a
-single call can carry the phase 2 sections when an agent prefers one payload.
+`codevanta_struct`, `codevanta_entropy`, `codevanta_decompile`,
+`codevanta_session_save`, `codevanta_session_list`. `codevanta_analyze` mirrors
+the CLI flags (`include_xrefs` / `include_cfg` / `include_callgraph`, default off)
+so a single call can carry the phase 2 sections when an agent prefers one payload.
+
+`codevanta_decompile` takes `path`, `address`, `backend` (`auto` by default) and
+the same `max_instructions`/`max_blocks` budgets as the CLI, and returns the
+rendering with the provider that produced it, its `language`, `warnings`,
+`evidence` and the number of basic blocks it covers.
 
 `codevanta_callgraph` takes the same bounded limits as the CLI
 (`limit_functions`, `limit_edges`, defaulting to 1000 and 5000) and returns nodes,
@@ -485,7 +514,7 @@ plus smoke-tests the wheel on 3.13.
 - [Project specification](PROJECT_SPEC.md)
 - [Architecture](docs/architecture.md)
 - [API reference](docs/api.md) — every public Python entry point, the evidence
-  contract, the nine dashboard routes, and the fifteen MCP tools
+  contract, the ten dashboard routes, and the sixteen MCP tools
 - [Sample binaries](docs/samples.md) — the committed PE/Mach-O/ELF fixtures and
   how to regenerate them
 - [Contributor attribution](docs/attribution.md) — how agent commits are credited,
@@ -501,6 +530,7 @@ plus smoke-tests the wheel on 3.13.
 - [Phase 2i — alignment/array hints, function similarity, struct over MCP](docs/phase2i.md)
 - [Phase 2j — semantic diff pairing, similarity over MCP, signedness hints](docs/phase2j.md)
 - [Phase 2k — diff options over MCP, cross-architecture guard, merged struct windows](docs/phase2k.md)
+- [Phase 3 — pseudo-C decompilation, bounded emulation, decompiler backends](docs/phase3.md)
 
 ## Roadmap
 
