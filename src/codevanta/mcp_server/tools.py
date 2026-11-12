@@ -14,6 +14,13 @@ from codevanta.analysis.function_hash import function_fingerprint
 from codevanta.analysis.jump_tables import MAX_ENTRIES as MAX_JUMP_TABLE_ENTRIES
 from codevanta.analysis.jump_tables import MODE_RELATIVE, resolve_jump_table
 from codevanta.analysis.jump_tables import MODES as JUMP_TABLE_MODES
+from codevanta.analysis.type_recovery import (
+    DEFAULT_MAX_FIELDS,
+    DEFAULT_MAX_INSTRUCTIONS,
+    MAX_MAX_FIELDS,
+    MAX_MAX_INSTRUCTIONS,
+    suggest_struct,
+)
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.functions import discover_functions
 from codevanta.core.report import (
@@ -475,6 +482,92 @@ def function_hash(
         max_instructions=limit,
     )
     return fingerprint.to_dict()
+
+
+def struct(
+    path: str,
+    address: int | None = None,
+    function: str | None = None,
+    max_instructions: int = DEFAULT_MAX_INSTRUCTIONS,
+    max_fields: int = DEFAULT_MAX_FIELDS,
+    include_stack: bool = False,
+) -> dict[str, Any]:
+    """Suggest struct fields from the memory operands of a function region.
+
+    The region is decoded with a bounded linear sweep from the resolved start and
+    every memory operand of the form ``[reg]``, ``[reg + 0xNN]`` or
+    ``[reg - 0xNN]`` is read: the displacement becomes a field offset, the Intel
+    size keyword on the operand (falling back to the pointer width) becomes the
+    field width, and the operand position decides read versus write -- the first
+    operand is a write, except for ``cmp``/``test``/``cmps*``, which are always
+    reads. Operands with an index register, a scale or a segment prefix are
+    skipped rather than guessed, and ``lea``/``nop`` carry no memory access.
+
+    Accesses are aggregated per offset: the dominant width is the most frequent
+    one (ties go to the wider access) and the read/write counts are totals for
+    the offset. Fields are returned sorted by ascending offset, so the result is
+    deterministic for a given input. ``alignment`` is the gcd of the absolute
+    non-zero offsets (``None`` with fewer than two distinct non-zero offsets) and
+    ``array_groups`` lists maximal runs of at least three equally wide, equally
+    spaced fields, computed from the fields actually reported.
+
+    Every field is a **heuristic** at ``Confidence.MEDIUM``: a hypothesis about
+    how one function treats memory around one base register, never a verified
+    type, and it says nothing about signedness, purpose or lifetime. Fields are
+    not proven to belong to a single struct when several base registers are in
+    play; each entry names its own ``base_register``.
+
+    Args:
+        path: PE or ELF file to read; it is read, never executed.
+        address: Virtual address of the first instruction, inside an executable
+            section. Takes precedence over ``function``.
+        function: Name of a detected function candidate to start from; used only
+            when ``address`` is ``None``.
+        max_instructions: Instruction budget (1 ..
+            :data:`codevanta.analysis.type_recovery.MAX_MAX_INSTRUCTIONS`); the
+            sweep reads at most ``max_instructions * 16`` file bytes.
+        max_fields: Field cap (1 ..
+            :data:`codevanta.analysis.type_recovery.MAX_MAX_FIELDS`). Dropped
+            offsets set ``truncated``.
+        include_stack: When true, ``rbp``/``rsp``-relative operands are reported
+            alongside register-based ones; when false (default) they are ignored
+            as stack slots.
+
+    Returns:
+        The serialized suggestion with ``address``, ``instruction_count``,
+        ``field_count``, ``max_fields``, ``truncated``, ``include_stack``,
+        ``fields``, ``alignment``, ``array_groups``, and ``evidence``.
+
+    Raises:
+        AnalysisError: If the file is missing, ``address`` is not a non-negative
+            integer, ``function`` is not a string or names no candidate, a limit
+            is out of range, ``include_stack`` is not a boolean, or the resolved
+            start is not inside an executable section.
+    """
+    start_address: int | None = None
+    if address is not None:
+        start_address = _check_address(address)
+    if function is not None and not isinstance(function, str):
+        raise AnalysisError(
+            f"function must be a string, got {type(function).__name__}"
+        )
+    instruction_budget = _check_bounded_int(
+        "max_instructions", max_instructions, MAX_MAX_INSTRUCTIONS
+    )
+    field_cap = _check_bounded_int("max_fields", max_fields, MAX_MAX_FIELDS)
+    stack_flag = _check_bool("include_stack", include_stack)
+    target = _validate_path(path)
+    info = load_binary(target)
+    start = resolve_target(info, start_address, function)
+    suggestion = suggest_struct(
+        target,
+        info,
+        start,
+        max_instructions=instruction_budget,
+        max_fields=field_cap,
+        include_stack=stack_flag,
+    )
+    return suggestion.to_dict()
 
 
 def session_save(

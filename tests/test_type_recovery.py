@@ -20,6 +20,7 @@ from codevanta.analysis.type_recovery import (
     READ,
     STACK_REGISTERS,
     WRITE,
+    ArrayGroup,
     FieldAccess,
     StructSuggestion,
     parse_memory_operands,
@@ -56,6 +57,44 @@ MOV_RAX_RBP_8 = bytes.fromhex("488b4508")
 
 #: ``mov rax, qword ptr [rsp + 8]`` -- a stack slot, not a struct field.
 MOV_RAX_RSP_8 = bytes.fromhex("488b442408")
+
+#: ``mov rcx, qword ptr [rdi + 0x8]`` -- read of field 8 (8 bytes wide).
+MOV_RCX_RDI_8 = bytes.fromhex("488b4f08")
+
+#: ``mov rcx, qword ptr [rdi + 0x18]`` -- read of field 0x18 (8 bytes wide).
+MOV_RCX_RDI_18 = bytes.fromhex("488b4f18")
+
+#: ``mov rcx, qword ptr [rdi + 0x20]`` -- read of field 0x20 (8 bytes wide).
+MOV_RCX_RDI_20 = bytes.fromhex("488b4f20")
+
+#: ``mov eax, dword ptr [rdi + 0x14]`` -- read of field 0x14 (4 bytes wide).
+MOV_EAX_RDI_14 = bytes.fromhex("8b4714")
+
+#: ``mov ecx, dword ptr [rdi + 0x30]`` -- read of field 0x30 (4 bytes wide).
+MOV_ECX_RDI_30 = bytes.fromhex("8b4f30")
+
+#: ``mov ecx, dword ptr [rdi + 0x38]`` -- read of field 0x38 (4 bytes wide).
+MOV_ECX_RDI_38 = bytes.fromhex("8b4f38")
+
+#: ``mov ecx, dword ptr [rdi + 0x40]`` -- read of field 0x40 (4 bytes wide).
+MOV_ECX_RDI_40 = bytes.fromhex("8b4f40")
+
+#: Three 8-byte fields at 0x10/0x18/0x20: one evenly spaced run of length 3.
+ARRAY_THREE_QWORDS = MOV_RAX_RDI_10 + MOV_RDI_18_RBX + MOV_RCX_RDI_20 + RET
+
+#: Two 8-byte fields 4 bytes apart: enough for an alignment, never for a run.
+TWO_FIELDS_0X10_0X14 = MOV_RAX_RDI_10 + MOV_EAX_RDI_14 + RET
+
+#: A qword run at 0x8/0x10/0x18, a gap, then a dword run at 0x30/0x38/0x40.
+TWO_ARRAY_RUNS = (
+    MOV_RCX_RDI_8
+    + MOV_RAX_RDI_10
+    + MOV_RCX_RDI_18
+    + MOV_ECX_RDI_30
+    + MOV_ECX_RDI_38
+    + MOV_ECX_RDI_40
+    + RET
+)
 
 
 def _make_elf64(path: Path, code: bytes, data: bytes = b"", entry: int = TEXT_VA) -> Path:
@@ -297,3 +336,94 @@ def test_result_is_deterministic_and_json_serializable(tmp_path: Path) -> None:
     assert json.loads(json.dumps(payload))["field_count"] == 3
     assert [field["offset"] for field in payload["fields"]] == ["0x10", "0x18", "0x20"]
     assert payload["evidence"]["confidence"] == Confidence.MEDIUM.value
+
+
+def test_three_evenly_spaced_qwords_yield_alignment_and_one_array_group(
+    tmp_path: Path,
+) -> None:
+    result = _suggest(tmp_path / "array.bin", ARRAY_THREE_QWORDS)
+
+    assert [f.offset for f in result.fields] == [0x10, 0x18, 0x20]
+    assert result.alignment == 8
+    assert len(result.array_groups) == 1
+    group = result.array_groups[0]
+    assert isinstance(group, ArrayGroup)
+    assert (group.offset, group.stride, group.count, group.width) == (0x10, 8, 3, 8)
+    assert group.span == 0x18
+    assert group.evidence.confidence is Confidence.MEDIUM
+    assert group.evidence.source == "type_recovery.array_run"
+    assert "heuristic" in (group.evidence.detail or "")
+    assert group.evidence.extra["stride"] == 8
+
+
+def test_two_fields_give_an_alignment_but_no_array_group(tmp_path: Path) -> None:
+    result = _suggest(tmp_path / "two_fields.bin", TWO_FIELDS_0X10_0X14)
+
+    assert [f.offset for f in result.fields] == [0x10, 0x14]
+    assert result.alignment == 4
+    assert result.array_groups == ()
+
+
+def test_a_single_offset_has_no_alignment(tmp_path: Path) -> None:
+    non_zero = _suggest(tmp_path / "single_non_zero.bin", MOV_RAX_RDI_10 + RET)
+    only_zero = _suggest(tmp_path / "single_zero.bin", MOV_EAX_RDI + RET)
+
+    assert [f.offset for f in non_zero.fields] == [0x10]
+    assert non_zero.alignment is None
+    assert [f.offset for f in only_zero.fields] == [0]
+    assert only_zero.alignment is None
+    assert non_zero.array_groups == ()
+    assert only_zero.array_groups == ()
+
+
+def test_alignment_ignores_offset_zero(tmp_path: Path) -> None:
+    result = _suggest(
+        tmp_path / "zero_ignored.bin",
+        MOV_EAX_RDI + MOV_RAX_RDI_10 + MOV_RCX_RDI_20 + RET,
+    )
+
+    assert [f.offset for f in result.fields] == [0, 0x10, 0x20]
+    assert result.alignment == 16
+    # The two remaining qwords are 0x10 apart, i.e. only a run of two.
+    assert result.array_groups == ()
+
+
+def test_array_groups_are_maximal_and_split_on_width(tmp_path: Path) -> None:
+    result = _suggest(tmp_path / "two_runs.bin", TWO_ARRAY_RUNS)
+
+    assert [f.offset for f in result.fields] == [0x8, 0x10, 0x18, 0x30, 0x38, 0x40]
+    assert [
+        (group.offset, group.stride, group.count, group.width)
+        for group in result.array_groups
+    ] == [(0x8, 8, 3, 8), (0x30, 8, 3, 4)]
+    assert result.alignment == 8
+
+
+def test_to_dict_reports_alignment_and_array_groups(tmp_path: Path) -> None:
+    arrays = _suggest(tmp_path / "array_json.bin", ARRAY_THREE_QWORDS).to_dict()
+    mixed = _suggest(tmp_path / "mixed_json.bin", THREE_FIELDS).to_dict()
+
+    assert {"alignment", "array_groups"} <= set(arrays)
+    assert arrays["alignment"] == 8
+    assert arrays["array_groups"][0]["offset"] == "0x10"
+    assert arrays["array_groups"][0]["stride"] == 8
+    assert arrays["array_groups"][0]["count"] == 3
+    assert arrays["array_groups"][0]["width"] == 8
+    assert arrays["array_groups"][0]["evidence"]["confidence"] == Confidence.MEDIUM.value
+    # 0x10/0x18/0x20 mix 8- and 4-byte widths, so no run is claimed.
+    assert mixed["alignment"] == 8
+    assert mixed["array_groups"] == []
+    assert json.loads(json.dumps(arrays))["array_groups"][0]["count"] == 3
+
+
+def test_alignment_and_array_groups_are_deterministic(tmp_path: Path) -> None:
+    binary = _make_elf64(tmp_path / "layout_deterministic.bin", TWO_ARRAY_RUNS)
+    info = _load(binary)
+
+    first = suggest_struct(binary, info, TEXT_VA)
+    second = suggest_struct(binary, info, TEXT_VA)
+
+    assert first == second
+    assert first.alignment == second.alignment == 8
+    assert first.array_groups == second.array_groups
+

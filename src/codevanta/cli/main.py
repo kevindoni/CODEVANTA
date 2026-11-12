@@ -53,6 +53,7 @@ from codevanta.analysis.type_recovery import (
     DEFAULT_MAX_INSTRUCTIONS as STRUCT_MAX_INSTRUCTIONS,
 )
 from codevanta.analysis.type_recovery import (
+    ArrayGroup,
     StructSuggestion,
     parse_memory_operands,
     suggest_struct,
@@ -805,6 +806,34 @@ def _struct_warnings(result: StructSuggestion) -> list[str]:
     return warnings
 
 
+def _struct_alignment_text(result: StructSuggestion) -> str:
+    """Render the inferred alignment, or ``unknown`` when none could be derived."""
+    return "unknown" if result.alignment is None else str(result.alignment)
+
+
+def _struct_array_line(group: ArrayGroup) -> str:
+    """Render one array candidate as ``array at 0x10: 3 x 8-byte, stride 8``."""
+    return (
+        f"array at {_struct_offset_cell(group.offset)}: "
+        f"{group.count} x {group.width}-byte, stride {group.stride}"
+    )
+
+
+def _print_struct_layout(result: StructSuggestion) -> None:
+    """Print the alignment line and one line per array candidate.
+
+    ``arrays: none`` stands in for the absent group lines, so the footer always
+    says whether a run was found. Both texts go through :func:`escape` because
+    they are assembled from analysis data.
+    """
+    console.print(f"[dim]alignment: {escape(_struct_alignment_text(result))}[/]")
+    if not result.array_groups:
+        console.print("[dim]arrays: none[/]")
+        return
+    for group in result.array_groups:
+        console.print(f"[dim]{escape(_struct_array_line(group))}[/]")
+
+
 def _print_struct_suggestion(
     result: StructSuggestion,
     *,
@@ -825,12 +854,13 @@ def _print_struct_suggestion(
         )
     console.print(table)
     registers = ", ".join(base_registers) or "-"
-    console.print(f"[dim]base registers: {escape(registers)} · fields: {result.field_count}[/]")
+    console.print(f"[dim]base registers: {escape(registers)} - fields: {result.field_count}[/]")
     console.print(
         f"[dim]instructions: {result.instruction_count}"
-        f" · max fields: {result.max_fields}"
-        f" · truncated: {'yes' if result.truncated else 'no'}[/]"
+        f" - max fields: {result.max_fields}"
+        f" - truncated: {'yes' if result.truncated else 'no'}[/]"
     )
+    _print_struct_layout(result)
     for warning in _struct_warnings(result):
         console.print(f"[yellow]warning:[/] {escape(warning)}")
 
@@ -885,11 +915,14 @@ def struct(
     are dropped unless ``--include-stack`` is given, and ``--max-fields`` caps the
     number of offsets kept (the rest are dropped and reported as truncated).
 
-    ``--json`` emits ``StructSuggestion.to_dict()`` unchanged; the table adds a
-    footer naming the base registers seen, the field and instruction counts and
-    the truncation flag, followed by one ``warning:`` line per limitation. Load
-    and input errors -- unreadable file, bad address, unknown function, address
-    outside an executable section -- exit 2.
+    ``--json`` emits ``StructSuggestion.to_dict()`` unchanged, which already
+    carries the derived ``alignment`` and ``array_groups``. The table adds a
+    footer naming the base registers seen, the field and instruction counts, the
+    truncation flag, the inferred ``alignment`` (``unknown`` when fewer than two
+    distinct non-zero offsets were seen) and one ``array at 0x..`` line per array
+    candidate -- ``arrays: none`` when no run was found -- followed by one
+    ``warning:`` line per limitation. Load and input errors -- unreadable file,
+    bad address, unknown function, address outside an executable section -- exit 2.
     """
     start_address = None if address is None else _parse_address(address)
     loaded = _load(path)
