@@ -1,9 +1,9 @@
 """Binary loading and metadata extraction backed by LIEF.
 
-The loader normalizes PE and ELF binaries into :class:`BinaryInfo`. All
-addresses exposed by ``BinaryInfo`` are absolute virtual addresses (VA); PE
-RVAs are rebased with the image base so downstream modules can treat both
-formats uniformly.
+The loader normalizes PE, ELF, and Mach-O binaries into :class:`BinaryInfo`.
+All addresses exposed by ``BinaryInfo`` are absolute virtual addresses (VA);
+PE RVAs are rebased with the image base so downstream modules can treat every
+format uniformly.
 """
 
 from __future__ import annotations
@@ -204,7 +204,7 @@ class BinaryInfo:
 
 
 class BinaryLoader:
-    """Loads PE and ELF binaries and extracts structural metadata."""
+    """Loads PE, ELF, and Mach-O binaries and extracts structural metadata."""
 
     MAX_FILE_SIZE = 512 * 1024 * 1024  # 512 MiB safety guard
 
@@ -226,6 +226,8 @@ class BinaryLoader:
             info = self._load_pe(binary, file_path)
         elif fmt == "ELF":
             info = self._load_elf(binary, file_path)
+        elif fmt == "MachO":
+            info = self._load_macho(binary, file_path)
         else:
             raise BinaryLoadError(f"Unsupported format {fmt!r}: {file_path}")
 
@@ -628,7 +630,209 @@ class BinaryLoader:
             )
         return symbols
 
+    # ---- Mach-O ------------------------------------------------------------
+
+    def _load_macho(self, binary: Any, path: Path) -> BinaryInfo:
+        header = getattr(binary, "header", None)
+        cpu = str(self._get_attr(header, "cpu_type", "") or "")
+        arch, bitness = self._macho_arch(cpu)
+        if bool(getattr(header, "is_64bit", False)):
+            bitness = 64
+        elif bool(getattr(header, "is_32bit", False)):
+            bitness = 32
+        magic_text = str(self._get_attr(header, "magic", "") or "").upper()
+        endianness = "big" if "CIGAM" in magic_text else "little"
+        image_base = self._as_int(getattr(binary, "imagebase", 0))
+        entry_point = self._as_int(getattr(binary, "entrypoint", 0)) or None
+        sections = [self._macho_section(s) for s in self._safe(binary, "sections")]
+        imports = self._macho_imports(binary)
+        exports = self._macho_exports(binary)
+        symbols = self._macho_symbols(binary, sections)
+        warnings: list[str] = []
+        if not sections:
+            warnings.append("Mach-O has no sections; section-based analysis is limited.")
+        if not symbols and not exports:
+            warnings.append(
+                "No symbol table or exports found; function discovery is limited to the entry point."
+            )
+        return BinaryInfo(
+            path=path,
+            format="MachO",
+            architecture=arch,
+            bitness=bitness,
+            endianness=endianness,
+            entry_point=entry_point,
+            image_base=image_base,
+            sha256="",
+            file_size=0,
+            sections=sections,
+            imports=imports,
+            exports=exports,
+            symbols=symbols,
+            is_stripped=not symbols and not exports,
+            warnings=warnings,
+        )
+
+    @staticmethod
+    def _macho_arch(cpu: str) -> tuple[str, int]:
+        upper = cpu.upper()
+        if "X86_64" in upper:
+            return "x86_64", 64
+        if "ARM64" in upper or "ARM64E" in upper:
+            return "aarch64", 64
+        if "I386" in upper:
+            return "x86", 32
+        if "ARM" in upper:
+            return "arm", 32
+        if "POWERPC64" in upper:
+            return "ppc64", 64
+        if "POWERPC" in upper:
+            return "ppc", 32
+        return "unknown", 0
+
+    @classmethod
+    def _macho_section(cls, section: Any) -> SectionInfo:
+        flags = cls._as_int(getattr(section, "flags", 0))
+        offset = cls._as_int(getattr(section, "offset", 0))
+        size = cls._as_int(getattr(section, "size", 0))
+        virtual_address = cls._as_int(getattr(section, "virtual_address", 0))
+        segment = None
+        if bool(getattr(section, "has_segment", False)):
+            try:
+                segment = section.segment
+            except Exception:
+                segment = None
+        init_protection = cls._as_int(getattr(segment, "init_protection", 0))
+        entropy = getattr(section, "entropy", None)
+        name = cls._decode_name(cls._get_attr(section, "fullname", "name"))
+        return SectionInfo(
+            name=name,
+            virtual_address=virtual_address,
+            size=size,
+            offset=offset,
+            # Sections without file bytes (S_ZEROFILL and friends) have offset 0.
+            raw_size=size if offset > 0 else 0,
+            entropy=float(entropy) if entropy is not None else None,
+            # S_ATTR_PURE_INSTRUCTIONS / S_ATTR_SOME_INSTRUCTIONS.
+            is_executable=bool(flags & 0x80000000) or bool(flags & 0x400),
+            # Write permission lives on the segment; vm_prot_t VM_PROT_WRITE == 2.
+            is_writable=bool(init_protection & 0x2),
+            evidence=Evidence(
+                source="macho.section_table",
+                method="section_header",
+                confidence=Confidence.CERTAIN,
+                address=virtual_address,
+                detail=f"Mach-O section {name!r}",
+            ),
+        )
+
+    @classmethod
+    def _macho_imports(cls, binary: Any) -> list[ImportInfo]:
+        imports: list[ImportInfo] = []
+        for symbol in cls._safe(binary, "imported_symbols"):
+            name = cls._decode_name(getattr(symbol, "name", None))
+            if not name:
+                continue
+            library_object = cls._get_attr(symbol, "library")
+            library = cls._decode_name(cls._get_attr(library_object, "name")) if library_object is not None else ""
+            value = cls._as_int(getattr(symbol, "value", 0))
+            imports.append(
+                ImportInfo(
+                    name=name,
+                    library=library or None,
+                    address=value or None,
+                    evidence=Evidence(
+                        source="macho.undefined_symbols",
+                        method="imported_symbol",
+                        confidence=Confidence.HIGH,
+                        address=value or None,
+                        detail="undefined symbol bound by dyld at load time",
+                    ),
+                )
+            )
+        return imports
+
+    @classmethod
+    def _macho_exports(cls, binary: Any) -> list[ExportInfo]:
+        exports: list[ExportInfo] = []
+        for symbol in cls._safe(binary, "exported_symbols"):
+            name = cls._decode_name(getattr(symbol, "name", None))
+            if not name:
+                continue
+            value = cls._as_int(getattr(symbol, "value", 0))
+            exports.append(
+                ExportInfo(
+                    name=name,
+                    address=value or None,
+                    evidence=Evidence(
+                        source="macho.exported_symbols",
+                        method="exported_symbol",
+                        confidence=Confidence.HIGH if value else Confidence.MEDIUM,
+                        address=value or None,
+                        detail="symbol with dyld export information",
+                    ),
+                )
+            )
+        return exports
+
+    @classmethod
+    def _macho_symbols(cls, binary: Any, sections: list[SectionInfo]) -> list[SymbolInfo]:
+        # Mach-O nlist entries do not encode function vs data. Membership in an
+        # executable section is the strongest structural evidence available, so
+        # it drives is_function and is stated explicitly in the evidence detail.
+        exec_ranges = [
+            (s.virtual_address, s.virtual_address + s.size)
+            for s in sections
+            if s.is_executable and s.size > 0
+        ]
+        symbols: list[SymbolInfo] = []
+        seen: set[tuple[str, int]] = set()
+        for symbol in cls._safe(binary, "symbols"):
+            name = cls._decode_name(getattr(symbol, "name", None))
+            if not name:
+                continue
+            value = cls._as_int(getattr(symbol, "value", 0))
+            key = (name, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            size = cls._as_int(getattr(symbol, "size", 0))
+            is_function = bool(value) and any(
+                start <= value < end for start, end in exec_ranges
+            )
+            type_text = str(getattr(symbol, "type", "") or "")
+            symbols.append(
+                SymbolInfo(
+                    name=name,
+                    address=value,
+                    size=size,
+                    kind=type_text or "unknown",
+                    is_function=is_function,
+                    evidence=Evidence(
+                        source="macho.symbol_table",
+                        method="symtab_entry",
+                        confidence=Confidence.HIGH,
+                        address=value or None,
+                        detail=(
+                            "function inferred from executable-section membership"
+                            if is_function
+                            else "symbol kind is not encoded in the Mach-O symbol table"
+                        ),
+                    ),
+                )
+            )
+        return symbols
+
     # ---- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _decode_name(value: Any) -> str:
+        """Decode a LIEF name that may arrive as bytes or str; strip padding."""
+        if isinstance(value, (bytes, bytearray)):
+            text = bytes(value).decode("utf-8", "replace")
+        else:
+            text = str(value or "")
+        return text.split("\x00", 1)[0].strip()
 
     @staticmethod
     def _get_attr(obj: Any, *names: str, default: Any = None) -> Any:

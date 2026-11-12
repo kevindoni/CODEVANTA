@@ -50,6 +50,30 @@ class _Draft:
     aliases: list[str] = field(default_factory=list)
 
 
+#: Evidence source for exported functions, by binary format.
+_EXPORT_SOURCES: dict[str, str] = {
+    "PE": "pe.export_table",
+    "ELF": "elf.dynsym",
+    "MachO": "macho.exported_symbols",
+}
+
+#: Evidence source for symbol-table functions, by binary format.
+_SYMBOL_SOURCES: dict[str, str] = {
+    "PE": "pe.coff_symbols",
+    "ELF": "elf.symtab",
+    "MachO": "macho.symbol_table",
+}
+
+#: Discovery confidence for symbol-table candidates, by binary format. Mach-O
+#: symbol entries do not encode kind, so function-ness is inferred from
+#: executable-section membership and deserves slightly lower confidence.
+_SYMBOL_CONFIDENCE: dict[str, Confidence] = {
+    "PE": Confidence.HIGH,
+    "ELF": Confidence.HIGH,
+    "MachO": Confidence.MEDIUM,
+}
+
+
 def discover_functions(info: BinaryInfo) -> list[FunctionCandidate]:
     """Discover function candidates from structural evidence only.
 
@@ -105,7 +129,7 @@ def discover_functions(info: BinaryInfo) -> list[FunctionCandidate]:
             export.address,
             export.name,
             None,
-            "pe.export_table" if info.format == "PE" else "elf.dynsym",
+            _EXPORT_SOURCES.get(info.format, "binary.exports"),
             Confidence.HIGH,
             "exported_function",
             "exported function entry",
@@ -118,8 +142,8 @@ def discover_functions(info: BinaryInfo) -> list[FunctionCandidate]:
             symbol.address,
             symbol.name,
             symbol.size or None,
-            "elf.symtab" if info.format == "ELF" else "pe.coff_symbols",
-            Confidence.HIGH,
+            _SYMBOL_SOURCES.get(info.format, "binary.symbol_table"),
+            _SYMBOL_CONFIDENCE.get(info.format, Confidence.HIGH),
             "function_symbol",
             "function symbol from the symbol table",
         )
