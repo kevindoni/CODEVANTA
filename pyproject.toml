@@ -24,6 +24,7 @@ dependencies = [
   "capstone>=5.0",
   "typer>=0.12",
   "rich>=13.0",
+  "mcp>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -40,7 +41,18 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["core*", "analysis*", "ir*", "evidence*", "api*", "cli*", "storage*", "plugins*"]
+include = [
+  "core*",
+  "analysis*",
+  "ir*",
+  "evidence*",
+  "api*",
+  "cli*",
+  "storage*",
+  "plugins*",
+  "mcp_server*",
+  "setup*",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

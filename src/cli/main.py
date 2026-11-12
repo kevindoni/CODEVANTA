@@ -12,11 +12,10 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-from core.disassembler import Disassembler, DisassemblyError
 from core.functions import discover_functions
 from core.loader import BinaryInfo, BinaryLoader, BinaryLoadError
+from core.report import AnalysisError, build_report, disassemble_region, resolve_target
 from core.strings import StringExtractor
-from evidence.provenance import Provenance
 
 app = typer.Typer(
     name="codevanta",
@@ -52,21 +51,6 @@ def _print_sections(info: BinaryInfo) -> None:
             flags or "-",
         )
     console.print(table)
-
-
-def _read_code(path: Path, info: BinaryInfo, address: int, want_bytes: int) -> bytes | None:
-    offset = info.va_to_offset(address)
-    section = info.section_for_va(address)
-    if offset is None or section is None:
-        return None
-    remaining = (section.offset + (section.raw_size or section.size)) - offset
-    if remaining <= 0:
-        return None
-    with open(path, "rb") as handle:
-        handle.seek(offset)
-        return handle.read(min(want_bytes, remaining))
-
-
 @app.command()
 def info(path: Annotated[Path, typer.Argument(help="Path to a PE or ELF binary")]) -> None:
     """Show binary metadata (format, arch, sections, imports, exports)."""
@@ -165,31 +149,11 @@ def disasm(
     """Disassemble the entry point, an address, or a named function."""
     loaded = _load(path)
     try:
-        disassembler = Disassembler(loaded.architecture, loaded.bitness, loaded.endianness)
-    except DisassemblyError as exc:
+        start = resolve_target(loaded, address, function)
+        result = disassemble_region(path, loaded, start, count=count)
+    except AnalysisError as exc:
         console.print(f"[bold red]error:[/] {exc}")
-        raise typer.Exit(code=3) from exc
-    start = address
-    if function and start is None:
-        match = next((c for c in discover_functions(loaded) if c.name == function), None)
-        if match is None:
-            console.print(f"[bold red]error:[/] function {function!r} not found")
-            raise typer.Exit(code=4)
-        start = match.address
-    if start is None:
-        start = loaded.entry_point
-    if start is None:
-        console.print("[bold red]error:[/] no address supplied and binary has no entry point")
-        raise typer.Exit(code=4)
-    section = loaded.section_for_va(start)
-    if section is None or not section.is_executable:
-        console.print(f"[bold red]error:[/] address 0x{start:x} is not inside an executable section")
-        raise typer.Exit(code=5)
-    code = _read_code(path, loaded, start, max(count, 1) * 16)
-    if not code:
-        console.print(f"[bold red]error:[/] cannot map address 0x{start:x} to file bytes")
-        raise typer.Exit(code=5)
-    result = disassembler.disassemble(code, base_address=start, max_instructions=count)
+        raise typer.Exit(code=4) from exc
     table = Table(title=f"Disassembly at 0x{start:x}")
     table.add_column("Address", justify="right")
     table.add_column("Bytes")
@@ -210,47 +174,145 @@ def analyze(
     string_limit: Annotated[int, typer.Option(help="Maximum strings kept in the report")] = 5000,
 ) -> None:
     """Run the phase 1 analysis and emit a JSON report."""
-    loaded = _load(path)
-    provenance = (
-        Provenance()
-        .add_step("load_binary")
-        .add_step("discover_functions")
-        .add_step("extract_strings")
-    )
-    candidates = discover_functions(loaded)
-    all_strings = StringExtractor(min_length=4).extract(path, info=loaded)
-    kept = all_strings[:string_limit]
-
-    disassembly = None
-    if loaded.entry_point is not None:
-        try:
-            disassembler = Disassembler(loaded.architecture, loaded.bitness, loaded.endianness)
-            code = _read_code(path, loaded, loaded.entry_point, 512)
-            if code:
-                disassembly = disassembler.disassemble(
-                    code, base_address=loaded.entry_point, max_instructions=32
-                ).to_dict()
-        except DisassemblyError:
-            disassembly = None
-
-    report = {
-        "provenance": provenance.to_dict(),
-        "binary": loaded.to_dict(),
-        "functions": [c.to_dict() for c in candidates],
-        "strings": {
-            "count": len(all_strings),
-            "returned": len(kept),
-            "truncated": len(kept) < len(all_strings),
-            "items": [s.to_dict() for s in kept],
-        },
-        "disassembly": disassembly,
-    }
+    try:
+        report = build_report(path, string_limit=string_limit)
+    except (AnalysisError, BinaryLoadError) as exc:
+        console.print(f"[bold red]error:[/] {exc}")
+        raise typer.Exit(code=2) from exc
     payload = json.dumps(report, indent=2)
     if output is not None:
         output.write_text(payload, encoding="utf-8")
         console.print(f"[green]report written:[/] {output}")
         return
     console.print_json(payload)
+
+
+mcp_app = typer.Typer(help="Model Context Protocol server commands")
+app.add_typer(mcp_app, name="mcp")
+
+
+@mcp_app.command("serve")
+def mcp_serve() -> None:
+    """Serve CODEVANTA tools to coding agents over MCP (stdio)."""
+    try:
+        from mcp_server.server import run as run_server
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        console.print(f"[bold red]error:[/] MCP support needs the 'mcp' package: {exc}")
+        raise typer.Exit(code=2) from exc
+    run_server()
+
+
+def _render_plan(plan) -> None:
+    lines = list(plan.notes)
+    for change in plan.changes:
+        lines.append(f"{change.action}: {change.path}")
+        if change.diff:
+            lines.append(change.diff)
+    title = f"setup plan · {plan.client} · {plan.scope}"
+    console.print(Panel("\n".join(lines), title=escape(title)))
+
+
+def _adapters_for(ctx, names: list[str] | None):
+    from setup.clients import SetupError, detected_clients, get_client
+
+    try:
+        if names:
+            return [get_client(name) for name in names]
+        return detected_clients(ctx)
+    except SetupError as exc:
+        console.print(f"[bold red]error:[/] {exc}")
+        raise typer.Exit(code=2) from exc
+
+
+@app.command()
+def setup(
+    client: Annotated[
+        list[str] | None,
+        typer.Option("--client", "-c", help="claude, cursor, cline, vscode (default: detected)"),
+    ] = None,
+    scope: Annotated[str, typer.Option(help="user or project")] = "user",
+    project: Annotated[
+        Path | None, typer.Option(help="Project directory for project scope")
+    ] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Show the plan only")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Apply without confirmation")] = False,
+    verify: Annotated[bool, typer.Option("--verify", help="Verify after applying")] = False,
+) -> None:
+    """Register CODEVANTA as an MCP server for coding agents."""
+    from setup.apply import apply_plan
+    from setup.clients import SetupContext, SetupError
+    from setup.verify import verify_entry, verify_tools
+
+    ctx = SetupContext.from_environment(project)
+    adapters = _adapters_for(ctx, client)
+    if not adapters:
+        console.print("[yellow]no coding agents detected[/]; pass --client claude|cursor|cline|vscode")
+        raise typer.Exit(code=3)
+    try:
+        plans = [adapter.plan(ctx, scope) for adapter in adapters]
+    except SetupError as exc:
+        console.print(f"[bold red]error:[/] {exc}")
+        raise typer.Exit(code=2) from exc
+    for plan in plans:
+        _render_plan(plan)
+    if dry_run:
+        console.print("[dim]dry run: nothing was written[/]")
+        return
+    if any(plan.has_changes for plan in plans):
+        if not yes and not typer.confirm("Apply this setup plan?", default=False):
+            console.print("[yellow]cancelled[/]")
+            return
+        for plan in plans:
+            for path in apply_plan(plan):
+                console.print(f"[green]updated[/] {path}")
+    else:
+        console.print("[green]already configured[/]")
+    if verify:
+        results = [verify_entry(adapter, ctx, scope) for adapter in adapters]
+        results.append(verify_tools())
+        for result in results:
+            marker = "[green]ok[/]" if result["ok"] else "[red]fail[/]"
+            console.print(f"{marker} {escape(str(result))}")
+        if not all(result["ok"] for result in results):
+            raise typer.Exit(code=4)
+
+
+@app.command()
+def uninstall(
+    client: Annotated[
+        list[str] | None, typer.Option("--client", "-c", help="claude, cursor, cline, vscode")
+    ] = None,
+    scope: Annotated[str, typer.Option(help="user or project")] = "user",
+    project: Annotated[
+        Path | None, typer.Option(help="Project directory for project scope")
+    ] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Apply without confirmation")] = False,
+) -> None:
+    """Remove CODEVANTA from coding-agent MCP settings."""
+    from setup.apply import apply_plan
+    from setup.clients import SetupContext, SetupError
+
+    ctx = SetupContext.from_environment(project)
+    adapters = _adapters_for(ctx, client)
+    if not adapters:
+        console.print("[yellow]no coding agents detected[/]; pass --client claude|cursor|cline|vscode")
+        raise typer.Exit(code=3)
+    try:
+        plans = [adapter.removal_plan(ctx, scope) for adapter in adapters]
+    except SetupError as exc:
+        console.print(f"[bold red]error:[/] {exc}")
+        raise typer.Exit(code=2) from exc
+    for plan in plans:
+        _render_plan(plan)
+    if not any(plan.has_changes for plan in plans):
+        console.print("[green]nothing to remove[/]")
+        return
+    if not yes and not typer.confirm("Apply this removal plan?", default=False):
+        console.print("[yellow]cancelled[/]")
+        return
+    for plan in plans:
+        for path in apply_plan(plan):
+            console.print(f"[green]updated[/] {path}")
 
 
 def main() -> None:

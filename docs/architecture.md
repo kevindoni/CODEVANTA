@@ -37,6 +37,13 @@ IR layer     Evidence layer
 | `src/core/disassembler.py` | Decode machine code with Capstone into `IRInstruction` |
 | `src/core/strings.py` | Extract ASCII/UTF-16LE strings with offset → VA mapping |
 | `src/core/functions.py` | Discover function candidates with provenance |
+| `src/core/report.py` | Shared report/disassembly helpers for CLI and MCP |
+| `src/mcp_server/tools.py` | MCP tool functions (plain, testable) |
+| `src/mcp_server/server.py` | MCP stdio server (`MCPServer`, five tools) |
+| `src/setup/clients.py` | Per-client config adapters (claude/cursor/cline/vscode) |
+| `src/setup/plan.py` | Setup plans, unified diffs, create/update/noop classification |
+| `src/setup/apply.py` | Idempotent writes with `*.codevanta.bak` backups |
+| `src/setup/verify.py` | Entry verification and tool-layer smoke test |
 | `src/ir/` | Adapter contract; VEX/P-Code adapters arrive in phase 4 |
 | `src/evidence/` | Evidence records, provenance, confidence scoring |
 | `src/cli/main.py` | Command line surface |

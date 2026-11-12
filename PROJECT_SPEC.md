@@ -43,6 +43,17 @@ multi-user collaboration, AI binary modification.
 - ASCII and UTF-16LE string extraction with file offset and mapped VA.
 - CLI: `info`, `functions`, `strings`, `disasm`, `analyze` (+ JSON export).
 
+## Phase 1.5 scope (delivered)
+
+- MCP server (`codevanta mcp serve`, stdio) exposing five tools:
+  `codevanta_info`, `codevanta_functions`, `codevanta_strings`,
+  `codevanta_disasm`, `codevanta_analyze`.
+- Guided setup (`codevanta setup`) for Claude Code, Cursor, Cline, and VS Code:
+  plan preview with unified diff, explicit approval, `*.codevanta.bak` backups,
+  idempotent writes, post-apply verification, and `codevanta uninstall`.
+- Shared analysis helpers (`src/core/report.py`) so the CLI and MCP tools cannot
+  drift apart.
+
 ## Phase 1 acceptance criteria
 
 1. Reads PE and ELF files.

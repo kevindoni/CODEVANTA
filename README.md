@@ -44,6 +44,8 @@ Delivered in phase 1:
 - Function candidates from exports, function symbols, and the entry point, each with source and confidence.
 - ASCII and UTF-16LE string extraction with file offset and mapped virtual address.
 - CLI: `info`, `functions`, `strings`, `disasm`, `analyze` (+ JSON report).
+- **MCP server** (`codevanta mcp serve`) exposing the same five tools to coding agents.
+- **Guided setup** (`codevanta setup`) for Claude Code, Cursor, Cline, and VS Code, with plan preview, backups, and verification.
 
 ## Installation
 
@@ -66,20 +68,50 @@ All addresses in reports are absolute virtual addresses (VA). Function
 candidates always state their detection source (`export`, `symbol`,
 `entry_point`) and confidence (`high`, `medium`, `low`, `unknown`).
 
+## Coding agent setup (MCP)
+
+CODEVANTA exposes the same analysis as MCP tools, so coding agents can call it
+directly:
+
+```powershell
+codevanta setup --dry-run --client cursor        # show the plan, write nothing
+codevanta setup --client cursor --yes --verify   # apply and verify
+codevanta setup --client claude --scope user
+codevanta setup --client vscode --scope project --project .
+codevanta uninstall --client cursor
+```
+
+Supported clients: `claude` (Claude Code), `cursor`, `cline` (VS Code
+extension), `vscode` (Copilot, project scope).
+
+Safety model: every run prints the exact file changes and a diff first; nothing
+is written without `--yes` (or an interactive confirmation); existing configs
+are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
+
+MCP tools: `codevanta_info`, `codevanta_functions`, `codevanta_strings`,
+`codevanta_disasm`, `codevanta_analyze`.
+
+Prompt you can paste into a coding agent:
+
+> Install CODEVANTA and connect it to this coding agent. Show me the setup plan
+> first, then verify the installation.
+
 ## Project layout
 
 ```text
 src/
-├── core/       # loader (LIEF), disassembler (Capstone), strings, functions
-├── evidence/   # evidence records, provenance, confidence scoring
-├── ir/         # backend-neutral instruction model + adapter registry
-├── analysis/   # cross-references and CFG (phase 2+)
-├── api/        # HTTP API (phase 2+)
-├── cli/        # Typer command line surface
-├── storage/    # session storage (phase 2+)
-└── plugins/    # plugin system (phase 5)
-tests/          # unit and integration tests
-docs/           # architecture notes
+├── core/        # loader (LIEF), disassembler (Capstone), strings, functions, shared report
+├── evidence/    # evidence records, provenance, confidence scoring
+├── ir/          # backend-neutral instruction model + adapter registry
+├── mcp_server/  # MCP tools and stdio server for coding agents
+├── setup/       # client config planning, apply, verify (claude/cursor/cline/vscode)
+├── analysis/    # cross-references and CFG (phase 2+)
+├── api/         # HTTP API (phase 2+)
+├── cli/         # Typer command line surface
+├── storage/     # session storage (phase 2+)
+└── plugins/     # plugin system (phase 5)
+tests/           # unit and integration tests
+docs/            # architecture notes
 ```
 
 ## Testing

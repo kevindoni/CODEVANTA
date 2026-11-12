@@ -37,6 +37,39 @@ def elf64_path(tmp_path: Path) -> Path:
     return make_minimal_elf64(tmp_path / "sample_elf64.bin")
 
 
+def make_elf64_with_text(path: Path, *, entry: int = 0x401000) -> Path:
+    """Write an ELF64 file with one executable .text section."""
+    text = bytes.fromhex("554889e5c3")  # push rbp; mov rbp, rsp; ret
+    shstr = b"\x00.text\x00.shstrtab\x00"
+    off_text = 0x40
+    off_shstr = off_text + len(text)
+    off_sh = 0x58
+    ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
+    header = ident + struct.pack(
+        "<HHIQQQIHHHHHH", 2, 62, 1, entry, 0, off_sh, 0, 64, 56, 0, 64, 3, 2
+    )
+    null_section = bytes(64)
+    text_section = struct.pack(
+        "<IIQQQQIIQQ", 1, 1, 6, entry, off_text, len(text), 0, 0, 16, 0
+    )
+    str_section = struct.pack(
+        "<IIQQQQIIQQ", 7, 3, 0, 0, off_shstr, len(shstr), 0, 0, 1, 0
+    )
+    blob = bytearray(off_sh)
+    blob[0:64] = header
+    blob[off_text:off_text + len(text)] = text
+    blob[off_shstr:off_shstr + len(shstr)] = shstr
+    blob += null_section + text_section + str_section
+    path.write_bytes(blob)
+    return path
+
+
+@pytest.fixture
+def elf64_text_path(tmp_path: Path) -> Path:
+    return make_elf64_with_text(tmp_path / "sample_elf64_text.bin")
+
+
+
 @pytest.fixture
 def pe_path() -> Path:
     """Use the running Python interpreter as a real PE sample on Windows."""
