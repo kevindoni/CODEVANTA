@@ -360,6 +360,31 @@ counted in `indirect_skipped`, which `codevanta xrefs --json` prints.
 `codevanta analyze --callgraph` embeds the graph in the report, bounded to 1000
 functions and 5000 edges, and marks it `truncated` when a cap cuts it short.
 The `xrefs` and `cfg` sections use the same opt-in shape (`--xrefs`, `--cfg`).
+### Try it in the browser
+
+```powershell
+codevanta gui                  # http://127.0.0.1:8765/  (opens a browser)
+codevanta gui --port 9000      # pick a port
+codevanta gui --no-browser     # print the URL and wait
+```
+
+`codevanta gui` serves one self-contained dashboard page over a loopback-only,
+read-only HTTP server — no extra dependencies, no network access, and the
+analysed file is never executed or written. The page drives nine JSON routes
+(`/api/health`, `/api/info`, `/api/functions`, `/api/strings`, `/api/xrefs`,
+`/api/cfg`, `/api/struct`, `/api/callgraph`, `/api/diff`), each a thin adapter
+over the engine of the same name, so the browser shows the same evidence payload
+the CLI prints. Try it on the committed samples:
+
+```powershell
+codevanta info    samples\pe64_text.bin        # PE32+ with one export
+codevanta disasm  samples\macho64_text.bin --count 10
+codevanta disasm  samples\elf64_text.bin       # 5-byte .text, easiest to read
+```
+
+See [docs/samples.md](docs/samples.md) for every sample file and
+[docs/api.md](docs/api.md#codevantagui-local-web-dashboard) for the route
+parameters, status codes, and the `create_server` / `serve` Python API.
 
 ## Coding agent setup (MCP)
 
@@ -429,6 +454,7 @@ src/codevanta/
 ├── ir/          # backend-neutral instruction model + adapter registry
 ├── mcp_server/  # MCP tools and stdio server for coding agents
 ├── setup/       # client config planning, apply, verify (claude/cursor/cline/vscode)
+├── gui/         # loopback-only web dashboard (stdlib HTTP server + JSON routes)
 ├── analysis/    # cross-references, call graph, CFG (linear sweep + recursive traversal), jump tables (absolute + relative), function fingerprints and similarity, structural/deep diff, struct-field suggestions with alignment/array hints, graph/HTML export (phase 2)
 ├── api/         # HTTP API (phase 2+)
 ├── cli/         # Typer command line surface
@@ -453,6 +479,10 @@ plus smoke-tests the wheel on 3.13.
 
 - [Project specification](PROJECT_SPEC.md)
 - [Architecture](docs/architecture.md)
+- [API reference](docs/api.md) — every public Python entry point, the evidence
+  contract, the nine dashboard routes, and the fifteen MCP tools
+- [Sample binaries](docs/samples.md) — the committed PE/Mach-O/ELF fixtures and
+  how to regenerate them
 - [Phase 2 — cross-references, CFGs, sessions](docs/phase2.md)
 - [Phase 2b — call graphs, graph export, session annotations](docs/phase2b.md)
 - [Phase 2c — import/indirect calls, embedded call graphs, MCP call graph](docs/phase2c.md)

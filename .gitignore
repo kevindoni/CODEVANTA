@@ -16,6 +16,9 @@ htmlcov/
 
 # Generated analysis output
 samples/report_*.json
+# ...except the two report fixtures the docs reference; keep them tracked.
+!samples/report_elf64.json
+!samples/report_notepad.json
 *.log
 
 # Editors / OS

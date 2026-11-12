@@ -217,7 +217,7 @@ class CallGraph:
                 nodes.append(
                     CallGraphNode(
                         address=address,
-                        label=_hex(address) if address is not None else "unresolved",
+                        label=_hex(address) or "unresolved",
                         kind=kind,
                         confidence="unknown",
                     )
@@ -252,7 +252,7 @@ class CallGraph:
         GraphML consumers always see edges that reference existing node ids.
         """
         base_nodes = self._nodes_with_endpoints()
-        ids_by_address = {
+        ids_by_address: dict[int | None, str] = {
             node.address: _node_id(node) for node in base_nodes if node.address is not None
         }
         nodes: list[dict[str, Any]] = [

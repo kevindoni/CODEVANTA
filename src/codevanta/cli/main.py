@@ -6,7 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NoReturn
 
 import typer
 from rich.console import Console
@@ -113,10 +113,24 @@ def _session_db(db: Path | None) -> Path:
     return Path.home() / ".codevanta" / "sessions.db"
 
 
-def _fail(message: str, code: int) -> None:
+def _fail(message: str, code: int) -> NoReturn:
     """Print an error and exit with ``code``."""
     console.print(f"[bold red]error:[/] {escape(message)}")
     raise typer.Exit(code=code)
+
+
+def _system_exit_status(exc: SystemExit) -> int:
+    """Return the status a :class:`SystemExit` asks for, as CPython would.
+
+    ``SystemExit`` carries ``None`` (meaning success), an ``int`` or any other
+    object (printed, then exit 1, which is the documented CPython behaviour).
+    """
+    code = exc.code
+    if code is None:
+        return 0
+    if isinstance(code, bool) or not isinstance(code, int):
+        return 1
+    return code
 
 
 def _print_sections(info: BinaryInfo) -> None:
@@ -1350,14 +1364,82 @@ app.add_typer(mcp_app, name="mcp")
 
 
 @mcp_app.command("serve")
-def mcp_serve() -> None:
-    """Serve CODEVANTA tools to coding agents over MCP (stdio)."""
+def mcp_serve(
+    transport: Annotated[
+        str,
+        typer.Option(
+            "--transport",
+            help="stdio (default), sse or streamable-http",
+        ),
+    ] = "stdio",
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Bind address for the HTTP transports"),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", help="Bind port for the HTTP transports; 0 picks a free one"),
+    ] = 8000,
+    allow_remote: Annotated[
+        bool,
+        typer.Option("--allow-remote", help="Permit a non-loopback bind address"),
+    ] = False,
+) -> None:
+    """Serve CODEVANTA tools to coding agents over MCP (stdio or HTTP)."""
     try:
         from codevanta.mcp_server.server import run as run_server
     except ImportError as exc:  # pragma: no cover - dependency guard
         console.print(f"[bold red]error:[/] MCP support needs the 'mcp' package: {exc}")
         raise typer.Exit(code=2) from exc
-    run_server()
+    try:
+        run_server(transport=transport, host=host, port=port, allow_remote=allow_remote)
+    except (AnalysisError, ValueError) as exc:
+        _fail(str(exc), 2)
+    except OSError as exc:
+        _fail(f"could not bind {host}:{port}: {exc}", 2)
+    except SystemExit as exc:
+        # uvicorn reports an unusable address by calling ``sys.exit`` from inside
+        # the SDK's event loop, so a taken port arrives here as ``SystemExit``
+        # (verified with the pinned mcp/uvicorn: code 3) and would otherwise
+        # leave the process with exit 3 and raw uvicorn output. Exit 0 is a
+        # clean shutdown and is re-raised untouched.
+        if _system_exit_status(exc) == 0:
+            raise
+        _fail(f"could not bind {host}:{port}", 2)
+
+
+@app.command()
+def gui(
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Loopback address to bind (127.0.0.1, localhost or ::1)"),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", help="TCP port to listen on; 0 picks a free one"),
+    ] = 8765,
+    no_browser: Annotated[
+        bool,
+        typer.Option("--no-browser", help="Do not open a browser window"),
+    ] = False,
+) -> None:
+    """Serve the local web dashboard (read-only, loopback only)."""
+    if port < 0 or port > 65535:
+        _fail(f"port must be within 0 .. 65535, got {port}", 2)
+    try:
+        from codevanta.gui import serve as serve_gui
+    except ImportError as exc:  # pragma: no cover - packaging guard
+        console.print(f"[bold red]error:[/] the web dashboard is unavailable: {exc}")
+        raise typer.Exit(code=2) from exc
+    try:
+        serve_gui(host=host, port=port, open_browser=not no_browser)
+    except OSError as exc:
+        # ``http.server`` raises ``OSError`` (``PermissionError`` for WSAEACCES on
+        # Windows) for a taken port, never ``SystemExit``, so this is the bind
+        # failure path for the dashboard; the message names the address.
+        _fail(f"could not bind {host}:{port}: {exc}", 2)
+    except ValueError as exc:
+        _fail(str(exc), 2)
 
 
 def _render_plan(plan) -> None:

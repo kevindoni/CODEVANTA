@@ -9,7 +9,8 @@ format uniformly.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+import struct
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,156 @@ except Exception:  # pragma: no cover - LIEF build without logging controls
 
 class BinaryLoadError(Exception):
     """Raised when a file cannot be loaded as a supported binary."""
+
+
+# ---- fat (universal) Mach-O container --------------------------------------
+
+# A universal binary wraps several thin Mach-O images behind one of these
+# magics. The 8-byte header (magic + nfat_arch) is always followed by one
+# ``fat_arch`` entry per slice; the "_64" variants use 64-bit offset/size
+# fields and the "CIGAM" variants store the fields in little-endian order.
+FAT_MAGIC = 0xCAFEBABE
+FAT_CIGAM = 0xBEBAFECA
+FAT_MAGIC_64 = 0xCAFEBABF
+FAT_CIGAM_64 = 0xBFBAFECA
+
+# magic -> (magic name, 64-bit table entries, struct byte order)
+_FAT_MAGICS: dict[int, tuple[str, bool, str]] = {
+    FAT_MAGIC: ("FAT_MAGIC", False, ">"),
+    FAT_CIGAM: ("FAT_CIGAM", False, "<"),
+    FAT_MAGIC_64: ("FAT_MAGIC_64", True, ">"),
+    FAT_CIGAM_64: ("FAT_CIGAM_64", True, "<"),
+}
+
+_FAT_HEADER_SIZE = 8
+_FAT_ARCH_SIZE = 20  # fat_arch: cputype, cpusubtype, offset, size, align
+_FAT_ARCH_64_SIZE = 32  # fat_arch_64: 64-bit offset/size plus a reserved field
+
+# Universal binaries in the wild carry at most a handful of slices (2-4 is
+# typical). ``nfat_arch`` is attacker-controlled, so the table is hard-capped:
+# without this bound a crafted 512 MiB file could declare hundreds of thousands
+# of entries and burn seconds of parsing time plus proportional memory.
+MAX_FAT_SLICES = 32
+
+# ``fat_arch.align`` is an exponent (``1 << align``), never larger than 2**20
+# in real toolchain output. Anything above that would let a file demand absurd
+# slice alignment, so it is rejected rather than fed into ``1 << align``.
+MAX_FAT_ALIGN = 20
+
+# CPU_ARCH_ABI64 marks the 64-bit dialect of a CPU family (x86_64, arm64, ...).
+_CPU_ARCH_ABI64 = 0x01000000
+_CPU_TYPE_NAMES = {
+    0x00000007: "x86",
+    0x01000007: "x86_64",
+    0x0000000C: "arm",
+    0x0100000C: "aarch64",
+    0x0200000C: "aarch64_32",
+    0x00000012: "ppc",
+    0x01000012: "ppc64",
+}
+
+
+def _cpu_type_name(cputype: int) -> str:
+    """Stable, human-readable name for a Mach-O ``cputype``."""
+    return _CPU_TYPE_NAMES.get(cputype, f"cputype_{cputype:#x}")
+
+
+# LIEF ``CPU_TYPE`` member name -> numeric cputype, used only when the enum
+# cannot be cast to ``int`` (older/limited LIEF builds).
+_CPU_TYPE_ALIASES = {
+    "I386": 0x00000007,
+    "X86": 0x00000007,
+    "X86_64": 0x01000007,
+    "AMD64": 0x01000007,
+    "ARM": 0x0000000C,
+    "AARCH64": 0x0100000C,
+    "ARM64": 0x0100000C,
+    "ARM64E": 0x0100000C,
+    "ARM64_32": 0x0200000C,
+    "POWERPC": 0x00000012,
+    "POWERPC64": 0x01000012,
+}
+
+
+# Selection rule tokens, kept stable for reports and tests.
+RULE_PREFER_64BIT = "prefer_64bit"
+RULE_FIRST_BY_OFFSET = "first_by_offset"
+
+
+@dataclass(frozen=True)
+class FatArch:
+    """One ``fat_arch`` entry of a fat Mach-O architecture table."""
+
+    index: int
+    cputype: int
+    cpusubtype: int
+    offset: int
+    size: int
+    align: int
+
+    @property
+    def is_64bit(self) -> bool:
+        return bool(self.cputype & _CPU_ARCH_ABI64)
+
+    @property
+    def arch_name(self) -> str:
+        return _cpu_type_name(self.cputype)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "arch": self.arch_name,
+            "cputype": f"0x{self.cputype:x}",
+            "cpusubtype": self.cpusubtype,
+            "offset": f"0x{self.offset:x}",
+            "size": self.size,
+            "align": self.align,
+            "is_64bit": self.is_64bit,
+        }
+
+
+@dataclass(frozen=True)
+class FatContainer:
+    """A parsed fat (universal) Mach-O container plus the selected slice."""
+
+    magic: int
+    wide_entries: bool
+    arches: tuple[FatArch, ...]
+    slice: FatArch
+    rule: str
+    reason: str
+
+    @property
+    def magic_name(self) -> str:
+        return _FAT_MAGICS[self.magic][0]
+
+    @property
+    def slice_count(self) -> int:
+        return len(self.arches)
+
+    def evidence_extra(self) -> dict[str, Any]:
+        """Structured container metadata for :attr:`BinaryInfo.evidence`."""
+        return {
+            "fat": True,
+            "fat_magic": f"0x{self.magic:08x}",
+            "fat_magic_name": self.magic_name,
+            "fat_arch_64": self.wide_entries,
+            "slice_index": self.slice.index,
+            "slice_count": self.slice_count,
+            "slice_arch": self.slice.arch_name,
+            "slice_cputype": f"0x{self.slice.cputype:x}",
+            "slice_offset": self.slice.offset,
+            "slice_size": self.slice.size,
+            "selection_rule": self.rule,
+            "selection_reason": self.reason,
+            "available_arches": [arch.arch_name for arch in self.arches],
+            # The table is already bounded by MAX_FAT_SLICES, but the evidence
+            # list is capped explicitly so reports stay bounded by construction
+            # even if that limit is ever raised.
+            "available_slices": [
+                arch.to_dict() for arch in self.arches[:MAX_FAT_SLICES]
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -145,9 +296,11 @@ class BinaryInfo:
     symbols: list[SymbolInfo] = field(default_factory=list)
     is_stripped: bool = False
     warnings: list[str] = field(default_factory=list)
+    # Container-level provenance (currently the fat Mach-O slice selection).
+    evidence: Evidence | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "path": str(self.path),
             "format": self.format,
             "architecture": self.architecture,
@@ -164,6 +317,9 @@ class BinaryInfo:
             "symbols": [s.to_dict() for s in self.symbols],
             "warnings": list(self.warnings),
         }
+        if self.evidence is not None:
+            data["evidence"] = self.evidence.to_dict()
+        return data
 
     def section_for_va(self, va: int) -> SectionInfo | None:
         """Return the section that contains ``va``, if any."""
@@ -214,20 +370,56 @@ class BinaryLoader:
         self._validate(file_path)
         raw = file_path.read_bytes()
         sha256 = hashlib.sha256(raw).hexdigest()
-        try:
-            binary = lief.parse(str(file_path))
-        except Exception as exc:  # LIEF raises several native error types
-            raise BinaryLoadError(f"LIEF could not parse {file_path}: {exc}") from exc
-        if binary is None:
-            raise BinaryLoadError(f"Unsupported or unreadable binary: {file_path}")
+
+        # A fat (universal) container must be unwrapped before any of the thin
+        # parsers run: LIEF would only ever see the container magic.
+        container = self._fat_container(raw, file_path)
+        fat_offset = 0
+        if container is not None:
+            chosen = container.slice
+            payload = raw[chosen.offset : chosen.offset + chosen.size]
+            fat_offset = chosen.offset
+            try:
+                binary = lief.parse(payload)
+            except Exception as exc:  # LIEF raises several native error types
+                raise BinaryLoadError(
+                    f"Fat Mach-O {file_path}: slice {chosen.index} "
+                    f"({chosen.arch_name}) could not be parsed: {exc}"
+                ) from exc
+            if binary is None:
+                raise BinaryLoadError(
+                    f"Fat Mach-O {file_path}: slice {chosen.index} "
+                    f"({chosen.arch_name}) at offset 0x{chosen.offset:x} "
+                    f"is not a valid thin Mach-O image"
+                )
+        else:
+            try:
+                binary = lief.parse(str(file_path))
+            except Exception as exc:  # LIEF raises several native error types
+                raise BinaryLoadError(f"LIEF could not parse {file_path}: {exc}") from exc
+            if binary is None:
+                raise BinaryLoadError(f"Unsupported or unreadable binary: {file_path}")
 
         fmt = self._format_name(binary)
+        if container is not None:
+            # Everything inside a fat container must be a thin Mach-O image:
+            # an ELF or PE payload would be parsed with slice-relative offsets
+            # and silently reported as that foreign format.
+            if fmt != "MachO":
+                raise BinaryLoadError(
+                    f"Fat Mach-O {file_path}: fat slice is not a Mach-O image: {fmt}"
+                )
+            # With the payload parsed, the slice header is the authority on what
+            # was actually loaded; the container table is only a claim.
+            container = self._verify_fat_slice(container, binary, file_path)
         if fmt == "PE":
             info = self._load_pe(binary, file_path)
         elif fmt == "ELF":
             info = self._load_elf(binary, file_path)
         elif fmt == "MachO":
-            info = self._load_macho(binary, file_path)
+            info = self._load_macho(
+                binary, file_path, fat_offset=fat_offset, container=container
+            )
         else:
             raise BinaryLoadError(f"Unsupported format {fmt!r}: {file_path}")
 
@@ -264,6 +456,169 @@ class BinaryLoader:
         if "PE" in type_name:
             return "PE"
         return "Unknown"
+
+    # ---- fat (universal) Mach-O container ----------------------------------
+
+    @classmethod
+    def _fat_container(cls, raw: bytes, path: Path) -> FatContainer | None:
+        """Parse a fat Mach-O container header and pick one slice.
+
+        Returns ``None`` when ``raw`` does not start with a fat magic, so thin
+        Mach-O, ELF and PE inputs keep taking the unchanged path. Malformed
+        containers raise :class:`BinaryLoadError` naming the offending field.
+        """
+        if len(raw) < len(b"\xca\xfe\xba\xbe"):
+            return None
+        magic = int.from_bytes(raw[:4], "big")
+        if magic not in _FAT_MAGICS:
+            return None
+        magic_name, wide_entries, order = _FAT_MAGICS[magic]
+        entry_size = _FAT_ARCH_64_SIZE if wide_entries else _FAT_ARCH_SIZE
+
+        if len(raw) < _FAT_HEADER_SIZE:
+            raise BinaryLoadError(
+                f"Malformed fat Mach-O {path}: nfat_arch field is truncated "
+                f"({magic_name} header needs {_FAT_HEADER_SIZE} bytes, "
+                f"file has {len(raw)})"
+            )
+        slice_count = struct.unpack_from(f"{order}I", raw, 4)[0]
+        if slice_count == 0:
+            raise BinaryLoadError(
+                f"Malformed fat Mach-O {path}: nfat_arch is zero, a fat "
+                f"{magic_name} container must hold at least one slice"
+            )
+        if slice_count > MAX_FAT_SLICES:
+            raise BinaryLoadError(
+                f"Malformed fat Mach-O {path}: nfat_arch={slice_count} exceeds "
+                f"the supported maximum of {MAX_FAT_SLICES} slices"
+            )
+
+        table_end = _FAT_HEADER_SIZE + slice_count * entry_size
+        if table_end > len(raw):
+            raise BinaryLoadError(
+                f"Malformed fat Mach-O {path}: fat_arch table truncated "
+                f"(nfat_arch={slice_count} needs {table_end} bytes, "
+                f"file has {len(raw)})"
+            )
+
+        format_string = f"{order}IIQQII" if wide_entries else f"{order}IIIII"
+        arches: list[FatArch] = []
+        for index in range(slice_count):
+            base = _FAT_HEADER_SIZE + index * entry_size
+            if wide_entries:
+                # fat_arch_64 carries a trailing reserved u32.
+                cputype, cpusubtype, offset, size, align = struct.unpack_from(
+                    format_string, raw, base
+                )[:5]
+            else:
+                cputype, cpusubtype, offset, size, align = struct.unpack_from(
+                    format_string, raw, base
+                )
+            if size == 0:
+                raise BinaryLoadError(
+                    f"Malformed fat Mach-O {path}: fat_arch[{index}].size is zero"
+                )
+            if align > MAX_FAT_ALIGN:
+                raise BinaryLoadError(
+                    f"Malformed fat Mach-O {path}: fat_arch[{index}].align is "
+                    f"{align}, above the supported maximum of {MAX_FAT_ALIGN}"
+                )
+            alignment = 1 << align
+            if offset % alignment != 0:
+                raise BinaryLoadError(
+                    f"Malformed fat Mach-O {path}: fat_arch[{index}].offset "
+                    f"0x{offset:x} is not aligned to {alignment} bytes "
+                    f"(align={align})"
+                )
+            if offset < table_end:
+                raise BinaryLoadError(
+                    f"Malformed fat Mach-O {path}: fat_arch[{index}].offset "
+                    f"0x{offset:x} points inside the fat header/table, which "
+                    f"ends at 0x{table_end:x}"
+                )
+            if offset + size > len(raw):
+                raise BinaryLoadError(
+                    f"Malformed fat Mach-O {path}: fat_arch[{index}].offset/size "
+                    f"outside the file (offset=0x{offset:x}, size=0x{size:x}, "
+                    f"file size=0x{len(raw):x})"
+                )
+            arches.append(
+                FatArch(
+                    index=index,
+                    cputype=cputype,
+                    cpusubtype=cpusubtype,
+                    offset=offset,
+                    size=size,
+                    align=align,
+                )
+            )
+
+        chosen, rule, reason = cls._select_fat_slice(arches)
+        return FatContainer(
+            magic=magic,
+            wide_entries=wide_entries,
+            arches=tuple(arches),
+            slice=chosen,
+            rule=rule,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _select_fat_slice(arches: list[FatArch]) -> tuple[FatArch, str, str]:
+        """Pick one slice deterministically: 64-bit first, then lowest offset."""
+        wide = [arch for arch in arches if arch.is_64bit]
+        candidates = wide or arches
+        chosen = min(candidates, key=lambda arch: (arch.offset, arch.index))
+        if wide:
+            return (
+                chosen,
+                RULE_PREFER_64BIT,
+                "64-bit slice preferred over 32-bit slices, lowest file offset wins",
+            )
+        return (
+            chosen,
+            RULE_FIRST_BY_OFFSET,
+            "no 64-bit slice present, first slice by file offset wins",
+        )
+
+    @classmethod
+    def _verify_fat_slice(
+        cls, container: FatContainer, binary: Any, path: Path
+    ) -> FatContainer:
+        """Reconcile the container entry with the parsed thin Mach-O header.
+
+        The table entry only claims an architecture; the slice header proves it.
+        A mismatch means the bytes are not what the container advertises, so it
+        is rejected. On success the container's slice is rebuilt from the real
+        header, keeping ``slice_cputype``/``slice_arch`` evidence honest.
+        """
+        header_cputype = cls._macho_header_cputype(binary)
+        if header_cputype is None:  # LIEF build without a usable cpu_type
+            return container
+        chosen = container.slice
+        if header_cputype != chosen.cputype:
+            raise BinaryLoadError(
+                f"Fat Mach-O {path}: fat_arch[{chosen.index}].cputype "
+                f"{_cpu_type_name(chosen.cputype)} (0x{chosen.cputype:x}) does "
+                f"not match the parsed slice header cpu_type "
+                f"{_cpu_type_name(header_cputype)} (0x{header_cputype:x})"
+            )
+        return replace(container, slice=replace(chosen, cputype=header_cputype))
+
+    @staticmethod
+    def _macho_header_cputype(binary: Any) -> int | None:
+        """Numeric ``cputype`` of a parsed Mach-O header, or ``None``."""
+        header = getattr(binary, "header", None)
+        cpu_type = getattr(header, "cpu_type", None)
+        if cpu_type is None:
+            return None
+        try:
+            return int(cpu_type)
+        except (TypeError, ValueError):
+            pass
+        # LIEF builds that expose only the enum member name.
+        name = str(getattr(cpu_type, "name", cpu_type) or "").upper()
+        return _CPU_TYPE_ALIASES.get(name)
 
     # ---- PE ---------------------------------------------------------------
 
@@ -632,7 +987,14 @@ class BinaryLoader:
 
     # ---- Mach-O ------------------------------------------------------------
 
-    def _load_macho(self, binary: Any, path: Path) -> BinaryInfo:
+    def _load_macho(
+        self,
+        binary: Any,
+        path: Path,
+        *,
+        fat_offset: int = 0,
+        container: FatContainer | None = None,
+    ) -> BinaryInfo:
         header = getattr(binary, "header", None)
         cpu = str(self._get_attr(header, "cpu_type", "") or "")
         arch, bitness = self._macho_arch(cpu)
@@ -644,7 +1006,11 @@ class BinaryLoader:
         endianness = "big" if "CIGAM" in magic_text else "little"
         image_base = self._as_int(getattr(binary, "imagebase", 0))
         entry_point = self._as_int(getattr(binary, "entrypoint", 0)) or None
-        sections = [self._macho_section(s) for s in self._safe(binary, "sections")]
+        # Section offsets from LIEF are relative to the parsed slice; shift them
+        # so they stay valid offsets into the outer fat container.
+        sections = [
+            self._macho_section(s, fat_offset) for s in self._safe(binary, "sections")
+        ]
         imports = self._macho_imports(binary)
         exports = self._macho_exports(binary)
         symbols = self._macho_symbols(binary, sections)
@@ -654,6 +1020,20 @@ class BinaryLoader:
         if not symbols and not exports:
             warnings.append(
                 "No symbol table or exports found; function discovery is limited to the entry point."
+            )
+        evidence = None
+        if container is not None:
+            chosen = container.slice
+            evidence = Evidence(
+                source="macho.fat_header",
+                method="fat_arch_table",
+                confidence=Confidence.CERTAIN,
+                detail=(
+                    f"selected slice {chosen.index} of {container.slice_count} "
+                    f"({chosen.arch_name}) from a {container.magic_name} container: "
+                    f"{container.reason}"
+                ),
+                extra=container.evidence_extra(),
             )
         return BinaryInfo(
             path=path,
@@ -671,6 +1051,7 @@ class BinaryLoader:
             symbols=symbols,
             is_stripped=not symbols and not exports,
             warnings=warnings,
+            evidence=evidence,
         )
 
     @staticmethod
@@ -691,11 +1072,14 @@ class BinaryLoader:
         return "unknown", 0
 
     @classmethod
-    def _macho_section(cls, section: Any) -> SectionInfo:
+    def _macho_section(cls, section: Any, fat_offset: int = 0) -> SectionInfo:
         flags = cls._as_int(getattr(section, "flags", 0))
         offset = cls._as_int(getattr(section, "offset", 0))
         size = cls._as_int(getattr(section, "size", 0))
         virtual_address = cls._as_int(getattr(section, "virtual_address", 0))
+        # A slice-relative offset of 0 means "no file bytes" (S_ZEROFILL and
+        # friends); those stay unmapped even inside a fat container.
+        file_offset = offset + fat_offset if offset > 0 else offset
         segment = None
         if bool(getattr(section, "has_segment", False)):
             try:
@@ -709,9 +1093,9 @@ class BinaryLoader:
             name=name,
             virtual_address=virtual_address,
             size=size,
-            offset=offset,
+            offset=file_offset,
             # Sections without file bytes (S_ZEROFILL and friends) have offset 0.
-            raw_size=size if offset > 0 else 0,
+            raw_size=size if file_offset > 0 else 0,
             entropy=float(entropy) if entropy is not None else None,
             # S_ATTR_PURE_INSTRUCTIONS / S_ATTR_SOME_INSTRUCTIONS.
             is_executable=bool(flags & 0x80000000) or bool(flags & 0x400),

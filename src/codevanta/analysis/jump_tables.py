@@ -41,7 +41,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from codevanta.core.loader import BinaryInfo, SectionInfo
 from codevanta.core.report import AnalysisError, read_code
@@ -162,7 +162,7 @@ class JumpTableResult:
         }
 
 
-def _byteorder(info: BinaryInfo) -> str:
+def _byteorder(info: BinaryInfo) -> Literal["little", "big"]:
     """Return the ``int.from_bytes`` byte order implied by ``info.endianness``."""
     text = str(getattr(info, "endianness", "") or "").strip().lower()
     return "big" if any(text.startswith(marker) for marker in _BIG_ENDIAN_MARKERS) else "little"

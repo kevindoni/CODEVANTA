@@ -8,6 +8,71 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- Local web dashboard (`codevanta.gui`, `codevanta gui`): a standard-library-only
+  `ThreadingHTTPServer` bound to a loopback address serves one self-contained
+  dashboard page and nine read-only `GET` JSON routes (`/api/health`,
+  `/api/info`, `/api/functions`, `/api/strings`, `/api/xrefs`, `/api/cfg`,
+  `/api/struct`, `/api/callgraph`, `/api/diff`). Every route is a thin adapter
+  over the engine of the same name — no analysis is reimplemented — so each
+  payload keeps that engine's evidence record and limits. A host outside
+  `localhost`, `::1` or `127.0.0.0/8` is refused with `ValueError`, every numeric
+  query parameter is validated against the consuming engine's ceiling, and a
+  payload over `MAX_RESPONSE_BYTES` (4 MiB) has its top-level lists halved and is
+  flagged `response_truncated`. `create_server(port=0)` returns a bound,
+  unstarted server for tests and `create_handler(paths_allowed=False)` rejects
+  the file-taking routes outright.
+- Fat (universal) Mach-O loading (`codevanta.core.loader`): the four container
+  magics (`FAT_MAGIC`, `FAT_CIGAM`, `FAT_MAGIC_64`, `FAT_CIGAM_64`, 32- and
+  64-bit `fat_arch` tables) are parsed before LIEF runs, and exactly one slice is
+  then parsed. Selection is deterministic and stated in the evidence: a 64-bit
+  slice wins over a 32-bit one (`prefer_64bit`), otherwise the lowest file offset
+  wins (`first_by_offset`); every other slice is reported, never parsed. Section
+  offsets are rebased by the slice offset, so `va_to_offset()` maps into the
+  outer container, and `BinaryInfo.evidence` carries `source="macho.fat_header"`
+  with the structured `extra` keys (`fat`, `fat_magic`, `fat_magic_name`,
+  `fat_arch_64`, `slice_index`, `slice_count`, `slice_arch`, `slice_cputype`,
+  `slice_offset`, `slice_size`, `selection_rule`, `selection_reason`,
+  `available_arches`, `available_slices`) at `certain` confidence. Malformed
+  containers raise `BinaryLoadError` naming the defect — zero `nfat_arch`, a
+  truncated `fat_arch` table, a zero slice size, or an offset/size past the end
+  of the file.
+- Committed PE and Mach-O samples (`samples/pe64_text.bin`,
+  `samples/macho64_text.bin`): a PE32+ image with one executable `.text` and a
+  one-entry export table, and a thin `MH_EXECUTE` Mach-O exporting
+  `_codevanta_sample_main`, sharing one hand-assembled x86_64 code body and ASCII
+  payload so cross-format behaviour can be compared directly.
+  `scripts/make_samples.py` (standard library only) regenerates them byte for
+  byte from zeroed timestamps and fixed padding, `--check` exits non-zero when a
+  committed sample is stale, `--output-dir` writes elsewhere, and
+  `tests/test_samples.py` enforces that in CI.
+- MCP HTTP transports (`codevanta.mcp_server.server.run`, `codevanta mcp serve`):
+  `transport` accepts `stdio` (default, unchanged: JSON-RPC over stdin/stdout),
+  `sse` and `streamable-http`, which bind `host:port` instead
+  (`port=0` picks a free port). Because these tools read arbitrary local files, a
+  non-loopback host is refused unless `allow_remote=True`, and an unknown
+  transport raises `AnalysisError` naming the supported set. The CLI forwards
+  every option verbatim (`--transport`, `--host`, `--port`, `--allow-remote`) and
+  exits `2` on a rejected transport or bind, so existing stdio configurations
+  keep their meaning.
+- CI coverage and type checks (`.github/workflows/ci.yml`): the test job runs
+  `pytest --cov=codevanta --cov-report=term-missing`, and a separate `type-check`
+  job runs `mypy src/codevanta` on Python 3.13.
+- Benchmark script (`scripts/bench.py`): times the public analysis entry points
+  (`load`, `discover_functions`, `extract_strings`, disassembly, `find_xrefs`,
+  `build_cfg`, `build_call_graph`, `function_fingerprint`, `suggest_struct`, and
+  `diff_binaries` when two inputs are given) with `time.perf_counter` only, so a
+  performance regression shows up as a number. It defaults to the committed
+  `samples/`, takes `--repeat`, `--max-instructions` and `--limit-functions`
+  bounds, reports the shortest run per benchmark as `best_ms`, prints a sorted
+  table or `--json`, and writes nothing — inputs are read, never mapped or
+  executed. A benchmark the analysis layer refuses shows `iterations 0` with the
+  reason on stderr instead of a fabricated time.
+- API reference and sample documentation (`docs/api.md`, `docs/samples.md`):
+  every public entry point with the signature and defaults read from the source,
+  the evidence/confidence contract, the dashboard routes, the fifteen MCP tools,
+  and six runnable recipes whose printed output is the real output; plus a page
+  per sample binary with its SHA-256 and one working command each.
+
 - Big-endian UTF-16 string extraction (`codevanta.core.strings`): the UTF-16
   scan now follows the binary's endianness — big-endian targets (e.g. MIPS,
   s390x, PowerPC) yield `utf-16be` strings, little-endian targets keep
@@ -586,7 +651,7 @@ All notable changes to CODEVANTA are documented here. The format follows
   extents. Sessions and annotations live in one local SQLite file with no schema
   migrations yet.
 
-## [0.1.0] - 2026-12-11
+## [0.1.0] - 2026-11-12
 
 ### Added
 
