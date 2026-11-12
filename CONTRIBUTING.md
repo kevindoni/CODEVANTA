@@ -74,6 +74,21 @@ Use a short imperative subject, optionally with a conventional prefix
 (`feat:`, `fix:`, `docs:`, `build:`, `test:`, `refactor:`). Explain the *why* in
 the body and mention user-visible changes.
 
+### Attribution trailer
+
+When an AI agent produced a change, add the trailer so the authorship stays
+visible in the history:
+
+```text
+Co-authored-by: Cline (AI coding agent) <noreply@cline.bot>
+```
+
+Squash merges rewrite the commit and record the merge actor as the author, so the
+trailer is what survives; [CONTRIBUTORS.md](CONTRIBUTORS.md) remains the
+authoritative per-agent record. `.mailmap` keeps the maintainer's identities
+collapsed in `git shortlog`, which is why local counts and the GitHub contributor
+graph disagree.
+
 ## Pull requests
 
 `main` is protected: a pull request is required and the CI checks
