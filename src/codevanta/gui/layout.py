@@ -429,6 +429,19 @@ _BODY = """
       </div>
     </fieldset>
     <p class="group-label">Run analysis</p>
+    <div class="grid-opts" style="margin-bottom:14px">
+      <div>
+        <label for="backend">Decompile &middot; backend</label>
+        <div class="selwrap">
+          <select id="backend">
+            <option value="auto">auto</option>
+            <option value="native">native</option>
+            <option value="angr">angr</option>
+            <option value="ghidra">ghidra</option>
+          </select>
+        </div>
+      </div>
+    </div>
     <div class="verbs">
       <button type="button" data-action="info">Info</button>
       <button type="button" data-action="functions">Functions</button>
@@ -437,6 +450,7 @@ _BODY = """
       <button type="button" data-action="cfg">CFG</button>
       <button type="button" data-action="struct">Struct</button>
       <button type="button" data-action="callgraph">Callgraph</button>
+      <button type="button" data-action="decompile">Decompile</button>
     </div>
   </section>
 
@@ -507,7 +521,8 @@ _SCRIPT = """
     cfg: "/api/cfg",
     struct: "/api/struct",
     callgraph: "/api/callgraph",
-    diff: "/api/diff"
+    diff: "/api/diff",
+    decompile: "/api/decompile"
   };
 
   var MAX_TABLE_ROWS = 200;
@@ -569,6 +584,9 @@ _SCRIPT = """
     } else if (action === "callgraph") {
       addParam(parts, "limit_functions", fieldValue("limit"));
       addParam(parts, "limit_edges", fieldValue("limit_edges"));
+    } else if (action === "decompile") {
+      addParam(parts, "address", fieldValue("address"));
+      addParam(parts, "backend", fieldValue("backend") || "auto");
     }
     return parts;
   }

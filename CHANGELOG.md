@@ -631,6 +631,71 @@ All notable changes to CODEVANTA are documented here. The format follows
   200000) and `--json` (echo the payload when `--output` is used). Without the
   new flags the report is exactly the phase 1 payload, so existing JSON
   consumers are unaffected.
+- Pseudo-C decompilation (`codevanta.analysis.decompile`, `codevanta decompile`):
+  `decompile_function(path, info, address, max_instructions=2000,
+  max_blocks=500)` renders one function as readable C from the recursive CFG's
+  blocks, so nothing is decoded twice and nothing is executed. Argument count
+  comes from the ABI argument registers read before the first `call` (capped at
+  six, `mov rax, rdi` reads `rdi` while `mov rdi, rax` does not); argument
+  registers become `a0`..`a5`, frame slots become `local_0x8`/`arg_0x8`, other
+  memory operands become `*(u64*)(...)` with the binary's pointer width. Only
+  mnemonic-justified statements are emitted (`mov`/`lea`, compound and unary
+  assignments) so nothing is invented, and every emitted line keeps its raw
+  instruction text as a trailing comment. Control flow is structured into
+  `if`/`else`, `while (1)` with `continue;`/`break`, and `goto LABEL_<addr>;`
+  for whatever cannot be nested; conditions come from `cmp`/`test` plus the
+  branch mnemonic, with `(unsigned)` forms for `jb`..`ja`. Every rendering is
+  `Confidence.LOW` with `source="decompile.pseudo_c"` /
+  `method="mnemonic_heuristic"`, repeated in a header comment block inside the
+  text. Budgets are `2000`/`500` by default and capped at
+  `MAX_MAX_INSTRUCTIONS`/`MAX_MAX_BLOCKS` (`100000`); a cut-short rendering sets
+  `truncated` and warns instead of failing, while a non-executable address, an
+  out-of-range budget and a region that decodes to nothing raise `AnalysisError`
+  (exit `2`).
+- Pluggable decompiler backends (`codevanta.analysis.decompilers`): `ghidra`
+  (pyghidra + `GHIDRA_INSTALL_DIR`), `angr` and the always-available `native`
+  renderer sit behind one `decompile_function(...) -> BackendResult` entry point.
+  `BackendAvailability` reports `available`, a non-empty `reason` and the
+  `requires` tuple per provider and never raises or installs anything, so a
+  missing package is a probe result, never an `ImportError`. `backend="auto"`
+  (the default) prefers `ghidra` then `angr` and falls back to `native` with one
+  warning per skipped backend, while `backend="angr"`/`"ghidra"` are strict and
+  fail with the probe's reason and install hint. Budgets are validated once,
+  before any backend runs. `codevanta decompile --backend` and `--output` wrap
+  it, and neither Ghidra nor angr is a CODEVANTA dependency.
+- Bounded offline emulation (`codevanta.analysis.emulate`, `codevanta emulate`):
+  `emulate_function` copies the file's bytes into a *private* unicorn CPU and
+  runs them there, so nothing is ever executed on the host and no host syscall,
+  process or library is invoked. Only ABI entry state is seeded (`rip` at the
+  address, `rsp`/`rbp` in a stack region at `STACK_BASE_64`/`STACK_BASE_32`);
+  inputs arrive through `initial_registers`/`initial_memory` (`--set`, `--mem`),
+  never by guessing. Every run ends with a stated `stopped_reason` — `return`,
+  `budget`, `unmapped`, `unsupported`, `error` — plus a warning, and a value
+  left in `rax` after a budget stop is reported as a register rather than a
+  return value. Work is bounded by `max_instructions` (2000, ceiling 100000),
+  `stack_size` (64 KiB, ceiling 16 MiB), `MAX_SECTION_BYTES`,
+  `MAX_TOTAL_MAPPED` (64 MiB), `MAX_INITIAL_BLOCKS`/`MAX_INITIAL_BLOCK_BYTES`
+  and `MAX_MEMORY_WRITES` (256, overflow counted and warned).
+  `resolve_indirect_target` stops at the first indirect jump/call and returns
+  its target, with `None` meaning "not resolved" rather than "no target";
+  `xor_bytes` and `decrypt_string_loop` (xor/add/sub, optional per-byte
+  `key_step`, C-style terminators) apply a recovered key without executing
+  anything. Emulation needs the optional `unicorn` engine and exits `2` with the
+  reason when it is missing; only x86 and x86-64 are emulated, other
+  architectures report `unsupported` instead of a guess.
+- Phase 3 surfaces: the sixteenth MCP tool `codevanta_decompile` (same payload
+  as `BackendResult.to_dict()` plus the resolved `path`/`address` and the block
+  count, with an unavailable strict backend surfacing as a tool error carrying
+  the probe's reason), and the dashboard's tenth route `/api/decompile` with its
+  form on the page — `backend=auto` by default, `address` defaulting to the
+  entry point, and `400` naming the backend when a strict one is unavailable.
+- Documentation: `docs/phase3.md` covers the rendering rules, the ABI argument
+  inference, the confidence/evidence contract and exact bounds of the native
+  renderer, every emulation stop reason and limit, the provider layer's
+  selection policy and the availability matrix observed in this environment,
+  how to install `angr`/`pyghidra`+Ghidra to unlock real C output, `docs/api.md`
+  gains the three new modules' reference sections, and the README usage block
+  and docs index list the two new commands and the phase 3 document.
 
 ### Notes
 

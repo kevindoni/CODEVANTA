@@ -1,11 +1,16 @@
 # CODEVANTA API reference
 
 Every public Python entry point, with the arguments and defaults read from the
-source at the time of writing (`v0.1.0`, branch `feat/v0.1.0-completion`).
+source at the time of writing (`v0.1.0`; the phase 3 sections were read on branch
+`feat/phase3-power`).
 
 CODEVANTA does static analysis only: it parses file bytes and never executes a
-target. Each result object carries an [evidence record](#the-evidence-contract)
-so you can tell a proven fact from a heuristic before you rely on it.
+target on the host. (The phase-3 emulator in
+[`codevanta.analysis.emulate`](#codevantaanalysisemulate-bounded-offline-emulation)
+runs those same bytes on a private unicorn CPU, with no host process, syscall or
+library involved.) Each result object carries an [evidence
+record](#the-evidence-contract) so you can tell a proven fact from a heuristic
+before you rely on it.
 
 ## Contents
 
@@ -23,6 +28,9 @@ so you can tell a proven fact from a heuristic before you rely on it.
 - [`codevanta.analysis.binary_diff`: binary diff](#codevantaanalysisbinary_diff-binary-diff)
 - [`codevanta.analysis.function_hash`: fingerprints and similarity](#codevantaanalysisfunction_hash-fingerprints-and-similarity)
 - [`codevanta.analysis.type_recovery`: struct suggestions](#codevantaanalysistype_recovery-struct-suggestions)
+- [`codevanta.analysis.decompile`: pseudo-C rendering](#codevantaanalysisdecompile-pseudo-c-rendering)
+- [`codevanta.analysis.decompilers`: decompiler providers](#codevantaanalysisdecompilers-decompiler-providers)
+- [`codevanta.analysis.emulate`: bounded offline emulation](#codevantaanalysisemulate-bounded-offline-emulation)
 - [`codevanta.storage.session`: persisted sessions](#codevantastoragesession-persisted-sessions)
 - [`codevanta.gui`: local web dashboard](#codevantagui-local-web-dashboard)
 - [`codevanta.mcp_server`: MCP server](#codevantamcp_server-mcp-server)
@@ -36,7 +44,7 @@ so you can tell a proven fact from a heuristic before you rely on it.
 | `X \| None` | `None` means "the format does not record this", never `0`. Callers must check. |
 | `to_dict()` | Every result dataclass has one. Dictionaries are JSON-serializable; addresses become `"0x..."` strings, sizes stay integers. |
 | Errors | `BinaryLoadError` (load), `AnalysisError` (request cannot be satisfied), `DisassemblyError` (Capstone cannot decode), `SessionError` (storage), `GraphExportError` (export). |
-| Execution | Nothing here runs the target binary, writes to it, or needs the network. |
+| Execution | Nothing here runs the target binary on the host, writes to it, or needs the network. The phase-3 emulator runs the file's bytes on a private unicorn CPU. |
 
 ## The evidence contract
 
@@ -733,6 +741,207 @@ include_stack=False, pointer_width=8)` exposes the per-instruction access reader
 with `READ` / `WRITE` as the `direction` values.
 
 
+## `codevanta.analysis.decompile`: pseudo-C rendering
+
+```python
+from codevanta.analysis.decompile import (
+    CallSite, PseudoFunction, decompile_function,
+    DEFAULT_MAX_INSTRUCTIONS, DEFAULT_MAX_BLOCKS,
+    MAX_MAX_INSTRUCTIONS, MAX_MAX_BLOCKS,
+)
+
+decompile_function(path, info, address,
+                   max_instructions=DEFAULT_MAX_INSTRUCTIONS,   # 2000
+                   max_blocks=DEFAULT_MAX_BLOCKS) -> PseudoFunction
+```
+
+Renders one function as readable pseudo-C from the blocks of
+`build_recursive_cfg`, with names from `discover_functions`. Nothing is decoded
+twice and nothing is executed. `PseudoFunction` is `address`, `name`, `lines`
+(body lines without the header and braces), `body` (header comment + signature +
+braces + body), `call_sites`, `block_count`, `instruction_count`, `truncated`,
+`evidence`, and a JSON-safe `to_dict()`; each `CallSite` is `address`, `target`
+(`None` for an indirect transfer), `name` and `kind` (`"call"`, `"jump"` for a
+tail call, `"unknown"` for an unresolved indirect jump).
+
+**What the text can mean.** The argument count is the ABI argument registers
+read before the first `call` (`rdi`/`rsi`/`rdx`/`rcx`/`r8`/`r9` plus aliases on
+x86-64, `ecx`/`edx` on x86), capped at six; argument registers are renamed
+`a0`..`a5`, frame slots become `local_0x8`/`arg_0x8`, other memory operands
+`*(u64*)(...)` (`u32` for 32-bit files). Statements are emitted only where the
+mnemonic alone justifies them (`mov`/`lea`, compound and unary assignments), and
+each keeps its raw instruction text as a trailing comment; every other
+instruction keeps only the comment. Control flow is structured as `if`/`else`,
+`while (1)` with `continue;`/`break`, or `goto LABEL_<addr>;`, and conditions
+come from `cmp`/`test` plus the branch mnemonic (`(unsigned)` for `jb`..`ja`).
+
+```python
+from codevanta.analysis.decompile import decompile_function
+from codevanta.core.loader import BinaryLoader
+
+path = "samples/pe64_text.bin"
+info = BinaryLoader().load(path)
+function = decompile_function(path, info, info.entry_point)
+print(function.name, function.instruction_count, function.truncated)
+print(function.evidence.confidence.value, function.evidence.source)
+print(function.lines[0])
+```
+
+```text
+codevanta_sample_main 8 False
+low decompile.pseudo_c
+rsp -= 0x28;  /* sub rsp, 0x28 */
+```
+
+**Evidence.** Always `Confidence.LOW`, `source="decompile.pseudo_c"`,
+`method="mnemonic_heuristic"`, with a detail string naming the instruction and
+block counts and the "nothing is executed" caveat — and the same facts repeated
+in the header comment inside the text. CFG warnings are appended there as
+` * warning: ...` lines (at most six plus `(+N more)`).
+
+**Bounds.** `DEFAULT_MAX_INSTRUCTIONS = 2000`,
+`DEFAULT_MAX_BLOCKS = 500`, `MAX_MAX_INSTRUCTIONS = MAX_MAX_BLOCKS =
+MAX_DISASSEMBLY_COUNT = 100000`. A cut-short rendering sets `truncated` and
+warns; `AnalysisError` is raised for an address outside an executable section, a
+budget outside `1..MAX`, or a region that decodes to no instruction.
+
+
+## `codevanta.analysis.decompilers`: decompiler providers
+
+```python
+from codevanta.analysis.decompilers import (
+    AUTO, LANGUAGE,
+    AngrBackend, GhidraBackend, NativeBackend,
+    BackendAvailability, BackendResult, DecompilerBackend,
+    available_backends, get_backend, decompile_function, supported_backends,
+)
+
+available_backends() -> tuple[BackendAvailability, ...]     # ghidra, angr, native
+get_backend(name) -> DecompilerBackend                      # AnalysisError if unknown
+decompile_function(path, info, address, backend=AUTO,       # "auto"
+                   max_instructions=2000, max_blocks=500) -> BackendResult
+```
+
+`BackendAvailability` is `name`, `available`, a non-empty `reason` (what was
+detected, or what is missing plus an install hint) and `requires`. Probes never
+raise and never install: a missing package is `available=False`, never an
+`ImportError`. `BackendResult` is `text` (never empty), `backend` (the provider
+that actually rendered it), `language` (`LANGUAGE = "c"`), `warnings` and
+`evidence`; `to_dict()` is JSON-safe.
+
+| Backend | `requires` | Runs when |
+| --- | --- | --- |
+| `ghidra` | `("pyghidra", "ghidra")` | `pyghidra` imports **and** `GHIDRA_INSTALL_DIR` holds `support/`, `ghidraRun` or `ghidraRun.bat` |
+| `angr` | `("angr",)` | `angr` imports |
+| `native` | `()` | always |
+
+`backend="auto"` prefers `ghidra`, then `angr`, then `native`, and records one
+warning per skipped backend; `"angr"`/`"ghidra"` are strict and raise
+`AnalysisError` naming the backend and its probe reason instead of substituting
+another provider. Budgets are validated once (`require_budget`) before any
+backend runs.
+
+```python
+from codevanta.analysis.decompilers import available_backends, decompile_function
+from codevanta.core.loader import BinaryLoader
+
+path = "samples/pe64_text.bin"
+info = BinaryLoader().load(path)
+print([(probe.name, probe.available) for probe in available_backends()])
+result = decompile_function(path, info, info.entry_point, backend="native")
+print(result.backend, result.language, len(result.warnings))
+print(result.evidence.extra)
+```
+
+```text
+[('ghidra', False), ('angr', False), ('native', True)]
+native c 0
+{'backend': 'native', 'max_instructions': 2000, 'max_blocks': 500}
+```
+
+Those three lines are this machine's answer (no `pyghidra`, no `angr`); see
+[`docs/phase3.md`](phase3.md#how-to-unlock-real-c-output) for installing them.
+
+
+## `codevanta.analysis.emulate`: bounded offline emulation
+
+```python
+from codevanta.analysis.emulate import (
+    EMULATOR_AVAILABLE, emulator_status, emulate_function, resolve_indirect_target,
+    xor_bytes, decrypt_string_loop, DECRYPT_OPS,
+    EmulationResult, StopReason,
+    DEFAULT_MAX_INSTRUCTIONS, MAX_MAX_INSTRUCTIONS,
+    DEFAULT_STACK_SIZE, MAX_STACK_SIZE, PAGE_SIZE,
+    MAX_SECTION_BYTES, MAX_TOTAL_MAPPED,
+    MAX_INITIAL_BLOCKS, MAX_INITIAL_BLOCK_BYTES, MAX_MEMORY_WRITES,
+    STACK_BASE_64, STACK_BASE_32,
+)
+
+emulate_function(path, info, address, initial_registers=None, initial_memory=None,
+                 max_instructions=DEFAULT_MAX_INSTRUCTIONS,   # 2000
+                 stack_size=DEFAULT_STACK_SIZE) -> EmulationResult   # 0x10000
+
+resolve_indirect_target(path, info, address, initial_registers=None,
+                        max_instructions=DEFAULT_MAX_INSTRUCTIONS, *,
+                        initial_memory=None) -> int | None
+```
+
+The file's bytes are copied into a **private unicorn CPU**; nothing runs on the
+host, no host syscall or library is invoked, and a call into an import simply
+leaves the mapped image. Only ABI entry state is seeded (`rip`/`eip` at
+`address`, `rsp`/`rbp` (`esp`/`ebp`) near the top of a stack mapped at
+`STACK_BASE_64` (`0x7fff00000000`) or `STACK_BASE_32` (`0x7e000000`)); argument
+registers are never guessed. `EMULATOR_AVAILABLE` says whether a unicorn build
+is importable, and `emulator_status()` returns the empty string when it is (the
+reason otherwise).
+
+**Stop reasons** (`StopReason`): `return` (a `ret` left the section region —
+`return_value` is set), `budget` (`instructions == max_instructions`, no
+`return_value`), `unmapped` (faulting address in `warnings`), `unsupported` (not
+x86/x86-64, undecodable, or unicorn missing — `instructions=0`,
+`Confidence.UNKNOWN`), `error` (unicorn raised because of the emulated code).
+
+**`EmulationResult`**: `address`, `stopped_reason`, `instructions`,
+`return_value`, `registers`, `memory_writes` (`(address, bytes)` in store order),
+`indirect_targets`, `warnings`, `evidence` (`source="emulate.unicorn"`,
+`method="bounded_cpu_emulation"`, `Confidence.MEDIUM`, mapped `regions` and the
+budget in `extra`).
+
+**Bounds**: `MAX_MAX_INSTRUCTIONS = 100000`, `PAGE_SIZE = 0x1000`,
+`MAX_STACK_SIZE = 0x1000000`, `MAX_SECTION_BYTES = 0x1000000`,
+`MAX_TOTAL_MAPPED = 0x4000000`, `MAX_INITIAL_BLOCKS = 32`,
+`MAX_INITIAL_BLOCK_BYTES = 0x100000`, `MAX_MEMORY_WRITES = 256`.
+`AnalysisError` is only raised for an invalid request (address not executable or
+without file bytes, budget/stack size out of range, unknown register name, a
+value that does not fit the machine word, an `initial_memory` block over the
+limits); limitations are reported, never raised.
+
+```python
+from codevanta.analysis.emulate import emulate_function, resolve_indirect_target
+from codevanta.core.loader import BinaryLoader
+
+path = "samples/pe64_text.bin"
+info = BinaryLoader().load(path)
+result = emulate_function(path, info, info.entry_point)
+print(result.stopped_reason, result.instructions, hex(result.return_value))
+print(result.evidence.confidence.value, result.evidence.extra["stack_base"])
+print(resolve_indirect_target(path, info, info.entry_point))
+```
+
+```text
+return 9 0x2a
+medium 0x7fff00000000
+None
+```
+
+`resolve_indirect_target` returns the target of the first indirect jump/call, and
+`None` means "not resolved" — never "no target". `xor_bytes(data, key)` and
+`decrypt_string_loop(data, key, *, key_step=0, op="xor", terminators=(0,))` are
+pure byte functions (`DECRYPT_OPS = ("xor", "add", "sub")`) that apply a
+recovered key without executing anything; see
+[`docs/phase3.md`](phase3.md#the-xorstring-helpers).
+
+
 ## `codevanta.storage.session`: persisted sessions
 
 ```python
@@ -821,7 +1030,7 @@ never returns more than `MAX_RESPONSE_BYTES`, whatever the payload shape. Every
 numeric query parameter is validated against the ceiling of the engine that
 consumes it.
 
-### The nine `/api` routes
+### The ten `/api` routes
 
 All routes are `GET` and return `application/json`; `/` returns the HTML page.
 The builders are thin adapters — no analysis is reimplemented here.
@@ -837,6 +1046,7 @@ The builders are thin adapters — no analysis is reimplemented here.
 | `/api/struct` | `path`, `address`, `max_fields` (64), `include_stack` (0) | `suggest_struct` |
 | `/api/callgraph` | `path`, `limit_functions` (2000), `limit_edges` (20000) | `build_call_graph` |
 | `/api/diff` | `left`, `right`, `semantic` (0), `threshold` (0.9) | `diff_binaries` |
+| `/api/decompile` | `path`, `address` (entry point), `backend` (`auto`), `max_instructions` (2000), `max_blocks` (500) | `codevanta.analysis.decompilers.decompile_function` |
 
 Flags are integer `0`/`1`; addresses accept decimal or `0x` hex. Status codes:
 `421` with `{"error": ...}` for a foreign, missing or port-mismatched `Host`
@@ -844,6 +1054,11 @@ header; `400` with `{"error": ...}` for bad input, a missing file or a rejected
 analysis request; `404` for an unknown route; `405` for a non-`GET` method; `500`
 with `{"error": ...}` for an unexpected failure. The dashboard is read-only: it
 parses bytes, never executes or writes the target.
+
+`/api/decompile` answers `400` — naming the backend — when `backend=angr` or
+`backend=ghidra` is requested and unavailable, and takes the entry point when
+`address` is omitted (failing with `400` when the binary has none). Its payload
+is `BackendResult.to_dict()` plus `path`, `address` and `blocks`.
 
 
 ## `codevanta.mcp_server`: MCP server
@@ -858,7 +1073,7 @@ is_loopback_host(host: str) -> bool
 ```
 
 `build_server()` creates the MCP server (`name="CODEVANTA"`,
-`version="0.1.0"`) and registers the fifteen tools below.
+`version="0.1.0"`) and registers the sixteen tools below.
 
 `run(transport=...)` accepts
 `SUPPORTED_TRANSPORTS = ("stdio", "sse", "streamable-http")`:
@@ -883,10 +1098,11 @@ authentication and `Host`/`Origin` validation.
 > --port 8000`. `--allow-remote` is the CLI spelling of `allow_remote=True`, and
 > a rejected transport or bind exits `2`.
 
-### The fifteen tools
+### The sixteen tools
 
 Registered tool names, with their input properties. Verified by listing the
-tools of a built server (`asyncio.run(build_server().list_tools())`):
+tools of a built server (`asyncio.run(build_server().list_tools())`, which
+returns 16 names):
 
 | Tool | Inputs (defaults) | Returns |
 | --- | --- | --- |
@@ -897,6 +1113,7 @@ tools of a built server (`asyncio.run(build_server().list_tools())`):
 | `codevanta_analyze` | `path`, `string_limit` (5000) | the phase-1 report with provenance and evidence |
 | `codevanta_xrefs` | `path`, `limit` (200), `max_bytes` (4000000) | direct call/jump/branch references |
 | `codevanta_cfg` | `path`, `address`, `function`, `max_instructions` (2000), `max_blocks` (500) | heuristic basic-block CFG |
+| `codevanta_decompile` | `path`, `address`, `backend` (`auto`), `max_instructions` (2000), `max_blocks` (500) | `BackendResult` payload + `path`, `address`, `blocks` |
 | `codevanta_callgraph` | `path`, `limit_functions` (1000), `limit_edges` (5000) | inter-function direct-call graph |
 | `codevanta_diff` | `left`, `right`, `max_functions` (5000), `deep` (false), `semantic` (false), `threshold` (0.9) | structural / deep / semantic diff |
 | `codevanta_jump_table` | `path`, `address`, `mode` ("absolute"), `base`, `entries` (256), `executable_only` (true) | decoded jump-table entries |
@@ -905,6 +1122,11 @@ tools of a built server (`asyncio.run(build_server().list_tools())`):
 | `codevanta_struct` | `path`, `address`, `function`, `max_instructions` (2000), `max_fields` (64), `include_stack` (false) | struct-field suggestion |
 | `codevanta_session_save` | `path`, `db`, `notes` | newly persisted session record |
 | `codevanta_session_list` | `db`, `limit` (20) | sessions, newest first |
+
+`codevanta_decompile` matches `backend` case-insensitively (blank means `auto`)
+and rejects an unknown name with the supported set in the message; an
+unavailable strict backend raises the tool's `ToolError` carrying the probe's
+reason, so a model sees which backend is missing instead of a generic failure.
 
 **Argument strictness.** `codevanta_diff` forwards `deep`, `semantic` and
 `threshold` untouched: they must be real booleans and a real number, so
@@ -1111,7 +1333,7 @@ finally:
 
 ```text
 ok 0.1.0
-9 api routes
+10 api routes
 PE 1 ['codevanta_sample_main']
 ```
 
@@ -1120,3 +1342,32 @@ loopback address. For the same data interactively, run `codevanta gui` and open
 `http://127.0.0.1:8765/`; for the command line, see `codevanta info`,
 `codevanta disasm`, `codevanta analyze` and the other commands documented in the
 [README](../README.md#usage).
+
+### 7. Read a function: render it, then run it
+
+```python
+from codevanta.analysis.decompilers import decompile_function
+from codevanta.analysis.emulate import emulate_function
+from codevanta.core.loader import BinaryLoader
+
+path = "samples/pe64_text.bin"
+info = BinaryLoader().load(path)
+
+rendered = decompile_function(path, info, info.entry_point, backend="native")
+print(rendered.text.splitlines()[-4])   # a body line, with its instruction comment
+
+run = emulate_function(path, info, info.entry_point)
+print(run.stopped_reason, run.instructions, run.return_value)
+```
+
+```text
+    call_14000101f();  /* call 0x14000101f */
+return 9 42
+```
+
+The rendering is heuristic text (`low` confidence), the run is a fact
+(`medium`): the same function, two different kinds of evidence. Both are bounded
+by the budgets documented in
+[`codevanta.analysis.decompile`](#codevantaanalysisdecompile-pseudo-c-rendering)
+and
+[`codevanta.analysis.emulate`](#codevantaanalysisemulate-bounded-offline-emulation).
