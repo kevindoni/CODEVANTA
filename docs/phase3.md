@@ -425,26 +425,38 @@ native True | built-in mnemonic-level pseudo-C renderer; needs no optional depen
 
 ### How to unlock real C output
 
+There are two real providers and **one** extra for both of them, so nothing
+heavy ever lands in a plain `pip install`:
+
+| Install | Gives you | Unlocks |
+|---------|-----------|---------|
+| `pip install -e ".[decompilers]"` | `angr` **and** `pyghidra` | the `angr` backend outright; `pyghidra` is the *Python half* of the `ghidra` backend |
+| a Ghidra release (`~570 MB`) + `GHIDRA_INSTALL_DIR` | Ghidra itself | the *other half* of the `ghidra` backend |
+
+`pyghidra` sits in `decompilers` instead of in an extra of its own because the
+bridge installs on its own: `python -m pip install --dry-run pyghidra` resolves to
+a ~360 kB JPype wheel plus `typing_extensions` and `packaging` — no Ghidra, no
+JDK, nothing pip could not fetch. Only *using* it needs both halves. So pip never
+downloads Ghidra behind your back, and a machine that already has Ghidra on disk
+unlocks the backend from the same extra instead of hunting for a second one.
+
 Ghidra first, because `auto` prefers it:
 
 ```powershell
-# 1. the Python bridge
-python -m pip install pyghidra
+# 1. the Python bridge (angr ships in the same extra)
+python -m pip install -e ".[decompilers]"
 
 # 2. a Ghidra installation, then point CODEVANTA at it
-$env:GHIDRA_INSTALL_DIR = "D:\tools\ghidra_12.1.4_PUBLIC"   # contains support\ and ghidraRun.bat
+$env:GHIDRA_INSTALL_DIR = "D:\tools\ghidra_12.1_PUBLIC"   # contains support\ and ghidraRun.bat
 ```
 
-angr instead (or as well):
-
-```powershell
-python -m pip install angr
-```
+`angr` alone is enough for the `angr` backend, and it is what the blocking
+`decompile-parity` CI job installs.
 
 Confirm the probe before asking for a strict backend:
 
 ```powershell
-python -c "from codevanta.analysis.decompilers import available_backends; [print(p.name, p.available) for p in available_backends()]"
+python scripts/check_decompiler_backends.py
 ```
 
 Nothing else changes: the same `codevanta decompile --backend ghidra` /
@@ -454,6 +466,26 @@ then return that provider's text with its own evidence (`ghidra.decompiler` /
 `analyses.Decompiler`) and `language="c"`. The native renderer stays the fallback
 for machines with neither, and the Ghidra provider projects the instruction budget
 onto its decompiler timeout (200 instructions per second, clamped to 5–300 s).
+
+#### Is the ghidra backend actually tested?
+
+Yes — by the `ghidra-parity` job in `.github/workflows/ci.yml`, and **best
+effort on purpose**. That job downloads the pinned Ghidra release (~570 MB) from
+the official GitHub releases, verifies its published SHA-256, unpacks it, exports
+`GHIDRA_INSTALL_DIR`, sets up Temurin JDK 21 (Ghidra 12.1 requires JDK 21; 12.2
+requires JDK 25, so the two are bumped together), installs
+`-e ".[dev,decompilers]"`, asserts that
+`python scripts/check_decompiler_backends.py` reports `ghidra  available`, and
+then runs `python -m pytest tests/test_decompiler_parity.py -q -k ghidra`.
+
+It is `continue-on-error: true` because the download and the JVM are outside this
+repository's control, so it can never block a merge; the blocking gate for the
+provider layer stays `decompile-parity` (angr, wheels only). The job never lies
+about what it did: if Ghidra cannot be fetched or unpacked it prints a
+`::notice::` line saying the ghidra backend was **not** exercised. The tests are
+guarded the same way — they `skip` (they do not pass vacuously) when `pyghidra`
+or `GHIDRA_INSTALL_DIR` is missing, which is what happens on a developer machine
+with neither installed.
 
 ## Surfaces
 
