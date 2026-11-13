@@ -44,6 +44,12 @@ from codevanta.analysis.type_recovery import (
     MAX_MAX_INSTRUCTIONS,
     suggest_struct,
 )
+from codevanta.analysis.vtables import (
+    DEFAULT_MAX_SLOTS,
+    DEFAULT_MAX_TABLES,
+    DEFAULT_MIN_SLOTS,
+    find_vtables,
+)
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.entropy import (
     DEFAULT_MAX_SAMPLE_BYTES,
@@ -813,6 +819,47 @@ def dwarf(
     target = _validate_path(path)
     info = load_binary(target)
     return extract_debug_info(target, info, limit=limit).to_dict()
+
+
+def vtable(
+    path: str,
+    address: int | None = None,
+    scan: bool = False,
+    min_slots: int = DEFAULT_MIN_SLOTS,
+    max_slots: int = DEFAULT_MAX_SLOTS,
+    max_tables: int = DEFAULT_MAX_TABLES,
+    resolve_thunks: bool = True,
+) -> dict[str, Any]:
+    """Discover vtable candidates and resolve thunk chains (indirect xrefs).
+
+    ``address`` decodes one candidate at an exact vtable address (the optional
+    two-slot Itanium header is skipped automatically); ``scan`` sweeps every
+    non-executable data section for runs of consecutive code pointers. Slot
+    targets that are one-instruction tail-call thunks report their final
+    callee as ``resolved_target``. Every candidate is a heuristic with
+    ``vtable.candidate`` / ``vtable.slot_ref`` evidence at medium confidence.
+    """
+    if scan and address is not None:
+        raise AnalysisError("use either address or scan, not both")
+    if address is None and not scan:
+        raise AnalysisError("give address or scan=True")
+    if min_slots < 1 or min_slots > 64:
+        raise AnalysisError("min_slots must be between 1 and 64")
+    if max_slots < min_slots or max_slots > 4_096:
+        raise AnalysisError("max_slots must be between min_slots and 4096")
+    if max_tables < 1 or max_tables > 1024:
+        raise AnalysisError("max_tables must be between 1 and 1024")
+    target = _validate_path(path)
+    info = load_binary(target)
+    return find_vtables(
+        target,
+        info,
+        address=address,
+        min_slots=min_slots,
+        max_slots=max_slots,
+        max_tables=max_tables,
+        resolve_thunks=resolve_thunks,
+    ).to_dict()
 
 
 def struct(

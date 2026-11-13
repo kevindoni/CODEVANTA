@@ -149,6 +149,27 @@ codevanta dwarf samples/hello-dwarf
 codevanta dwarf samples/hello-dwarf --json
 ```
 
+## `shapes-vtable` — ELF aarch64 with C++ vtables
+
+An 47 400-byte aarch64 PIE executable built with the Android NDK's clang++
+(`-O0`) from two polymorphic classes (`Square`, `Circle` deriving from
+`Shape`). It is the fixture for `codevanta vtable`: the `.data.rel.ro`
+section holds the two class vtables — pointer slots that are **zero on disk**
+(PIE) and filled through `R_AARCH64_RELATIVE` dynamic relocations, which the
+discovery overlays so virtualized builds are visible to static analysis.
+
+| Property | Value |
+| --- | --- |
+| Format | ELF64, aarch64, little-endian, PIE |
+| Vtables | `Square` @ `0xb8f0` (4 slots), `Circle` @ `0xb948` (4 slots) in `.data.rel.ro` |
+| Scan result | 3 candidate tables (the two class vtables plus one runtime table) |
+| Size | 47 400 bytes |
+
+```powershell
+codevanta vtable samples/shapes-vtable --scan
+codevanta vtable samples/shapes-vtable --address 0xb8f0
+```
+
 ## Shared code body
 
 Both samples execute the same hand-assembled x86_64 sequence

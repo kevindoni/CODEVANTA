@@ -83,6 +83,7 @@ from codevanta.analysis.type_recovery import (
     suggest_struct,
     suggest_structs,
 )
+from codevanta.analysis.vtables import find_vtables
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.core.disassembler import DisassemblyError
 from codevanta.core.entropy import analyze_entropy
@@ -296,6 +297,84 @@ def dwarf(
         console.print(types_table)
     for warning in result.warnings:
         console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+@app.command()
+def vtable(
+    path: Annotated[Path, typer.Argument(help="Path to a PE, ELF, Mach-O or DEX binary")],
+    address: Annotated[
+        str | None,
+        typer.Option("--address", "-a", help="Vtable address (decimal or 0x hex); header slots are skipped automatically"),
+    ] = None,
+    scan: Annotated[
+        bool, typer.Option("--scan", help="Sweep every data section for candidate runs")
+    ] = False,
+    min_slots: Annotated[
+        int, typer.Option("--min-slots", help="Fewest consecutive code pointers that count as a table")
+    ] = 3,
+    max_slots: Annotated[
+        int, typer.Option("--max-slots", help="Cap on slots decoded per candidate")
+    ] = 256,
+    max_tables: Annotated[
+        int, typer.Option("--max-tables", help="Cap on candidates in --scan mode")
+    ] = 64,
+    no_thunks: Annotated[
+        bool, typer.Option("--no-thunks", help="Do not follow one-instruction tail-call chains")
+    ] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of tables")
+    ] = False,
+) -> None:
+    """Discover vtable candidates and resolve thunk chains (indirect xrefs)."""
+    if address is None and not scan:
+        _fail("give --address ADDR or --scan", 2)
+    loaded = _load(path)
+    try:
+        parsed_address = None if address is None else _parse_address(address)
+        result = find_vtables(
+            path,
+            loaded,
+            address=parsed_address,
+            min_slots=min_slots,
+            max_slots=max_slots,
+            max_tables=max_tables,
+            resolve_thunks=not no_thunks,
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 4)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    if not result.tables:
+        console.print("[yellow]no vtable candidates found[/]")
+        for warning in result.warnings:
+            console.print(f"[yellow]warning:[/] {escape(warning)}")
+        return
+    for index, candidate in enumerate(result.tables):
+        title = (
+            f"Vtable candidate {index + 1}/{len(result.tables)} at 0x{candidate.address:x} "
+            f"({candidate.section_name}, {len(candidate.slots)} slots"
+            + (f", {candidate.header_slots} header skipped)" if candidate.header_slots else ")")
+        )
+        slots_table = Table(title=escape(title))
+        slots_table.add_column("Slot", justify="right")
+        slots_table.add_column("Slot address", justify="right")
+        slots_table.add_column("Target", justify="right")
+        slots_table.add_column("Via thunk", justify="right")
+        for slot in candidate.slots:
+            slots_table.add_row(
+                str(slot.index),
+                f"0x{slot.slot_address:x}",
+                f"0x{slot.target:x}",
+                f"0x{slot.resolved_target:x}" if slot.resolved_target is not None else "-",
+            )
+        console.print(slots_table)
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    console.print(
+        "[dim]candidates are runs of code pointers in data — a heuristic, "
+        "not proof of a vtable.[/]"
+    )
 
 
 @app.command()

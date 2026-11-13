@@ -404,6 +404,32 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Discover C++ vtable candidates (runs of consecutive code pointers in "
+            "data sections) and resolve thunk chains from slot targets — indirect "
+            "cross-references at medium confidence, clearly labelled as heuristic."
+        )
+    )
+    def codevanta_vtable(
+        path: str,
+        address: int | None = None,
+        scan: bool = False,
+        min_slots: int = 3,
+        max_slots: int = 256,
+        max_tables: int = 64,
+        resolve_thunks: bool = True,
+    ) -> dict:
+        return tools.vtable(
+            path,
+            address=address,
+            scan=scan,
+            min_slots=min_slots,
+            max_slots=max_slots,
+            max_tables=max_tables,
+            resolve_thunks=resolve_thunks,
+        )
+
+    @server.tool(
+        description=(
             "Analyze a binary and persist its fingerprint, function count, and "
             "string count as a new session in the local SQLite session database."
         )
