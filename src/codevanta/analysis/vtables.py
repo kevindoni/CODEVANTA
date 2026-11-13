@@ -201,7 +201,7 @@ def _read_slots(
     address: int,
     *,
     pointer_size: int,
-    byteorder: str,
+    byteorder: Literal["little", "big"],
     min_slots: int,
     max_slots: int,
     resolve_thunks: bool,
