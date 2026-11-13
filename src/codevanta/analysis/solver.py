@@ -67,33 +67,76 @@ variable under *that state's* constraints -- so the values are concrete inputs
 that genuinely reach the path (a path constrained to ``rdi == 0`` reports a
 zero ``rdi``). ``return_value`` is one concrete solution for ``rax`` at the
 ``ret``, not every value ``rax`` can take; the evidence says so.
+
+z3-backed path feasibility (optional, never required)
+-----------------------------------------------------
+The unicorn explorer in :mod:`codevanta.analysis.symbolic` reports paths
+without proving anything. This module also carries the checker that closes
+that gap *when the optional z3-solver package is importable* -- enable it
+with ``python -m pip install z3-solver``; z3 is deliberately absent from
+pyproject so everything stays green without it, and :data:`HAS_Z3` says
+which world a process is in. :func:`translate_path` maps the branch
+decisions the naive explorer collected (``jcc`` conditions over the six x86
+condition flags, ``j*cxz`` conditions over the counter register) onto z3
+BitVec expressions at the machine's width (32/64-bit), :func:`check_path`
+decides one translated path (``sat``/``unsat``/``unknown``, every call
+bounded by ``timeout_ms`` and a memory cap), :func:`enumerate_feasible_paths`
+keeps the satisfiable sets with model values for their inputs, and
+:func:`solve_exploration` wires that into a
+:class:`~codevanta.analysis.symbolic.PathExploration` additively: infeasible
+paths are pruned with a warning, survivors gain ``feasible``/``model``/
+``solver_ms``, and without z3 the payload is exactly today's naive payload
+plus one typed warning. Honesty note: the checker decides whether the
+*recorded conditions* can hold together -- the naive explorer records no
+operand data flow, so a satisfiable path is not a proof that real inputs
+drive those flags on the real code.
 """
 
 from __future__ import annotations
 
 import importlib.util
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from time import perf_counter
+from typing import Any, Literal
 
 import capstone
 
+from codevanta.analysis.symbolic import Branch, PathExploration
 from codevanta.core.loader import BinaryInfo
 from codevanta.core.report import AnalysisError, read_code
 from codevanta.evidence.confidence import Confidence
 from codevanta.evidence.models import Evidence
 
 __all__ = [
+    "DEFAULT_ENUMERATE_PATHS",
     "DEFAULT_MAX_PATHS",
     "DEFAULT_MAX_STEPS",
+    "DEFAULT_TIMEOUT_MS",
+    "HAS_Z3",
+    "MAX_CONSTRAINTS_PER_PATH",
+    "MAX_ENUMERATE_PATHS",
     "MAX_MAX_PATHS",
     "MAX_MAX_STEPS",
+    "MAX_MEMORY_MB",
+    "MAX_TIMEOUT_MS",
+    "NAIVE_FALLBACK_WARNING",
+    "PathConstraints",
+    "PathVerdict",
     "SOLVER_AVAILABLE",
+    "SolverOverlay",
     "SolverPath",
     "SymbolicResult",
+    "Verdict",
+    "Z3_INSTALL_HINT",
+    "check_path",
+    "enumerate_feasible_paths",
     "explore_symbolic",
+    "solve_exploration",
     "solver_status",
+    "summarize_result",
+    "translate_path",
 ]
 
 # ---- limits ---------------------------------------------------------------
@@ -223,6 +266,673 @@ def _import_angr() -> Any:
             f"importing 'angr' failed ({type(exc).__name__}: {exc}); reinstall it with {_ANGR_HINT}"
         ) from exc
     return angr
+
+
+# ---- z3 availability (optional path-feasibility checker) --------------------
+#
+# z3-solver is deliberately NOT a pyproject dependency (and not part of any
+# extra): the naive evaluation must stay green without it, and importing this
+# module must never require it. Everything z3-backed below is guarded by
+# :data:`HAS_Z3`; without z3 the guard raises a typed AnalysisError naming the
+# install command instead of an ImportError.
+
+
+try:
+    import z3
+
+    HAS_Z3 = True
+except ImportError:  # optional by design; see the module docstring
+    HAS_Z3 = False
+
+#: What a caller needs to enable the z3-backed path checker.
+Z3_INSTALL_HINT = "python -m pip install z3-solver"
+
+#: Solver time budget used when the caller does not pass ``timeout_ms``.
+DEFAULT_TIMEOUT_MS = 1000
+
+#: Hard ceiling on ``timeout_ms``: every solver call is time-bounded.
+MAX_TIMEOUT_MS = 60_000
+
+#: z3 ``max_memory`` cap (megabytes) set on every solver instance.
+MAX_MEMORY_MB = 256
+
+#: Branch constraints asserted per path before the rest are dropped (and
+#: counted in :attr:`PathConstraints.dropped` instead of silently lost).
+MAX_CONSTRAINTS_PER_PATH = 64
+
+#: Paths :func:`enumerate_feasible_paths` keeps when the caller passes nothing.
+DEFAULT_ENUMERATE_PATHS = 16
+
+#: Hard ceiling on that cap: bounded output, whatever the caller asks for.
+MAX_ENUMERATE_PATHS = 256
+
+#: The typed warning the pipeline emits when ``mode="auto"`` finds no z3.
+NAIVE_FALLBACK_WARNING = "z3 not installed - naive evaluation"
+
+#: Evidence identity for the z3-backed checker.
+_SOLVER_CHECK_SOURCE = "sym.solver"
+_SOLVER_CHECK_METHOD = "z3_bitvec_path_check"
+
+#: Evidence identity for the naive fallback (nothing was checked).
+_NAIVE_CHECK_SOURCE = "sym.naive"
+_NAIVE_CHECK_METHOD = "naive_evaluation"
+
+#: How one path's feasibility check ended.
+Verdict = Literal["sat", "unsat", "unknown"]
+
+#: ``jcc`` spellings Capstone produces, folded onto the canonical names below
+#: (restated from :mod:`codevanta.analysis.symbolic` so this module keeps its
+#: own narrow vocabulary instead of reaching into that explorer's private map).
+_CONDITION_ALIASES: dict[str, str] = {
+    "je": "jz",
+    "jne": "jnz",
+    "jb": "jc",
+    "jnae": "jc",
+    "jae": "jnc",
+    "jnb": "jnc",
+    "jna": "jbe",
+    "jnbe": "ja",
+    "jpe": "jp",
+    "jpo": "jnp",
+    "jl": "jl",
+    "jnge": "jl",
+    "jge": "jge",
+    "jnl": "jge",
+    "jle": "jle",
+    "jng": "jle",
+    "jg": "jg",
+    "jnle": "jg",
+}
+
+#: Canonical ``jcc`` names this module can translate onto flag expressions.
+_CANONICAL_CONDITIONS = frozenset(
+    {"jz", "jnz", "jc", "jnc", "jbe", "ja", "js", "jns", "jo", "jno", "jp", "jnp",
+     "jl", "jge", "jle", "jg"}
+)
+
+#: ``j*cxz`` forms test a counter register instead of the flags: register name
+#: plus the BitVec width that register speaks (16/32/64 bits).
+_COUNTER_JUMPS: dict[str, tuple[str, int]] = {
+    "jrcxz": ("rcx", 64),
+    "jecxz": ("ecx", 32),
+    "jcxz": ("cx", 16),
+}
+
+#: ``rflags`` bit positions of the six condition flags (the same bits
+#: :mod:`codevanta.analysis.symbolic` seeds).
+_FLAG_BIT_POSITIONS: dict[str, int] = {"cf": 0, "pf": 2, "af": 4, "zf": 6, "sf": 7, "of": 11}
+
+
+# ---- solver-check results ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PathConstraints:
+    """One naive path's branch decisions, translated onto z3 expressions.
+
+    Attributes:
+        path_index: The naive explorer's index for the path (or any caller id).
+        bits: Machine width the expressions were built for (32 or 64).
+        expressions: The asserted z3 boolean expressions. Opaque solver
+            objects -- :meth:`to_dict` never exposes them, only their count.
+        inputs: The free inputs the solver may choose, by name: one ``rflags``
+            BitVec per branch site plus any counter register a ``j*cxz`` tested.
+        dropped: Decisions beyond :data:`MAX_CONSTRAINTS_PER_PATH`, not asserted.
+        notes: Every degradation (unknown mnemonics, the constraint cap).
+    """
+
+    path_index: int
+    bits: int
+    expressions: tuple[Any, ...]
+    inputs: Mapping[str, Any]
+    dropped: int = 0
+    notes: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict (counts and names, no solver objects)."""
+        return {
+            "path_index": self.path_index,
+            "bits": self.bits,
+            "constraint_count": len(self.expressions),
+            "inputs": sorted(self.inputs),
+            "dropped": self.dropped,
+            "notes": list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
+class PathVerdict:
+    """What the solver decided about one translated path.
+
+    Attributes:
+        path_index: The :class:`PathConstraints` id this verdict answers.
+        verdict: ``sat`` (constraints can hold together; ``model`` is filled),
+            ``unsat`` (they cannot) or ``unknown`` (the bounded solver ran out
+            of budget -- never dressed up as ``unsat``).
+        model: Concrete values the solver chose for the inputs when ``sat``;
+            empty otherwise.
+        solver_ms: Wall-clock milliseconds the solver call took.
+        notes: The constraints' own degradations, carried through.
+    """
+
+    path_index: int
+    verdict: Verdict
+    model: Mapping[str, int]
+    solver_ms: int
+    notes: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict (model values hex-formatted)."""
+        return {
+            "path_index": self.path_index,
+            "verdict": self.verdict,
+            "model": {name: f"0x{value:x}" for name, value in sorted(self.model.items())},
+            "solver_ms": self.solver_ms,
+            "notes": list(self.notes),
+        }
+
+
+# ---- constraint translation -------------------------------------------------
+
+
+def _import_z3() -> Any:
+    """Import z3 lazily, or raise :class:`AnalysisError` naming the install."""
+    if not HAS_Z3:
+        raise AnalysisError(
+            "'z3' is not installed, so the solver-backed path checker cannot run: it is "
+            "optional in CODEVANTA and z3 is never imported at module import time; "
+            f"install it with {Z3_INSTALL_HINT}"
+        )
+    try:
+        import z3
+    except Exception as exc:
+        raise AnalysisError(
+            f"importing 'z3' failed ({type(exc).__name__}: {exc}); "
+            f"reinstall it with {Z3_INSTALL_HINT}"
+        ) from exc
+    return z3
+
+
+def _flag_predicate(canonical: str, flags: Any) -> Any | None:
+    """Translate one canonical ``jcc`` onto a boolean expression over ``flags``.
+
+    ``flags`` is a BitVec at the machine width; every condition flag is its
+    single-bit slice. The formulas mirror the predicates
+    :mod:`codevanta.analysis.symbolic` evaluates (``jle`` = ``zf or sf != of``
+    and so on). ``None`` for a name outside :data:`_CANONICAL_CONDITIONS`.
+    """
+
+    def bit(name: str) -> Any:
+        position = _FLAG_BIT_POSITIONS[name]
+        return z3.Extract(position, position, flags) == z3.BitVecVal(1, 1)
+
+    if canonical == "jz":
+        return bit("zf")
+    if canonical == "jnz":
+        return z3.Not(bit("zf"))
+    if canonical == "jc":
+        return bit("cf")
+    if canonical == "jnc":
+        return z3.Not(bit("cf"))
+    if canonical == "jbe":
+        return z3.Or(bit("cf"), bit("zf"))
+    if canonical == "ja":
+        return z3.And(z3.Not(bit("cf")), z3.Not(bit("zf")))
+    if canonical == "js":
+        return bit("sf")
+    if canonical == "jns":
+        return z3.Not(bit("sf"))
+    if canonical == "jo":
+        return bit("of")
+    if canonical == "jno":
+        return z3.Not(bit("of"))
+    if canonical == "jp":
+        return bit("pf")
+    if canonical == "jnp":
+        return z3.Not(bit("pf"))
+    sf = z3.Extract(_FLAG_BIT_POSITIONS["sf"], _FLAG_BIT_POSITIONS["sf"], flags)
+    of = z3.Extract(_FLAG_BIT_POSITIONS["of"], _FLAG_BIT_POSITIONS["of"], flags)
+    if canonical == "jl":
+        return sf != of
+    if canonical == "jge":
+        return sf == of
+    if canonical == "jle":
+        return z3.Or(bit("zf"), sf != of)
+    if canonical == "jg":
+        return z3.And(z3.Not(bit("zf")), sf == of)
+    return None
+
+
+def _branch_expression(
+    decision: Branch,
+    bits: int,
+    flags_vars: dict[int, Any],
+    counters: dict[str, Any],
+    inputs: dict[str, Any],
+) -> tuple[Any, str | None]:
+    """Translate one :class:`~codevanta.analysis.symbolic.Branch` decision.
+
+    A flag-testing branch asserts its condition over a per-branch-site
+    ``rflags`` BitVec (flags are rewritten between branches, so one shared
+    variable would fake conflicts); a ``j*cxz`` asserts zero/non-zero over one
+    shared counter BitVec of its own width (the counter is a real register the
+    explorer carries through the path).
+
+    Returns:
+        ``(expression, note)`` -- the expression is ``None`` when the mnemonic
+        has no translation, in which case ``note`` says exactly what was
+        skipped (the caller still gets an honest count of what was asserted).
+    """
+    mnemonic = str(decision.mnemonic).strip().lower()
+    counter = _COUNTER_JUMPS.get(mnemonic)
+    if counter is not None:
+        name, width = counter
+        variable = counters.get(name)
+        if variable is None:
+            variable = z3.BitVec(f"codevanta_{name}", width)
+            counters[name] = variable
+            inputs[f"codevanta_{name}"] = variable
+        return ((variable == 0) if decision.taken else (variable != 0)), None
+    canonical = _CONDITION_ALIASES.get(mnemonic, mnemonic)
+    if canonical not in _CANONICAL_CONDITIONS:
+        return None, (
+            f"branch mnemonic {decision.mnemonic!r} at 0x{decision.address:x} has no z3 "
+            "translation; it was not asserted"
+        )
+    variable = flags_vars.get(decision.address)
+    if variable is None:
+        name = f"codevanta_rflags@0x{decision.address:x}"
+        variable = z3.BitVec(name, bits)
+        flags_vars[decision.address] = variable
+        inputs[name] = variable
+    predicate = _flag_predicate(canonical, variable)
+    assert predicate is not None  # canonical names always build a predicate
+    return (predicate if decision.taken else z3.Not(predicate)), None
+
+
+def translate_path(
+    decisions: Sequence[Branch],
+    bits: int = 64,
+    path_index: int = 0,
+) -> PathConstraints:
+    """Translate one naive path's branch decisions onto z3 BitVec constraints.
+
+    Args:
+        decisions: The ``Entry.decisions`` the unicorn explorer collected.
+        bits: Machine width for the flag BitVecs (32 or 64).
+        path_index: Caller id carried through to the verdict.
+
+    Returns:
+        The :class:`PathConstraints` for :func:`check_path`. Decisions beyond
+        :data:`MAX_CONSTRAINTS_PER_PATH` are counted in ``dropped`` and named
+        in a note; mnemonics without a translation are named in a note.
+
+    Raises:
+        AnalysisError: z3 is not installed (names :data:`Z3_INSTALL_HINT`),
+            ``bits`` is not 32 or 64, or a decision is not a ``Branch``.
+    """
+    _import_z3()  # availability guard; the z3 calls below are guarded by it
+    if bits not in (32, 64):
+        raise AnalysisError(f"bits must be 32 or 64, got {bits!r}")
+    expressions: list[Any] = []
+    notes: list[str] = []
+    flags_vars: dict[int, Any] = {}
+    counters: dict[str, Any] = {}
+    inputs: dict[str, Any] = {}
+    dropped = 0
+    for position, decision in enumerate(decisions):
+        if not isinstance(decision, Branch):
+            raise AnalysisError(
+                f"decision {position} must be a symbolic Branch, not {type(decision).__name__}"
+            )
+        if len(expressions) >= MAX_CONSTRAINTS_PER_PATH:
+            dropped += 1
+            continue
+        expression, note = _branch_expression(decision, bits, flags_vars, counters, inputs)
+        if note is not None:
+            notes.append(note)
+        if expression is not None:
+            expressions.append(expression)
+    if dropped:
+        notes.append(
+            f"{dropped} branch(es) beyond the {MAX_CONSTRAINTS_PER_PATH}-constraint "
+            "cap were not asserted"
+        )
+    return PathConstraints(
+        path_index=path_index,
+        bits=bits,
+        expressions=tuple(expressions),
+        inputs=inputs,
+        dropped=dropped,
+        notes=tuple(notes),
+    )
+
+
+# ---- bounded checking -------------------------------------------------------
+
+
+def _validated_timeout(timeout_ms: int) -> int:
+    """Validate one solver time budget: an int in ``[1, MAX_TIMEOUT_MS]``."""
+    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int):
+        raise AnalysisError(f"timeout_ms must be an int, not {type(timeout_ms).__name__}")
+    if timeout_ms < 1 or timeout_ms > MAX_TIMEOUT_MS:
+        raise AnalysisError(
+            f"timeout_ms must be in [1, {MAX_TIMEOUT_MS}], got {timeout_ms}"
+        )
+    return timeout_ms
+
+
+def _validated_enum_cap(max_paths: int) -> int:
+    """Validate one report cap: an int in ``[1, MAX_ENUMERATE_PATHS]``."""
+    if isinstance(max_paths, bool) or not isinstance(max_paths, int):
+        raise AnalysisError(f"max_paths must be an int, not {type(max_paths).__name__}")
+    if max_paths < 1 or max_paths > MAX_ENUMERATE_PATHS:
+        raise AnalysisError(
+            f"max_paths must be in [1, {MAX_ENUMERATE_PATHS}], got {max_paths}"
+        )
+    return max_paths
+
+
+def _new_solver(timeout_ms: int) -> Any:
+    """Create the bounded solver: a time cap in ms and a memory cap in MB.
+
+    Seam: tests substitute a stub exposing the same three calls
+    (``add``/``check``/``model``) so the pipeline logic is exercised without
+    z3 being installed.
+    """
+    solver_instance = z3.Solver()
+    solver_instance.set("timeout", timeout_ms)
+    solver_instance.set("max_memory", MAX_MEMORY_MB)
+    return solver_instance
+
+
+def check_path(constraints: PathConstraints, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> PathVerdict:
+    """Decide one translated path: ``sat``, ``unsat`` or ``unknown``, bounded.
+
+    Every solver call is bounded by ``timeout_ms`` (1 ..
+    :data:`MAX_TIMEOUT_MS`) and the :data:`MAX_MEMORY_MB` cap. An ``unknown``
+    stays ``unknown``: a budget that ran out is never reported as infeasible.
+
+    Raises:
+        AnalysisError: z3 is not installed, the budget is out of range, or z3
+            itself failed (each error says which, plus the install command).
+    """
+    _validated_timeout(timeout_ms)
+    _import_z3()
+    solver_instance = _new_solver(timeout_ms)
+    started = perf_counter()
+    try:
+        for expression in constraints.expressions:
+            solver_instance.add(expression)
+        answer = solver_instance.check()
+    except Exception as exc:
+        raise AnalysisError(
+            f"z3 failed while checking path {constraints.path_index} "
+            f"({type(exc).__name__}: {exc}); {Z3_INSTALL_HINT}"
+        ) from exc
+    elapsed_ms = int((perf_counter() - started) * 1000)
+    verdict: Verdict = "unknown"
+    answer_text = str(answer)  # stable across z3 versions (5.x dropped == "sat")
+    if answer_text == "sat":
+        verdict = "sat"
+    elif answer_text == "unsat":
+        verdict = "unsat"
+    model: dict[str, int] = {}
+    if verdict == "sat":
+        try:
+            solved = solver_instance.model()
+            for name in sorted(constraints.inputs):
+                value = solved.eval(constraints.inputs[name], model_completion=True)
+                model[name] = int(value.as_long())
+        except Exception as exc:
+            raise AnalysisError(
+                f"z3 failed while extracting the model of path {constraints.path_index} "
+                f"({type(exc).__name__}: {exc}); {Z3_INSTALL_HINT}"
+            ) from exc
+    return PathVerdict(
+        path_index=constraints.path_index,
+        verdict=verdict,
+        model=model,
+        solver_ms=elapsed_ms,
+        notes=constraints.notes,
+    )
+
+
+def enumerate_feasible_paths(
+    constraint_sets: Sequence[PathConstraints],
+    max_paths: int = DEFAULT_ENUMERATE_PATHS,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+) -> tuple[PathVerdict, ...]:
+    """Check ``constraint_sets`` and keep only the satisfiable ones, bounded.
+
+    Each set is checked with its own ``timeout_ms`` budget; at most
+    ``max_paths`` satisfiable sets come back (1 .. :data:`MAX_ENUMERATE_PATHS`),
+    each with the model values of its inputs. Unsatisfiable and unknown sets
+    are dropped here -- a caller that must tell those two apart checks with
+    :func:`check_path` directly.
+
+    Raises:
+        AnalysisError: A budget is out of range, z3 is not installed, or z3
+            itself failed (each names the offending input or the install).
+    """
+    _validated_timeout(timeout_ms)
+    _validated_enum_cap(max_paths)
+    feasible: list[PathVerdict] = []
+    for constraints in constraint_sets:
+        if len(feasible) >= max_paths:
+            break
+        verdict = check_path(constraints, timeout_ms=timeout_ms)
+        if verdict.verdict == "sat":
+            feasible.append(verdict)
+    return tuple(feasible)
+
+
+def summarize_result(result: PathVerdict, path: PathConstraints) -> dict[str, Any]:
+    """Concrete register values one path's model assigns, JSON-safe.
+
+    The model values are the free inputs the solver chose: per-branch
+    ``rflags`` assignments (hex) and any counter register the path tested.
+    ``model`` is empty unless the verdict is ``sat`` -- an ``unknown`` never
+    dresses up as a solution.
+    """
+    return {
+        "path_index": result.path_index,
+        "verdict": result.verdict,
+        "solver_ms": result.solver_ms,
+        "constraint_count": len(path.expressions),
+        "inputs": sorted(path.inputs),
+        "model": {name: f"0x{value:x}" for name, value in sorted(result.model.items())},
+        "notes": list(result.notes),
+    }
+
+
+# ---- pipeline overlay --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SolverOverlay:
+    """What the z3-backed checker added to one naive exploration.
+
+    Attributes:
+        mode: ``"auto"`` (check when z3 is importable) or ``"naive"`` (never).
+        solver: ``"z3"`` when paths were checked, ``"naive"`` otherwise.
+        ran: True exactly when z3 checked the paths (``auto`` + z3 present).
+        checked: Paths handed to the solver.
+        pruned: Indexes of paths pruned as infeasible (``unsat``).
+        entries: Verdicts of the surviving paths, in exploration order.
+        warnings: Typed warnings; the naive fallback message when z3 is absent.
+        solver_ms: Total solver wall time spent.
+        evidence: ``sym.solver`` when z3 ran, ``sym.naive`` otherwise.
+    """
+
+    mode: str
+    solver: str
+    ran: bool
+    checked: int
+    pruned: tuple[int, ...]
+    entries: tuple[PathVerdict, ...]
+    warnings: tuple[str, ...]
+    solver_ms: int
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the overlay itself to a JSON-safe dict."""
+        return {
+            "mode": self.mode,
+            "solver": self.solver,
+            "ran": self.ran,
+            "checked": self.checked,
+            "pruned": list(self.pruned),
+            "solver_ms": self.solver_ms,
+            "warnings": list(self.warnings),
+            "evidence": self.evidence.to_dict(),
+        }
+
+    def augmented_dict(self, exploration: PathExploration) -> dict[str, Any]:
+        """``exploration.to_dict()`` plus this overlay, strictly additive.
+
+        Without z3 the payload is exactly today's naive payload plus the typed
+        warning (no new keys); with z3 every surviving entry gains
+        ``feasible``/``model``/``solver_ms``, the pruned indexes move into the
+        ``solver`` section and the overlay warnings are appended.
+        """
+        payload = exploration.to_dict()
+        if not self.ran:
+            if self.warnings:
+                payload["warnings"] = [*payload["warnings"], *self.warnings]
+            return payload
+        pruned_set = set(self.pruned)
+        verdicts = {verdict.path_index: verdict for verdict in self.entries}
+        feasible_by_verdict: dict[Verdict, bool | None] = {
+            "sat": True,
+            "unsat": False,
+            "unknown": None,
+        }
+        entries: list[dict[str, Any]] = []
+        for entry in exploration.entries:
+            if entry.index in pruned_set:
+                continue
+            entry_dict = entry.to_dict()
+            verdict = verdicts.get(entry.index)
+            if verdict is not None:
+                entry_dict["solver"] = {
+                    "feasible": feasible_by_verdict[verdict.verdict],
+                    "model": {
+                        name: f"0x{value:x}" for name, value in sorted(verdict.model.items())
+                    },
+                    "solver_ms": verdict.solver_ms,
+                }
+            entries.append(entry_dict)
+        payload["entries"] = entries
+        payload["solver"] = self.to_dict()
+        payload["warnings"] = [*payload["warnings"], *self.warnings]
+        return payload
+
+
+def _overlay_evidence(
+    ran: bool, mode: str, checked: int, pruned_count: int, solver_ms: int, address: int
+) -> Evidence:
+    """Provenance for one overlay: what was checked, what was not."""
+    if ran:
+        return Evidence(
+            source=_SOLVER_CHECK_SOURCE,
+            method=_SOLVER_CHECK_METHOD,
+            confidence=Confidence.MEDIUM,
+            address=address,
+            detail=(
+                f"z3 checked {checked} naive path(s) over BitVec translations of their "
+                f"branch decisions; {pruned_count} pruned as infeasible in {solver_ms} ms"
+            ),
+            extra={
+                "solver": "z3",
+                "mode": mode,
+                "checked": checked,
+                "pruned": pruned_count,
+                "solver_ms": solver_ms,
+            },
+        )
+    return Evidence(
+        source=_NAIVE_CHECK_SOURCE,
+        method=_NAIVE_CHECK_METHOD,
+        confidence=Confidence.LOW,
+        address=address,
+        detail="naive evaluation only; no path feasibility was checked",
+        extra={"solver": "naive", "mode": mode},
+    )
+
+
+def solve_exploration(
+    exploration: PathExploration,
+    mode: str = "auto",
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    max_paths: int = DEFAULT_ENUMERATE_PATHS,
+) -> SolverOverlay:
+    """Check a naive exploration's paths with z3 and prune the infeasible ones.
+
+    ``mode="naive"`` never touches a solver: the overlay leaves the
+    exploration byte-identical (``augmented_dict`` == ``to_dict()``).
+    ``mode="auto"`` checks every path when z3 is importable and otherwise
+    falls back to exactly the naive behaviour plus
+    :data:`NAIVE_FALLBACK_WARNING`. An ``unknown`` verdict keeps its path (an
+    undecided path is not an infeasible one); at most ``max_paths`` surviving
+    verdicts are reported and the surplus is named in a warning.
+
+    Raises:
+        AnalysisError: ``mode`` is not auto/naive, a budget is out of range,
+            or z3 itself failed (each names the offending input or the install).
+    """
+    _validated_timeout(timeout_ms)
+    _validated_enum_cap(max_paths)
+    if mode not in ("auto", "naive"):
+        raise AnalysisError(f"mode must be 'auto' or 'naive', got {mode!r}")
+    if mode == "naive" or not HAS_Z3:
+        return SolverOverlay(
+            mode=mode,
+            solver="naive",
+            ran=False,
+            checked=0,
+            pruned=(),
+            entries=(),
+            warnings=((NAIVE_FALLBACK_WARNING,) if mode == "auto" else ()),
+            solver_ms=0,
+            evidence=_overlay_evidence(False, mode, 0, 0, 0, exploration.address),
+        )
+    warnings: list[str] = []
+    pruned: list[int] = []
+    kept: list[PathVerdict] = []
+    checked = 0
+    started = perf_counter()
+    for entry in exploration.entries:
+        constraints = translate_path(
+            entry.decisions, bits=exploration.bitness, path_index=entry.index
+        )
+        checked += 1
+        verdict = check_path(constraints, timeout_ms=timeout_ms)
+        if verdict.verdict == "unsat":
+            pruned.append(entry.index)
+            warnings.append(f"path {entry.index} pruned: infeasible under its branch constraints")
+            continue
+        if len(kept) >= max_paths:
+            warnings.append(
+                f"path {entry.index} checked feasible but not reported: the solver report "
+                f"cap (max_paths={max_paths}) was reached"
+            )
+            continue
+        kept.append(verdict)
+    total_ms = int((perf_counter() - started) * 1000)
+    return SolverOverlay(
+        mode=mode,
+        solver="z3",
+        ran=True,
+        checked=checked,
+        pruned=tuple(pruned),
+        entries=tuple(kept),
+        warnings=tuple(warnings),
+        solver_ms=total_ms,
+        evidence=_overlay_evidence(
+            True, mode, checked, len(pruned), total_ms, exploration.address
+        ),
+    )
 
 
 # ---- results ---------------------------------------------------------------
