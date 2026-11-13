@@ -4,6 +4,16 @@
 
 > **Advanced Code Intelligence** — Decode. Analyze. Understand.
 
+<p align="center">
+  <img src="docs/assets/cli.png" width="840" alt="CODEVANTA CLI - real output of info, functions and xrefs against a committed PE sample"><br>
+  <em>CLI - info, functions, xrefs on a committed PE sample</em><br><br>
+  <img src="docs/assets/gui.png" width="840" alt="CODEVANTA read-only web dashboard served on loopback"><br>
+  <em>Read-only web dashboard (codevanta gui)</em><br><br>
+  <img src="docs/assets/callgraph.png" width="840" alt="Self-contained HTML call graph export with pan and zoom"><br>
+  <em>HTML call graph export - 97 nodes (codevanta callgraph --format html)</em>
+</p>
+
+
 CODEVANTA is an AI-powered code intelligence, reverse engineering, and binary
 analysis platform. It helps engineers, security researchers, and analysts
 understand software faster — from source code to executables with missing
