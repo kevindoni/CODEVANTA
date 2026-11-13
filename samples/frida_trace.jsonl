@@ -1,0 +1,3 @@
+{"hit": 1, "address": "0x401000", "tid": 4242, "args": ["0x1", "0x7ffff7fde7c8", "0x0", "0x0"]}
+{"hit": 2, "address": "0x401002", "tid": 4242, "args": ["0x1", "0x7ffff7fde7c8", "0x0", "0x2a"]}
+{"hit": 3, "address": "0x401000", "tid": 4242, "args": ["0x1", "0x7ffff7fde7c8", "0x0", "0x0"]}

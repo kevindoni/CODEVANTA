@@ -26,3 +26,5 @@ samples/report_*.json
 .vscode/
 .DS_Store
 Thumbs.db
+
+!samples/gdb_trace.log

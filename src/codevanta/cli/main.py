@@ -38,6 +38,13 @@ from codevanta.analysis.callgraph import (
     build_call_graph,
 )
 from codevanta.analysis.cfg import FunctionCFG, build_cfg, build_recursive_cfg
+from codevanta.analysis.dataflow import (
+    DEFAULT_MAX_BLOCKS as DATAFLOW_MAX_BLOCKS,
+)
+from codevanta.analysis.dataflow import (
+    DEFAULT_MAX_INSTRUCTIONS as DATAFLOW_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.dataflow import DataFlowSummary, analyze_dataflow
 from codevanta.analysis.debuginfo import extract_debug_info
 from codevanta.analysis.decompile import (
     DEFAULT_MAX_BLOCKS as DECOMPILE_MAX_BLOCKS,
@@ -46,6 +53,7 @@ from codevanta.analysis.decompile import (
     DEFAULT_MAX_INSTRUCTIONS as DECOMPILE_MAX_INSTRUCTIONS,
 )
 from codevanta.analysis.decompilers import BackendResult, decompile_function
+from codevanta.analysis.evidence_bundle import build_bundle, dumps_bundle, write_bundle
 from codevanta.analysis.graph_export import (
     DEFAULT_MAX_EDGES as EXPORT_MAX_EDGES,
 )
@@ -68,6 +76,16 @@ from codevanta.analysis.jump_tables import (
     JumpTableResult,
     resolve_jump_table,
 )
+from codevanta.analysis.symbolic import (
+    DEFAULT_MAX_PATHS as SYMBOLIC_MAX_PATHS,
+)
+from codevanta.analysis.symbolic import (
+    DEFAULT_MAX_STEPS as SYMBOLIC_MAX_STEPS,
+)
+from codevanta.analysis.symbolic import (
+    EMULATOR_AVAILABLE as SYMBOLIC_EMULATOR_AVAILABLE,
+)
+from codevanta.analysis.symbolic import PathExploration, explore_paths
 from codevanta.analysis.trace import TraceReport, parse_frida_trace, parse_gdb_trace
 from codevanta.analysis.type_recovery import (
     DEFAULT_MAX_FIELDS as STRUCT_MAX_FIELDS,
@@ -99,6 +117,8 @@ from codevanta.core.report import (
     resolve_target,
 )
 from codevanta.core.strings import StringExtractor
+from codevanta.plugins import AnalysisContext, builtin_plugins, run_plugin
+from codevanta.plugins import load as load_plugin
 from codevanta.storage.session import SessionError, SessionRecord, SessionStore
 
 app = typer.Typer(
@@ -2206,6 +2226,416 @@ def attach(
         )
 
 
+# ---- phase 7: path exploration and data flow --------------------------------
+
+
+def _print_symbolic_exploration(result: PathExploration) -> None:
+    """Print one :class:`PathExploration` as a path table plus its warnings."""
+    table = Table(title=escape(f"Paths through 0x{result.address:x} ({result.paths})"))
+    table.add_column("#", justify="right")
+    table.add_column("Decisions")
+    table.add_column("Return", justify="right")
+    table.add_column("Stopped")
+    table.add_column("Steps", justify="right")
+    for entry in result.entries:
+        decisions = " ".join(
+            f"{branch.mnemonic}{'+' if branch.taken else '-'}" for branch in entry.decisions
+        )
+        if entry.seeded:
+            decisions = f"{decisions} ({entry.seeded} seeded)"
+        table.add_row(
+            str(entry.index),
+            decisions or "-",
+            f"0x{entry.return_value:x}" if entry.return_value is not None else "-",
+            entry.stopped_reason,
+            str(entry.instructions),
+        )
+    console.print(table)
+    console.print(
+        f"[dim]explorer: {escape(result.explorer)} · arch: {escape(result.architecture)} "
+        f"({result.bitness}-bit) · paths: {result.paths} · unresolved: {result.unresolved} · "
+        f"steps: {result.steps} · complete: {'yes' if result.complete else 'no'}[/]"
+    )
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    for entry in result.entries:
+        for warning in entry.warnings:
+            console.print(f"[yellow]warning:[/] [path {entry.index}] {escape(warning)}")
+
+
+@app.command()
+def symbolic(
+    path: Annotated[Path, typer.Argument(help="Path to the binary to explore")],
+    address: Annotated[
+        str | None,
+        typer.Argument(
+            help="Virtual address to start at (decimal or 0x hex); defaults to the entry point"
+        ),
+    ] = None,
+    max_paths: Annotated[
+        int, typer.Option("--max-paths", help="Maximum paths to report")
+    ] = SYMBOLIC_MAX_PATHS,
+    max_steps: Annotated[
+        int,
+        typer.Option(
+            "--max-steps", help="Instruction budget for the whole exploration, replays included"
+        ),
+    ] = SYMBOLIC_MAX_STEPS,
+    set_values: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--set", help="Seed a register for every path, e.g. --set eax=42; repeatable"
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit PathExploration.to_dict() instead of a table")
+    ] = False,
+) -> None:
+    """Enumerate the paths through one function by replaying branch decisions.
+
+    Exploration starts at ADDRESS, else the entry point, and walks the decision
+    tree breadth first: every conditional branch met on the way is followed in
+    the direction the emulated flags produced (``observed``) and the opposite
+    direction is enqueued with its flags rewritten (``seeded`` -- an assumption
+    about feasibility, not a solved constraint, and each such branch says so in
+    a ``warning:`` line). Nothing is executed on the host: the file's bytes are
+    copied onto a private CPU, exactly like ``codevanta emulate``.
+
+    The table has one row per path: its number, the decisions as
+    ``mnemonic+`` (taken) or ``mnemonic-`` (fell through) with a ``seeded``
+    count when directions were forced, the value in ``rax``/``eax`` when the
+    path reached a ``ret`` that left the function (``-`` otherwise), why it
+    stopped (``return``, ``budget``, ``blocked`` or ``unmapped``) and how many
+    instructions it executed. The dim line under it carries the explorer, the
+    architecture, the totals and whether the exploration was complete; every
+    degradation keeps its own ``warning:`` line, per path where applicable.
+    ``--json`` prints ``PathExploration.to_dict()`` unchanged instead.
+
+    ``--set REG=VALUE`` (repeatable, decimal or ``0x`` hex) seeds a register for
+    every path before it runs, which is how an input reaches the code. A
+    partial answer is never dressed up as a complete one: paths that ended
+    without a return are counted in the ``unresolved`` total and explained.
+    ``--max-paths`` and ``--max-steps`` bound the work; an out-of-range budget
+    is rejected before anything runs. Exploration needs the optional ``unicorn``
+    engine; when it is missing this exits 2 and never raises ``ImportError``.
+    A bad address, a bad seed and an address outside an executable section all
+    exit 2 as well.
+    """
+    if not SYMBOLIC_EMULATOR_AVAILABLE:
+        _fail(
+            "path exploration is unavailable: "
+            f"{emulator.emulator_status() or 'the unicorn engine could not be imported'}; "
+            "install it with 'pip install unicorn' and retry",
+            2,
+        )
+    registers = dict(_parse_register_assignment(text) for text in set_values or ())
+    requested = None if address is None else _parse_address(address)
+    loaded = _load(path)
+    try:
+        start = resolve_target(loaded, requested, None)
+        result = explore_paths(
+            path,
+            loaded,
+            start,
+            max_paths=max_paths,
+            max_steps=max_steps,
+            initial_registers=registers,
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    _print_symbolic_exploration(result)
+
+
+def _print_dataflow_summary(result: DataFlowSummary) -> None:
+    """Print one :class:`DataFlowSummary` as a definition table plus footers."""
+    table = Table(title=escape(f"Data flow at 0x{result.address:x}"))
+    table.add_column("Address", justify="right")
+    table.add_column("Register")
+    table.add_column("Kind")
+    table.add_column("Value", justify="right")
+    table.add_column("Source")
+    for definition in result.definitions:
+        table.add_row(
+            f"0x{definition.address:x}",
+            escape(definition.register),
+            escape(definition.kind),
+            f"0x{definition.value:x}" if definition.value is not None else "-",
+            escape(definition.source_register or "-"),
+        )
+    console.print(table)
+    constants = " ".join(
+        f"{name}=0x{value:x}" for name, value in sorted(result.constant_registers.items())
+    )
+    console.print(f"[dim]constant registers: {escape(constants or 'none')}[/]")
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+@app.command()
+def dataflow(
+    path: Annotated[Path, typer.Argument(help="Path to the binary to analyse")],
+    address: Annotated[
+        str | None,
+        typer.Argument(
+            help="Virtual address to start at (decimal or 0x hex); defaults to the entry point"
+        ),
+    ] = None,
+    max_instructions: Annotated[
+        int,
+        typer.Option("--max-instructions", help="Maximum instructions to decode"),
+    ] = DATAFLOW_MAX_INSTRUCTIONS,
+    max_blocks: Annotated[
+        int, typer.Option("--max-blocks", help="Maximum basic blocks to walk")
+    ] = DATAFLOW_MAX_BLOCKS,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit DataFlowSummary.to_dict() instead of a table")
+    ] = False,
+) -> None:
+    """Recover register definitions, uses and provable constants of one function.
+
+    The region starting at ADDRESS, else the entry point, is decoded and walked
+    forward once, block by block in ascending address order: every read is
+    resolved against the definitions seen so far and every register write
+    replaces (kills) what the register held. A few shapes are folded -- the
+    values a ``mov`` immediate, a register copy or an ``add``/``sub`` of known
+    values leave behind -- and anything else keeps the register unknown rather
+    than guessing.
+
+    The table has one row per definition: its address, the canonical register
+    (aliases such as ``eax`` are normalised), the shape (``const``, ``copy``,
+    ``arithmetic`` or ``unknown``), the provable value (``-`` when none) and
+    the source register of a copy. The dim line under it lists the constants
+    still known after the pass (``none`` when nothing is provable), and every
+    caveat -- undefined reads, a truncated CFG -- keeps its own ``warning:``
+    line. ``--json`` prints ``DataFlowSummary.to_dict()`` unchanged instead,
+    which adds the uses, the reaching definitions and the evidence.
+
+    ``--max-instructions`` and ``--max-blocks`` bound the work; an out-of-range
+    budget, a bad address and an address outside an executable section all
+    exit 2. The target binary is only ever read: this is a static pass.
+    """
+    requested = None if address is None else _parse_address(address)
+    loaded = _load(path)
+    try:
+        start = resolve_target(loaded, requested, None)
+        result = analyze_dataflow(
+            path,
+            loaded,
+            start,
+            max_instructions=max_instructions,
+            max_blocks=max_blocks,
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    _print_dataflow_summary(result)
+
+
+# ---- phase 7: analysis plugins ----------------------------------------------
+
+
+plugins_app = typer.Typer(help="Analysis plugin commands")
+app.add_typer(plugins_app, name="plugins")
+
+
+@plugins_app.command("list")
+def plugins_list(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the plugin descriptions as JSON")
+    ] = False,
+) -> None:
+    """List the analysis plugins this process can run with ``plugins run``.
+
+    The list is the live built-in registry, sorted by name. ``--json`` prints
+    one ``PluginInfo.to_dict()`` per plugin instead of a table.
+    """
+    infos = builtin_plugins()
+    if json_output:
+        console.print_json(json.dumps([info.to_dict() for info in infos]))
+        return
+    table = Table(title=escape(f"Analysis plugins ({len(infos)})"))
+    table.add_column("Name")
+    table.add_column("Version")
+    table.add_column("Kind")
+    table.add_column("Entry point")
+    table.add_column("Description")
+    for info in infos:
+        table.add_row(
+            escape(info.name),
+            escape(info.version),
+            escape(info.kind),
+            escape(info.entry_point or "-"),
+            escape(info.description or "-"),
+        )
+    console.print(table)
+
+
+@plugins_app.command("run")
+def plugins_run(
+    name: Annotated[
+        str, typer.Argument(help="Plugin name, as shown by 'codevanta plugins list'")
+    ],
+    path: Annotated[Path, typer.Argument(help="Path to the binary to analyse")],
+    address: Annotated[
+        str | None,
+        typer.Argument(
+            help="Focus address for the run (decimal or 0x hex); defaults to the entry point"
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit PluginResult.to_dict() instead of a table")
+    ] = False,
+) -> None:
+    """Run one analysis plugin over a binary under the plugin harness budget.
+
+    The plugin is resolved from the built-in registry first; a name no registry
+    or entry point declares exits 2 with an error that names it. The run gets
+    an :class:`~codevanta.plugins.AnalysisContext` built from the loaded binary
+    and its discovered function candidates, focused at ADDRESS, else the entry
+    point, and the harness bounds the run by wall-clock time and payload size
+    -- a plugin that overruns either budget exits 2.
+
+    The table prints the returned payload as ``key = value`` rows (nested
+    values as JSON), the dim line under it names the plugin, its version, its
+    kind and the measured run time, and warnings the payload declares keep
+    their own ``warning:`` lines. ``--json`` prints
+    ``PluginResult.to_dict()`` unchanged instead.
+    """
+    requested = None if address is None else _parse_address(address)
+    loaded = _load(path)
+    try:
+        plugin = load_plugin(name=name)
+        start = resolve_target(loaded, requested, None)
+        context = AnalysisContext(
+            path=path,
+            info=loaded,
+            address=start,
+            functions=tuple(discover_functions(loaded)),
+        )
+        result = run_plugin(plugin, context)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    table = Table(title=escape(f"Plugin {result.plugin.name}"))
+    table.add_column("Key")
+    table.add_column("Value")
+    for key, value in sorted(result.payload.items()):
+        text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+        table.add_row(escape(str(key)), escape(text))
+    console.print(table)
+    console.print(
+        f"[dim]plugin: {escape(result.plugin.name)} · version: "
+        f"{escape(result.plugin.version)} · kind: {escape(result.plugin.kind)} · "
+        f"{result.elapsed_ms:.1f} ms[/]"
+    )
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+# ---- phase 7: evidence bundles ----------------------------------------------
+
+
+def _parse_entry_assignment(text: str) -> tuple[str, str]:
+    """Parse one ``NAME=FILEPATH`` payload given through ``--entry``.
+
+    The name and the file side must both be non-empty; a missing ``=`` or a
+    blank half exits with code 2 instead of bundling a wrong payload.
+    """
+    name, separator, file_text = text.partition("=")
+    name = name.strip()
+    file_text = file_text.strip()
+    if not separator or not name or not file_text:
+        _fail(f"invalid --entry {text!r}; use NAME=FILEPATH, e.g. --entry cfg=report.json", 2)
+    return name, file_text
+
+
+def _read_entry_payload(name: str, file_text: str) -> Any:
+    """Read one ``--entry`` payload file and parse it as JSON."""
+    payload_path = Path(file_text)
+    try:
+        text = payload_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        _fail(f"cannot read entry {name!r} from {payload_path}: {exc}", 2)
+    except UnicodeDecodeError as exc:
+        _fail(f"entry {name!r} is not UTF-8 text ({exc})", 2)
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        _fail(f"entry {name!r} is not valid JSON ({exc})", 2)
+
+
+@app.command("evidence-bundle")
+def evidence_bundle(
+    path: Annotated[Path, typer.Argument(help="Path to the analysed binary")],
+    entries: Annotated[
+        list[str],
+        typer.Option(
+            "--entry",
+            help="Bundle one payload, NAME=FILEPATH (a JSON file); repeatable, at least once",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o", help="Write the bundle document here")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Also print the bundle document to stdout")
+    ] = False,
+) -> None:
+    """Hash one binary and its analysis payloads into a tamper-evident bundle.
+
+    Every ``--entry`` names one payload: ``NAME`` is the entry name in the
+    bundle (at least one entry is required; a repeated name is refused) and
+    ``FILEPATH`` is a JSON file whose parsed document becomes the payload. The
+    subject binary is streamed through SHA-256 and every payload is reduced to
+    canonical JSON before it is hashed, so a verifier can recompute both
+    digests from the document alone -- ``verify_bundle`` reports any later
+    edit as a mismatch.
+
+    The bundle is written to ``--output`` as canonical JSON. Writing it *into*
+    the analysed path is refused: ``--output`` must not name the analysed
+    binary itself (nor anything under it, when the subject is a directory),
+    because a bundle that overwrites its own subject destroys the evidence it
+    pins. Missing or unreadable entry files, non-JSON payloads and unwritable
+    outputs all exit 2, and a bundle is never written partially.
+
+    The success line names the written path, the entry count and the subject
+    digest. ``--json`` additionally prints the exact document to stdout.
+    """
+    payloads: dict[str, Any] = {}
+    for text in entries:
+        name, file_text = _parse_entry_assignment(text)
+        if name in payloads:
+            _fail(f"duplicate --entry name {name!r}; entry names must be unique", 2)
+        payloads[name] = _read_entry_payload(name, file_text)
+    subject = path.resolve()
+    target = output.resolve()
+    if subject.is_dir():
+        if target == subject or subject in target.parents:
+            _fail(
+                f"--output {str(output)!r} is inside the analysed directory {str(path)!r}; "
+                "write the bundle somewhere else",
+                2,
+            )
+    elif target == subject:
+        _fail(f"--output {str(output)!r} would overwrite the analysed binary {str(path)!r}", 2)
+    try:
+        bundle = build_bundle(path, payloads)
+        written = write_bundle(bundle, output)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    console.print(
+        f"[green]bundle written:[/] {escape(str(written))} · entries: {len(payloads)} "
+        f"· subject sha256: {escape(bundle.manifest.subject_sha256)}"
+    )
+    if json_output:
+        console.print(dumps_bundle(bundle), markup=False, soft_wrap=True)
+
+
 mcp_app = typer.Typer(help="Model Context Protocol server commands")
 app.add_typer(mcp_app, name="mcp")
 
@@ -2606,5 +3036,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

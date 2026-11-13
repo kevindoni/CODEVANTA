@@ -63,13 +63,14 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
     assert report["disassembly"]["instruction_count"] == 3
 
 
-def test_server_lists_twenty_tools() -> None:
+def test_server_lists_twenty_two_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
     assert names == [
         "codevanta_analyze",
         "codevanta_callgraph",
         "codevanta_cfg",
+        "codevanta_dataflow",
         "codevanta_decompile",
         "codevanta_diff",
         "codevanta_disasm",
@@ -84,6 +85,7 @@ def test_server_lists_twenty_tools() -> None:
         "codevanta_similarity",
         "codevanta_strings",
         "codevanta_struct",
+        "codevanta_symbolic",
         "codevanta_trace",
         "codevanta_vtable",
         "codevanta_xrefs",
@@ -182,6 +184,32 @@ def call_elf_path(tmp_path: Path) -> Path:
 def branchy_elf_path(tmp_path: Path) -> Path:
     """ELF64 sample with ``test eax, eax; je +2; nop; nop; ret``."""
     return _write_elf64(tmp_path / "branchy.bin", bytes.fromhex("85c074029090c3"))
+
+
+@pytest.fixture
+def straight_elf_path(tmp_path: Path) -> Path:
+    """ELF64 sample whose ``.text`` is ``mov eax, 42; ret`` (one path)."""
+    return _write_elf64(tmp_path / "straight.bin", bytes.fromhex("b82a000000c3"))
+
+
+@pytest.fixture
+def two_way_elf_path(tmp_path: Path) -> Path:
+    """ELF64 sample: ``test edi, edi; je +6; mov eax, 1; ret; mov eax, 2; ret``."""
+    return _write_elf64(
+        tmp_path / "two_way.bin",
+        bytes.fromhex("85ff")        # 0x00: test edi, edi
+        + bytes.fromhex("7406")      # 0x02: je 0x40100a
+        + bytes.fromhex("b801000000")  # 0x04: mov eax, 1
+        + bytes.fromhex("c3")        # 0x09: ret
+        + bytes.fromhex("b802000000")  # 0x0a: mov eax, 2
+        + bytes.fromhex("c3"),       # 0x0f: ret
+    )
+
+
+@pytest.fixture
+def const_elf_path(tmp_path: Path) -> Path:
+    """ELF64 sample whose ``.text`` is ``mov rax, 5; ret``."""
+    return _write_elf64(tmp_path / "const.bin", bytes.fromhex("48c7c005000000c3"))
 
 def test_xrefs_reports_direct_call(call_elf_path: Path) -> None:
     payload = tools.xrefs(str(call_elf_path))
@@ -1575,6 +1603,99 @@ def test_server_call_tool_decompile_surfaces_an_unavailable_backend(
         )
 
     assert "codevanta_decompile" in str(excinfo.value)
+
+
+def test_symbolic_explores_a_straight_line_as_one_path(straight_elf_path: Path) -> None:
+    payload = tools.symbolic(str(straight_elf_path), TEXT_ADDRESS)
+
+    assert payload["explorer"] == "unicorn"
+    assert payload["architecture"] == "x86_64"
+    assert payload["paths"] == 1
+    assert payload["complete"] is True
+    assert payload["return_values"] == ["0x2a"]
+    entry = payload["entries"][0]
+    assert entry["stopped_reason"] == "return"
+    assert entry["return_value"] == "0x2a"
+    assert entry["decisions"] == []
+    assert entry["seeded_branches"] == 0
+    assert payload["evidence"]["source"] == "symbolic.unicorn"
+    assert payload["evidence"]["method"] == "branch_decision_replay"
+    assert payload["path"] == str(straight_elf_path)
+    assert payload["address_resolved"] == "0x401000"
+    # Every other tool returns JSON-safe values; so must this one.
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_symbolic_labels_seeded_directions_as_assumptions(two_way_elf_path: Path) -> None:
+    payload = tools.symbolic(str(two_way_elf_path), TEXT_ADDRESS, max_steps=2000)
+
+    # Both sides of the one conditional are reported, and only one was real.
+    assert payload["paths"] == 2
+    assert {entry["decisions"][0]["basis"] for entry in payload["entries"]} == {
+        "observed",
+        "seeded",
+    }
+    assert payload["return_values"] == ["0x2", "0x1"]
+
+    seeded = next(entry for entry in payload["entries"] if entry["seeded_branches"])
+    decision = seeded["decisions"][0]
+    assert decision["mnemonic"] == "je"
+    assert "not proven" in decision["note"]
+    assert any("not proven" in warning for warning in seeded["warnings"])
+
+    # The evidence says what was observed versus what was only assumed.
+    assert payload["evidence"]["confidence"] == "low"
+    assert payload["evidence"]["extra"]["observed_branches"] == 1
+    assert payload["evidence"]["extra"]["seeded_branches"] == 1
+    assert any(
+        "no constraint was solved" in assumption
+        for assumption in payload["evidence"]["extra"]["assumptions"]
+    )
+
+
+def test_symbolic_rejects_bad_addresses_and_zero_budgets(straight_elf_path: Path) -> None:
+    with pytest.raises(AnalysisError, match="address must be non-negative"):
+        tools.symbolic(str(straight_elf_path), -1)
+    with pytest.raises(AnalysisError, match="not mapped by any section"):
+        tools.symbolic(str(straight_elf_path), 0x700000)
+    with pytest.raises(AnalysisError, match="max_paths must be between 1 and"):
+        tools.symbolic(str(straight_elf_path), TEXT_ADDRESS, max_paths=0)
+    with pytest.raises(AnalysisError, match="max_steps must be between 1 and"):
+        tools.symbolic(str(straight_elf_path), TEXT_ADDRESS, max_steps=0)
+
+
+def test_dataflow_recovers_definitions_and_constants(const_elf_path: Path) -> None:
+    payload = tools.dataflow(str(const_elf_path), TEXT_ADDRESS)
+
+    assert payload["address"] == "0x401000"
+    assert payload["definitions"] == [
+        {
+            "address": "0x401000",
+            "register": "rax",
+            "kind": "const",
+            "value": 5,
+            "source_register": None,
+        }
+    ]
+    assert payload["constant_registers"] == {"rax": 5}
+    assert payload["reaching_definition"] == {}
+    assert payload["warnings"] == []
+    assert payload["evidence"]["source"] == "dataflow.def_use"
+    assert payload["evidence"]["method"] == "forward_propagation"
+    assert payload["evidence"]["confidence"] == "medium"
+    # Every other tool returns JSON-safe values; so must this one.
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_dataflow_rejects_bad_addresses_and_zero_budgets(const_elf_path: Path) -> None:
+    with pytest.raises(AnalysisError, match="address must be non-negative"):
+        tools.dataflow(str(const_elf_path), -1)
+    with pytest.raises(AnalysisError, match="not inside an executable section"):
+        tools.dataflow(str(const_elf_path), 0x700000)
+    with pytest.raises(AnalysisError, match="max_instructions must be between 1 and"):
+        tools.dataflow(str(const_elf_path), TEXT_ADDRESS, max_instructions=0)
+    with pytest.raises(AnalysisError, match="max_blocks must be between 1 and"):
+        tools.dataflow(str(const_elf_path), TEXT_ADDRESS, max_blocks=0)
 
 
 
