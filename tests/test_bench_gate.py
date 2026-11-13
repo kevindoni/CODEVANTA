@@ -1,19 +1,24 @@
 """Tests for ``scripts/bench_gate.py``, the micro-benchmark regression gate.
 
 The gate is exercised the way CI runs it -- through a subprocess -- so the tests
-cover the parts that unit-testing the functions cannot: exit status, the shape of
-the committed baseline file, stdout/stderr separation, and the promise that
+cover the parts that unit-testing the functions cannot: exit status, the shape
+of the committed baseline file, stdout/stderr separation, and the promise that
 nothing but the baseline is ever written. Every run uses a single sample with a
 tiny work budget and ``--repeat 1`` so the module finishes in a few seconds; the
-handful of pure functions are tested in-process at the end.
+handful of pure functions are tested in-process at the end, including the
+platform resolution rule and the per-platform baseline selection (``--platform``
+beats ``$RUNNER_OS`` beats ``os.name``; an explicit ``--baseline`` beats all).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -52,6 +57,7 @@ SINGLE_INPUT_BENCHMARKS = (
 REPORT_KEYS = {
     "tool",
     "unit",
+    "platform",
     "tolerance",
     "repeat",
     "limits",
@@ -90,12 +96,17 @@ def test_loose_tolerance_passes(tmp_path: Path) -> None:
     baseline = tmp_path / "baseline.json"
     record_baseline(baseline)
 
-    result = run_gate(*TINY_ARGS, "--baseline", str(baseline), "--tolerance", "5")
+    result = run_gate(
+        *TINY_ARGS, "--baseline", str(baseline), "--tolerance", "5", "--platform", "linux"
+    )
 
     assert result.returncode == 0, result.stderr
     table = result.stdout.splitlines()
     assert table[0].split() == ["benchmark", "baseline_ms", "current_ms", "delta%", "status"]
     assert "regressed" not in result.stdout
+    # The run line and the verdict line both name the platform.
+    assert "bench_gate: platform linux" in result.stderr
+    assert "(platform linux)" in result.stderr
     # Every benchmark of a single input is a row of the table.
     for benchmark in SINGLE_INPUT_BENCHMARKS:
         assert f"{benchmark} ({ELF_LABEL})" in result.stdout
@@ -134,9 +145,13 @@ def test_update_baseline_writes_sorted_json(tmp_path: Path) -> None:
     """``--update-baseline`` writes the only file it may write, deterministically."""
     baseline = tmp_path / "baseline.json"
 
-    result = run_gate(*TINY_ARGS, "--baseline", str(baseline), "--update-baseline")
+    result = run_gate(
+        *TINY_ARGS, "--baseline", str(baseline), "--platform", "linux", "--update-baseline"
+    )
 
     assert result.returncode == 0, result.stderr
+    # --baseline wins over the platform default: linux is only reported.
+    assert "(platform linux)" in result.stdout
     assert [path.name for path in tmp_path.iterdir()] == ["baseline.json"]
     raw = baseline.read_bytes()
     assert b"\r\n" not in raw  # LF everywhere, so a Windows checkout shows no diff
@@ -167,12 +182,36 @@ def test_missing_baseline_exits_two(tmp_path: Path) -> None:
     assert not baseline.exists()
 
 
+def test_missing_platform_baseline_exits_two() -> None:
+    """Without ``--baseline`` the gate wants the platform's file; absent means exit 2.
+
+    No ``bench/baseline.macos.json`` is committed, so ``--platform macos`` must
+    fail before any measurement happens -- which also keeps this test fast.
+    """
+    result = run_gate(*TINY_ARGS, "--platform", "macos")
+
+    assert result.returncode == 2
+    assert "bench_gate: platform macos" in result.stderr
+    assert "no baseline" in result.stderr
+    assert "baseline.macos.json" in result.stderr
+    assert result.stdout == ""
+
+
 def test_json_report_parses(tmp_path: Path) -> None:
     """``--json`` puts one parseable document on stdout and nothing else."""
     baseline = tmp_path / "baseline.json"
     record_baseline(baseline)
 
-    result = run_gate(*TINY_ARGS, "--baseline", str(baseline), "--tolerance", "5", "--json")
+    result = run_gate(
+        *TINY_ARGS,
+        "--baseline",
+        str(baseline),
+        "--tolerance",
+        "5",
+        "--platform",
+        "linux",
+        "--json",
+    )
 
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)  # stdout is exactly one JSON document
@@ -180,6 +219,7 @@ def test_json_report_parses(tmp_path: Path) -> None:
     assert report["passed"] is True
     assert report["failures"] == []
     assert report["unit"] == "ms"
+    assert report["platform"] == "linux"
     assert report["tolerance"] == 5.0
     assert report["samples"] == [ELF_LABEL]
     assert len(report["results"]) == len(SINGLE_INPUT_BENCHMARKS)
@@ -252,3 +292,71 @@ def test_merge_best_keeps_the_faster_pass() -> None:
     fast = [make_row(1.0)]
     assert [row.best_ms for row in bench_gate.merge_best(slow, fast)] == [1.0]
     assert [row.best_ms for row in bench_gate.merge_best(fast, slow)] == [1.0]
+
+
+def test_platform_resolution_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--platform`` wins, then ``$RUNNER_OS``, then ``os.name``; darwin is macos."""
+    monkeypatch.delenv("RUNNER_OS", raising=False)
+
+    # An explicit label wins over everything, even a contradicting os.name.
+    monkeypatch.setattr(os, "name", "nt")
+    assert bench_gate.resolve_platform("macos") == "macos"
+
+    # nt is windows.
+    assert bench_gate.resolve_platform(None) == "windows"
+
+    # $RUNNER_OS beats os.name: CI is where the two could disagree, and a macos
+    # runner cannot be told from a linux one by os.name alone.
+    monkeypatch.setenv("RUNNER_OS", "Linux")
+    assert bench_gate.resolve_platform(None) == "linux"
+
+    monkeypatch.delenv("RUNNER_OS")
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert bench_gate.resolve_platform(None) == "linux"
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert bench_gate.resolve_platform(None) == "macos"
+
+    # Nothing recognisable falls through to the unknown label.
+    monkeypatch.setattr(os, "name", "java")
+    assert bench_gate.resolve_platform(None) == "unknown"
+
+
+def test_baseline_selection_by_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The platform picks ``bench/baseline.<label>.json``; ``--baseline`` wins."""
+    monkeypatch.delenv("RUNNER_OS", raising=False)
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert bench_gate.resolve_platform(None) == "linux"
+
+    expected = REPO_ROOT / "bench" / "baseline.linux.json"
+    assert bench_gate.default_baseline_path("linux") == expected
+    assert bench_gate.select_baseline_path("linux", None) == expected
+    # ...and an explicit --baseline beats the platform default.
+    assert (
+        bench_gate.select_baseline_path("linux", "bench/other.json")
+        == REPO_ROOT / "bench" / "other.json"
+    )
+
+
+def test_update_baseline_writes_the_platform_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--update-baseline`` writes the resolved platform's file, and only that file."""
+    monkeypatch.setattr(bench_gate, "REPO_ROOT", tmp_path)
+
+    argv = [
+        *TINY_ARGS,
+        "--platform",
+        "linux",
+        "--update-baseline",
+    ]
+    assert bench_gate.main(argv) == 0
+
+    bench_dir = tmp_path / "bench"
+    assert [path.name for path in bench_dir.iterdir()] == ["baseline.linux.json"]
+    document = json.loads((bench_dir / "baseline.linux.json").read_text(encoding="utf-8"))
+    assert document["format"] == "codevanta-bench-gate"
+    assert "(platform linux)" in capsys.readouterr().out

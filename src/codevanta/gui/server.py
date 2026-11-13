@@ -19,6 +19,8 @@ reimplemented here:
 * ``/api/callgraph`` -- :func:`codevanta.analysis.callgraph.build_call_graph`
 * ``/api/diff`` -- :func:`codevanta.analysis.binary_diff.diff_binaries`
 * ``/api/decompile`` -- :func:`codevanta.analysis.decompilers.decompile_function`
+* ``/api/emulate`` -- :func:`codevanta.analysis.emulate.emulate_function`
+* ``/api/symbolic`` -- :func:`codevanta.analysis.symbolic.explore_paths`
 * ``/api/session_save`` -- :meth:`codevanta.storage.session.SessionStore.save`
 * ``/api/session_list`` -- :meth:`codevanta.storage.session.SessionStore.list`
 
@@ -98,6 +100,32 @@ from codevanta.analysis.decompile import (
 from codevanta.analysis.decompilers import BackendResult, supported_backends
 from codevanta.analysis.decompilers import (
     decompile_function as decompile_with_backend,
+)
+from codevanta.analysis.emulate import (
+    DEFAULT_MAX_INSTRUCTIONS as DEFAULT_EMULATE_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.emulate import (
+    EMULATOR_AVAILABLE,
+    emulate_function,
+    emulator_status,
+)
+from codevanta.analysis.emulate import (
+    MAX_MAX_INSTRUCTIONS as MAX_EMULATE_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.symbolic import (
+    DEFAULT_MAX_PATHS as DEFAULT_SYMBOLIC_MAX_PATHS,
+)
+from codevanta.analysis.symbolic import (
+    DEFAULT_MAX_STEPS as DEFAULT_SYMBOLIC_MAX_STEPS,
+)
+from codevanta.analysis.symbolic import (
+    MAX_MAX_PATHS as MAX_SYMBOLIC_MAX_PATHS,
+)
+from codevanta.analysis.symbolic import (
+    MAX_MAX_STEPS as MAX_SYMBOLIC_MAX_STEPS,
+)
+from codevanta.analysis.symbolic import (
+    explore_paths,
 )
 from codevanta.analysis.type_recovery import (
     DEFAULT_MAX_FIELDS,
@@ -743,6 +771,90 @@ def _api_decompile(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
     return payload
 
 
+def _query_registers(params: dict[str, str], name: str) -> dict[str, int] | None:
+    """Parse repeatable ``set=REG=VAL`` pairs into an initial-register map.
+
+    ``set`` may be repeated (``set=eax=1&set=ebx=2``) -- :func:`_parse_query`
+    hands repeated occurrences over joined with a comma -- or carry
+    comma-separated pairs in one value. Values are decimal or ``0x``-hex
+    integers; register names and widths are validated by the engine itself, so
+    an unknown name surfaces as the engine's error, not a parser guess.
+    """
+    raw = _first(params, name)
+    if raw is None:
+        return None
+    seeds: dict[str, int] = {}
+    for pair in raw.split(","):
+        text = pair.strip()
+        reg, sep, value = text.partition("=")
+        reg = reg.strip().lower()
+        value = value.strip()
+        if not sep or not reg or not value:
+            raise _RouteError(
+                f"{name} must be REG=VAL pairs (e.g. set=eax=0x2a), got {text!r}"
+            )
+        try:
+            seeds[reg] = int(value, 16) if value.lower().startswith("0x") else int(value, 10)
+        except ValueError:
+            raise _RouteError(
+                f"{name} value must be a hexadecimal (0x...) or decimal integer, "
+                f"got {value!r}"
+            ) from None
+    return seeds
+
+
+def _api_emulate(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Emulate one function on the sandboxed CPU and return the run trace."""
+    if not EMULATOR_AVAILABLE:
+        raise _RouteError(emulator_status())
+    path = _query_path(params, "path", allow_paths)
+    address = _query_address(params, "address")
+    max_instructions = _query_int(
+        params,
+        "max_instructions",
+        DEFAULT_EMULATE_MAX_INSTRUCTIONS,
+        1,
+        MAX_EMULATE_MAX_INSTRUCTIONS,
+    )
+    seeds = _query_registers(params, "set")
+    info = _load(path)
+    start = address if address is not None else info.entry_point
+    if start is None:
+        raise _RouteError("address is required: the binary has no entry point")
+    result = emulate_function(
+        path,
+        info,
+        start,
+        initial_registers=seeds,
+        max_instructions=max_instructions,
+    )
+    payload = result.to_dict()
+    payload["path"] = str(info.path)
+    payload["address"] = f"0x{start:x}"
+    return payload
+
+
+def _api_symbolic(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Explore the execution paths through one function, both limits honoured."""
+    path = _query_path(params, "path", allow_paths)
+    address = _query_address(params, "address")
+    max_paths = _query_int(
+        params, "max_paths", DEFAULT_SYMBOLIC_MAX_PATHS, 1, MAX_SYMBOLIC_MAX_PATHS
+    )
+    max_steps = _query_int(
+        params, "max_steps", DEFAULT_SYMBOLIC_MAX_STEPS, 1, MAX_SYMBOLIC_MAX_STEPS
+    )
+    info = _load(path)
+    start = address if address is not None else info.entry_point
+    if start is None:
+        raise _RouteError("address is required: the binary has no entry point")
+    exploration = explore_paths(path, info, start, max_paths=max_paths, max_steps=max_steps)
+    payload = exploration.to_dict()
+    payload["path"] = str(info.path)
+    payload["address"] = f"0x{start:x}"
+    return payload
+
+
 def _session_item(record: SessionRecord) -> dict[str, Any]:
     """Project a stored session onto the fields the listing exposes.
 
@@ -826,6 +938,8 @@ ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
     "/api/callgraph": _api_callgraph,
     "/api/diff": _api_diff,
     "/api/decompile": _api_decompile,
+    "/api/emulate": _api_emulate,
+    "/api/symbolic": _api_symbolic,
     "/api/session_save": _api_session_save,
     "/api/session_list": _api_session_list,
 }
@@ -914,9 +1028,15 @@ def _encode_payload(payload: dict[str, Any]) -> bytes:
 
 
 def _parse_query(query: str) -> dict[str, str]:
-    """Flatten a query string into ``{name: first value}``."""
+    """Flatten a query string into ``{name: value}``.
+
+    A repeated parameter (``set=eax=1&set=ebx=2``) arrives as one comma-joined
+    value, so the repeatable ``set=REG=VAL`` form of ``/api/emulate`` survives
+    the flattening. Routes that accept a parameter only once reject the joined
+    value as malformed input instead of silently picking the first occurrence.
+    """
     parsed = parse_qs(query, keep_blank_values=True)
-    return {key: values[0] if values else "" for key, values in parsed.items()}
+    return {key: ",".join(values) if values else "" for key, values in parsed.items()}
 
 
 class _GuiRequestHandler(BaseHTTPRequestHandler):

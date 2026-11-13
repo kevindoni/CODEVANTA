@@ -21,6 +21,8 @@ from urllib.parse import quote
 import pytest
 
 from codevanta.analysis.decompilers import available_backends
+from codevanta.analysis.emulate import MAX_MAX_INSTRUCTIONS
+from codevanta.analysis.symbolic import MAX_MAX_PATHS
 from codevanta.gui import (
     ROUTES,
     VERSION,
@@ -48,6 +50,12 @@ MOV_ECX_RDI_20 = bytes.fromhex("8b4f20")
 
 #: ``ret``
 RET = bytes.fromhex("c3")
+
+#: ``mov eax, 42`` (B8 imm32) -- the straight-line body both new routes run.
+MOV_EAX_42 = bytes.fromhex("b82a000000")
+
+#: Straight-line ``mov eax, 42; ret``: returns 42 along a single path.
+RETURN_42 = MOV_EAX_42 + RET
 
 #: Three distinct struct offsets: 0x10, 0x18 and 0x20.
 THREE_FIELDS = MOV_RAX_RDI_10 + MOV_RDI_18_RBX + MOV_ECX_RDI_20 + RET
@@ -116,6 +124,12 @@ def _start(server: ThreadingHTTPServer) -> threading.Thread:
 def sample_binary(tmp_path: Path) -> Path:
     """A tiny ELF64 with a three-offset struct access pattern at ``.text``."""
     return _make_elf64(tmp_path / "sample.bin", THREE_FIELDS)
+
+
+@pytest.fixture()
+def return_binary(tmp_path: Path) -> Path:
+    """A tiny ELF64 whose ``.text`` is the straight-line ``mov eax, 42; ret``."""
+    return _make_elf64(tmp_path / "return42.bin", RETURN_42)
 
 
 @pytest.fixture()
@@ -196,6 +210,8 @@ def test_dashboard_page_contains_form_controls_and_no_external_url() -> None:
         "struct",
         "callgraph",
         "decompile",
+        "emulate",
+        "symbolic",
     ):
         assert f'data-action="{action}"' in page
     assert 'data-action="diff"' in page
@@ -730,6 +746,225 @@ def test_response_cap_shrinks_a_decompiled_text_field() -> None:
     assert payload["text"] == f"<cut: {len(oversized)} chars>"
     assert payload["address"] == "0x401000"
 
+
+
+# ---------------------------------------------------------------------------
+# /api/emulate and /api/symbolic
+# ---------------------------------------------------------------------------
+
+
+def test_emulate_returns_the_function_return_value(
+    gui_server: ThreadingHTTPServer, return_binary: Path
+) -> None:
+    status, payload = _get(
+        gui_server,
+        f"/api/emulate?path={return_binary.as_posix()}&address=0x401000"
+        "&max_instructions=100",
+    )
+
+    assert status == 200
+    assert payload["stopped_reason"] == "return"
+    # mov eax, 42; ret -> the run returns 0x2a after completing both steps.
+    assert payload["return_value"] == "0x2a"
+    assert payload["instructions"] >= 1
+    assert Path(payload["path"]) == return_binary
+    assert payload["address"] == "0x401000"
+
+
+def test_emulate_seeds_registers_from_repeatable_set_parameters(
+    gui_server: ThreadingHTTPServer, return_binary: Path
+) -> None:
+    # rbx is untouched by ``mov eax, 42; ret``, so a non-zero final value proves
+    # the seed reached the emulator. The second ``set`` parameter is the
+    # repeatable case: both occurrences must arrive, not just the first.
+    status, payload = _get(
+        gui_server,
+        f"/api/emulate?path={return_binary.as_posix()}&address=0x401000"
+        "&set=eax=0&set=rbx=2",
+    )
+
+    assert status == 200
+    assert payload["stopped_reason"] == "return"
+    assert payload["registers"]["rbx"] == "0x2"
+
+
+def test_emulate_refuses_when_the_emulator_is_unavailable(
+    gui_server: ThreadingHTTPServer,
+    return_binary: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gui_server_module, "EMULATOR_AVAILABLE", False)
+    monkeypatch.setattr(
+        gui_server_module, "emulator_status", lambda: "unicorn is missing"
+    )
+
+    status, payload = _get(
+        gui_server,
+        f"/api/emulate?path={return_binary.as_posix()}&address=0x401000",
+    )
+
+    assert status == 400
+    assert payload["error"] == "unicorn is missing"
+
+
+def test_emulate_rejects_bad_parameters(
+    gui_server: ThreadingHTTPServer, return_binary: Path
+) -> None:
+    path = return_binary.as_posix()
+
+    status_missing, payload_missing = _get(gui_server, "/api/emulate?address=0x401000")
+    assert status_missing == 400
+    assert payload_missing["error"] == "path is required"
+
+    status_text, payload_text = _get(
+        gui_server, f"/api/emulate?path={path}&address=0x401000&max_instructions=abc"
+    )
+    assert status_text == 400
+    assert "max_instructions" in payload_text["error"]
+
+    status_range, _ = _get(
+        gui_server,
+        f"/api/emulate?path={path}&address=0x401000"
+        f"&max_instructions={MAX_MAX_INSTRUCTIONS + 1}",
+    )
+    assert status_range == 400
+
+    status_set, payload_set = _get(
+        gui_server, f"/api/emulate?path={path}&address=0x401000&set=eax"
+    )
+    assert status_set == 400
+    assert "set" in payload_set["error"]
+
+
+def test_symbolic_returns_at_least_one_path_on_a_straight_line(
+    gui_server: ThreadingHTTPServer, return_binary: Path
+) -> None:
+    status, payload = _get(
+        gui_server,
+        f"/api/symbolic?path={return_binary.as_posix()}&address=0x401000"
+        "&max_paths=8&max_steps=200",
+    )
+
+    assert status == 200
+    assert payload["explorer"] == "unicorn"
+    assert payload["paths"] >= 1
+    assert len(payload["entries"]) == payload["paths"]
+    assert payload["entries"][0]["stopped_reason"] == "return"
+    assert payload["entries"][0]["return_value"] == "0x2a"
+    assert payload["return_values"] == ["0x2a"]
+    assert Path(payload["path"]) == return_binary
+
+
+def test_symbolic_rejects_bad_parameters(
+    gui_server: ThreadingHTTPServer, return_binary: Path
+) -> None:
+    path = return_binary.as_posix()
+
+    status_zero, payload_zero = _get(
+        gui_server, f"/api/symbolic?path={path}&address=0x401000&max_paths=0"
+    )
+    assert status_zero == 400
+    assert "max_paths" in payload_zero["error"]
+
+    status_range, _ = _get(
+        gui_server,
+        f"/api/symbolic?path={path}&address=0x401000&max_paths={MAX_MAX_PATHS + 1}",
+    )
+    assert status_range == 400
+
+    status_text, payload_text = _get(
+        gui_server, f"/api/symbolic?path={path}&address=0x401000&max_steps=nope"
+    )
+    assert status_text == 400
+    assert "max_steps" in payload_text["error"]
+
+
+def test_foreign_host_is_rejected_before_the_new_routes_run(
+    gui_server: ThreadingHTTPServer, return_binary: Path
+) -> None:
+    path = return_binary.as_posix()
+    for route in (
+        f"/api/emulate?path={path}&address=0x401000",
+        f"/api/symbolic?path={path}&address=0x401000",
+    ):
+        status, headers, body = _raw_get(gui_server, route, "attacker.example:8080")
+
+        assert status == 421, route
+        assert headers["X-Frame-Options"] == "DENY"
+        text = body.decode("utf-8")
+        assert json.loads(text)["error"].startswith("refusing Host")
+        # The 421 is answered before any route runs: no analysis payload leaks.
+        assert "stopped_reason" not in text
+
+
+def test_new_route_replies_carry_the_security_headers(
+    gui_server: ThreadingHTTPServer, return_binary: Path
+) -> None:
+    port = gui_server.server_address[1]
+    path = return_binary.as_posix()
+    for route in (
+        f"/api/emulate?path={path}&address=0x401000",
+        f"/api/symbolic?path={path}&address=0x401000",
+    ):
+        status, headers, body = _raw_get(gui_server, route, f"127.0.0.1:{port}")
+
+        assert status == 200, route
+        assert headers["Content-Type"].startswith("application/json")
+        assert headers["X-Frame-Options"] == "DENY"
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert "connect-src 'self'" in headers["Content-Security-Policy"]
+
+
+def test_emulate_body_counts_toward_the_response_cap(
+    gui_server: ThreadingHTTPServer,
+    return_binary: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The natural payload is comfortably above this cap, so hitting the limit
+    # proves the new route goes through the same bounded renderer as the rest.
+    cap = 400
+    monkeypatch.setattr(gui_server_module, "MAX_RESPONSE_BYTES", cap)
+    port = gui_server.server_address[1]
+
+    status, headers, body = _raw_get(
+        gui_server,
+        f"/api/emulate?path={return_binary.as_posix()}&address=0x401000",
+        f"127.0.0.1:{port}",
+    )
+
+    assert status == 200
+    assert len(body) <= cap
+    assert int(headers["Content-Length"]) == len(body)
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["response_truncated"] is True
+
+
+def test_dashboard_page_has_emulate_and_symbolic_controls() -> None:
+    page = render_dashboard_html()
+
+    for element_id in (
+        "emu-address",
+        "emu-max",
+        "sym-address",
+        "sym-max-paths",
+        "sym-max-steps",
+    ):
+        assert f'id="{element_id}"' in page
+    assert (
+        '<button type="button" id="emu-run" data-action="emulate">'
+        "Emulate function</button>" in page
+    )
+    assert (
+        '<button type="button" id="sym-run" data-action="symbolic">'
+        "Explore paths</button>" in page
+    )
+    # Both controls talk to the same-origin emulation routes only.
+    assert 'emulate: "/api/emulate"' in page
+    assert 'symbolic: "/api/symbolic"' in page
+    assert 'addParam(parts, "max_instructions", fieldValue("emu-max"))' in page
+    assert 'addParam(parts, "max_paths", fieldValue("sym-max-paths"))' in page
+    assert 'addParam(parts, "max_steps", fieldValue("sym-max-steps"))' in page
+    assert "innerHTML" not in page
 
 
 # ---------------------------------------------------------------------------

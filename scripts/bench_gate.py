@@ -6,10 +6,11 @@
 benchmarks -- by importing bench.py's measurement helpers, never by copying them
 -- and compares every ``best_ms`` against a committed baseline::
 
-    python scripts/bench_gate.py                        # gate against the baseline
+    python scripts/bench_gate.py                        # gate against the platform baseline
     python scripts/bench_gate.py --repeat 1             # cheaper, noisier
     python scripts/bench_gate.py --json                 # machine-readable verdict
     python scripts/bench_gate.py --update-baseline      # accept the new numbers
+    python scripts/bench_gate.py --platform linux       # pick a platform explicitly
 
 Tolerance
 ---------
@@ -46,13 +47,32 @@ Why a committed baseline is machine-dependent
 ``best_ms`` is wall-clock time on the machine that recorded it. A different CPU,
 a different Python patch release, a container sharing a core, or a loaded CI
 runner can all shift the absolute numbers -- the *shape* of the benchmarks stays
-comparable, the milliseconds do not. ``bench/baseline.json`` therefore holds the
+comparable, the milliseconds do not. The committed baseline therefore holds the
 numbers of one reference machine and ``--tolerance`` is what absorbs the
 difference between that machine and yours. Re-record the baseline where CI runs
 rather than on a laptop on battery, and treat a *consistent* 2x shift as "the
 baseline is stale" (re-record it deliberately) rather than as a per-PR failure.
 The sub-millisecond rows (``discover_functions``) are timer noise as much as
 work, so read their delta as suggestive, not as a verdict.
+
+Platforms
+---------
+Windows and Linux do not agree on milliseconds any better than two laptops do,
+so the reference numbers are kept *per platform*: ``bench/baseline.<label>.json``.
+The label is resolved once per run, in this order:
+
+1. an explicit ``--platform LABEL`` (one of windows/linux/macos/unknown),
+2. ``$RUNNER_OS`` on CI, case-insensitive (``Windows``/``Linux``/``macOS``),
+3. ``os.name``: ``nt`` is windows; ``posix`` is macos when ``sys.platform`` is
+   ``darwin`` and linux otherwise; anything else is unknown.
+
+Every run line names the platform, and the ``--json`` report carries it as the
+``platform`` key, so a red build can be traced to the file that judged it.
+``--update-baseline`` writes the resolved platform's file only -- record the
+linux numbers on a linux runner with ``python scripts/bench_gate.py
+--update-baseline``, not by hand-editing ``bench/baseline.linux.json``, which
+currently holds Windows-timed numbers and is consulted only by the
+informational CI benchmark job.
 
 Exit status
 -----------
@@ -73,6 +93,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -97,11 +118,19 @@ import bench  # noqa: E402  (reused on purpose, see the module docstring)
 #: Inputs compared when ``--samples`` is absent, as repository-relative paths.
 DEFAULT_SAMPLE_PATHS: tuple[str, ...] = ("samples/pe64_text.bin", "samples/elf64_text.bin")
 
-#: Where the committed reference numbers live, repository-relative.
-DEFAULT_BASELINE = "bench/baseline.json"
+#: Directory holding the committed reference numbers, repository-relative. One
+#: file per platform: ``baseline.<label>.json`` -- see the "Platforms" section.
+BASELINE_DIR = "bench"
 
 #: Relative slack: 0.5 means "up to 50% slower than the baseline still passes".
 DEFAULT_TOLERANCE = 0.5
+
+#: Every platform label ``--platform`` accepts, including the fallback.
+PLATFORMS: tuple[str, ...] = ("windows", "linux", "macos", "unknown")
+
+#: GitHub Actions' ``$RUNNER_OS`` values, lower-cased, that map onto a label.
+#: Anything else leaves the decision to ``os.name``.
+RUNNER_OS_ALIASES = {"windows": "windows", "linux": "linux", "macos": "macos"}
 
 BASELINE_FORMAT = "codevanta-bench-gate"
 BASELINE_VERSION = 1
@@ -136,6 +165,44 @@ def resolve(path_text: str) -> Path:
 def display(path: Path) -> str:
     """Render ``path`` relative to the repository when it lives inside it."""
     return bench.label_for(path)
+
+
+def resolve_platform(explicit: str | None) -> str:
+    """Return the platform label this run is measured on.
+
+    The rule, in order: an explicit ``--platform`` wins; then ``$RUNNER_OS``
+    (GitHub Actions, case-insensitive); then ``os.name`` -- ``nt`` is windows,
+    ``posix`` is macos when ``sys.platform`` is ``darwin`` and linux otherwise;
+    anything else is ``unknown``. CI needs the ``$RUNNER_OS`` step because a
+    macos runner and a linux runner share ``os.name == "posix"`` and only the
+    environment can tell them apart.
+    """
+    if explicit:
+        return explicit
+    runner_os = os.environ.get("RUNNER_OS")
+    if runner_os:
+        label = RUNNER_OS_ALIASES.get(runner_os.strip().lower())
+        if label is not None:
+            return label
+    if os.name == "nt":
+        return "windows"
+    if os.name == "posix":
+        return "macos" if sys.platform == "darwin" else "linux"
+    return "unknown"
+
+
+def default_baseline_path(platform: str) -> Path:
+    """Return the committed baseline document for ``platform``."""
+    return REPO_ROOT / BASELINE_DIR / f"baseline.{platform}.json"
+
+
+def select_baseline_path(platform: str, baseline: str | None) -> Path:
+    """Return the baseline to use: ``--baseline`` when given, else the platform's.
+
+    ``--baseline`` keeps its old meaning -- one named file, wherever it lives --
+    so scripts that already pass a path are unaffected by the split.
+    """
+    return resolve(baseline) if baseline else default_baseline_path(platform)
 
 
 def row_key(row: bench.Row) -> str:
@@ -414,6 +481,7 @@ def build_report(
     max_instructions: int,
     samples: Sequence[Path],
     baseline_path: Path,
+    platform: str,
     warnings: Sequence[str],
 ) -> dict[str, Any]:
     """Assemble the ``--json`` document."""
@@ -421,6 +489,7 @@ def build_report(
     return {
         "tool": BASELINE_FORMAT,
         "unit": "ms",
+        "platform": platform,
         "tolerance": tolerance,
         "repeat": repeat,
         "limits": {
@@ -442,14 +511,18 @@ def announce(warnings: Sequence[str]) -> None:
         print(f"bench_gate: warning: {warning}", file=sys.stderr)
 
 
-def summarise(verdicts: Sequence[Verdict], tolerance: float) -> str:
+def summarise(verdicts: Sequence[Verdict], tolerance: float, platform: str) -> str:
     """Return the one-line pass/fail summary meant for stderr."""
     failed = [verdict for verdict in verdicts if verdict.failed]
     if not failed:
-        return f"bench_gate: PASS {len(verdicts)}/{len(verdicts)} within {tolerance:.0%} tolerance"
+        return (
+            f"bench_gate: PASS {len(verdicts)}/{len(verdicts)} within {tolerance:.0%} tolerance "
+            f"(platform {platform})"
+        )
     names = ", ".join(verdict.key for verdict in failed)
     return (
-        f"bench_gate: FAIL {len(failed)}/{len(verdicts)} beyond {tolerance:.0%} tolerance: {names}"
+        f"bench_gate: FAIL {len(failed)}/{len(verdicts)} beyond {tolerance:.0%} tolerance: "
+        f"{names} (platform {platform})"
     )
 
 
@@ -480,6 +553,14 @@ def tolerance_value(text: str) -> float:
             f"tolerance must not be negative, got {value} (0.5 means 50% slower still passes)"
         )
     return value
+
+
+def platform_label(text: str) -> str:
+    """argparse type: one of the known platform labels, case-insensitive."""
+    label = text.strip().lower()
+    if label not in PLATFORMS:
+        raise argparse.ArgumentTypeError(f"expected one of {', '.join(PLATFORMS)}, got {text!r}")
+    return label
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -513,10 +594,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--platform",
+        type=platform_label,
+        default=None,
+        metavar="LABEL",
+        help=(
+            "which committed baseline to gate against; resolved from $RUNNER_OS, then "
+            f"os.name when absent (one of {', '.join(PLATFORMS)})"
+        ),
+    )
+    parser.add_argument(
         "--baseline",
-        default=DEFAULT_BASELINE,
+        default=None,
         metavar="PATH",
-        help=f"baseline document to compare against (default: {DEFAULT_BASELINE})",
+        help=(
+            "baseline document to compare against, overriding the per-platform default "
+            "(default: bench/baseline.<platform>.json)"
+        ),
     )
     parser.add_argument(
         "--tolerance",
@@ -564,16 +658,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the gate; return the process exit status."""
     args = build_parser().parse_args(argv)
-    baseline_path = resolve(args.baseline)
+    platform = resolve_platform(args.platform)
+    baseline_path = select_baseline_path(platform, args.baseline)
     samples = [resolve(item) for item in args.samples]
+
+    # Name the platform first: every verdict after this line was judged by the
+    # per-platform file it points at.
+    print(
+        f"bench_gate: platform {platform}, baseline {display(baseline_path)}",
+        file=sys.stderr,
+    )
 
     # Check the reference first: there is no point measuring against nothing.
     reference: Baseline | None = None
     if not args.update_baseline:
         if not baseline_path.is_file():
             print(
-                f"bench_gate: no baseline at {display(baseline_path)}; "
-                "record one with --update-baseline",
+                f"bench_gate: no baseline at {display(baseline_path)} for platform "
+                f"{platform}; record one with --update-baseline",
                 file=sys.stderr,
             )
             return EXIT_UNEVALUABLE
@@ -621,7 +723,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.json:
             print(render_document(payload), end="")
         else:
-            print(f"bench_gate: wrote {len(measurements)} measurements to {display(baseline_path)}")
+            print(
+                f"bench_gate: wrote {len(measurements)} measurements to "
+                f"{display(baseline_path)} (platform {platform})"
+            )
         return EXIT_OK
 
     assert reference is not None  # set above: the --update-baseline branch returned
@@ -658,12 +763,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_instructions=args.max_instructions,
             samples=samples,
             baseline_path=baseline_path,
+            platform=platform,
             warnings=warnings,
         )
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(render_table(verdicts))
-    print(summarise(verdicts, args.tolerance), file=sys.stderr)
+    print(summarise(verdicts, args.tolerance, platform), file=sys.stderr)
     return EXIT_REGRESSION if any(verdict.failed for verdict in verdicts) else EXIT_OK
 
 

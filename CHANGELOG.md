@@ -45,6 +45,95 @@ All notable changes to CODEVANTA are documented here. The format follows
   typed error. A real 952-byte `samples/hello.dex` (built with the Android
   SDK's `d8`) backs the test suite.
 
+- Phase 7 wiring (`feat/phase7-wiring`): the phase 6 engines are reachable
+  from every surface. New CLI commands `codevanta symbolic` (branch-decision
+  path exploration with `--set REG=VALUE` seeds and `--max-paths`/`--max-steps`
+  budgets), `codevanta dataflow` (def-use and provable constants of one
+  function), `codevanta evidence-bundle` (hash a binary plus `--entry
+  NAME=FILE` payloads into a tamper-evident bundle; refuses to overwrite the
+  subject) and `codevanta plugins list/run` (the live registry, and one plugin
+  run under the harness budget). MCP gains `codevanta_symbolic` and
+  `codevanta_dataflow` (the server now registers 22 tools) and the dashboard
+  gains `/api/symbolic` with its panel (14 routes; `build_server().list_tools()`
+  and `ROUTES` both verified). `scripts/report_bundle.py` ties a report and an
+  optional saved trace into one verified bundle; `bench/baseline.json` became
+  per-platform (`bench/baseline.windows.json`, `bench/baseline.linux.json`) so
+  the gate never compares timings across operating systems; saved traces
+  (`samples/gdb_trace.log`, `samples/frida_trace.jsonl`) let `codevanta trace`
+  be exercised offline, and `tests/test_cli_phase7.py`,
+  `test_trace_samples.py`, `test_symbolic_parity.py`, `test_report_bundle.py`
+  pin all of it.
+- CI hardening: a `fuzz-smoke` job runs the parser fuzzer (30 seeded iterations
+  over the committed samples) plus `tests/test_fuzz_parsers.py` on every PR; an
+  informational `benchmark` job reports drift against the committed baseline
+  with a wide tolerance and `continue-on-error` (timings are machine-dependent,
+  so it reports, it does not gate); a non-blocking `test-platform` job runs the
+  suite on windows-latest and macos-latest (py3.13) as platform signal while
+  parity stays proven by the Linux job.
+- Path exploration (`codevanta.analysis.symbolic` + `codevanta symbolic` + MCP
+  tool `codevanta_symbolic`): breadth-first replay of the branch decisions of
+  one function on a private unicorn CPU. The observed side of every branch is
+  the real emulation result; the other side is enqueued with its guarding flags
+  or loop counter rewritten (`seeded` — an assumption, never a solved
+  constraint, and each such branch says so with a per-path warning and drops
+  the summary to low confidence). No symbolic variables, no path predicate, no
+  SMT anywhere. Paths report decisions, taken targets, end registers, the
+  `rax`/`eax` value at a leaving `ret` (`None` otherwise), a stop reason
+  (`return`/`budget`/`blocked`/`unmapped`) and executed steps; `complete` is
+  true only when nothing was left unexplored and every reported path returned.
+  Optional angr bridge (`explore_with_angr`) reports the same shape when angr
+  is installed; x86/x86-64 only; missing unicorn, bad addresses and bad seeds
+  fail with typed errors before anything runs.
+- Dataflow (`codevanta.analysis.dataflow` + `codevanta dataflow` + MCP tool
+  `codevanta_dataflow`): one forward pass over the recursive CFG recovers
+  register definitions, uses, provable constants (`mov` immediates, copies,
+  `add`/`sub`/`xor` of known values, rip-relative loads) and reaching
+  definitions, with alias normalisation and call-clobber handling. Honest
+  limits stated in the result: the pass is a linearization (joins take the
+  highest-addressed predecessor), undefined reads become warnings, and nothing
+  is guessed.
+- Evidence bundles (`codevanta.analysis.evidence_bundle`): hash a subject
+  binary (streamed SHA-256) and any number of canonical-JSON payloads into one
+  frozen document; `verify_bundle` recomputes every digest and reports each
+  mismatch by name, catching edited payloads, edited digests, and
+  added/removed/renamed entries. Bounded (256 entries, 16 MiB per payload),
+  deterministic byte-for-byte across builds, with `build`/`verify`/`read`/
+  `write`/`dumps` helpers and the digest recipe documented for non-Python
+  verifiers.
+- Plugin SDK (`codevanta.plugins`): a structural protocol (name, version,
+  description, `analyze(context) -> mapping`) so an outside analyser never
+  needs to import CODEVANTA; entry-point discovery (`codevanta.analyzers`,
+  kinds analyzer/exporter/provider) that reads metadata without importing; a
+  process-local registry with `register`/`unregister`/`builtin_plugins`;
+  `build_context` (loaded binary, discovered candidates, entry-point focus,
+  read-only budget) and `run_plugin` under a wall-clock and canonical-JSON byte
+  budget. The built-in `MetricsAnalyzer` proves the path end to end, and
+  `codevanta plugins list/run` drive it from the CLI.
+- Trace and attach CLI (`codevanta trace`, `codevanta attach`): replay a saved
+  gdb/Frida session capture and map its hits onto function candidates
+  (`--provider auto` detects the format and states its choice; an unplaceable
+  capture exits 2 instead of guessing), and generate the provider script plus
+  the exact argv that runs it — without ever launching anything. MCP parity via
+  `codevanta_trace`, whose errors carry the real reason instead of a generic
+  tool failure.
+- GUI session persistence: `/api/session_save` (the dashboard's one writing
+  route — one row in the same SQLite store `codevanta session save` uses) and
+  `/api/session_list`, plus a Sessions panel; the counts a save records come
+  from the same engines the page displays.
+- Parser fuzz harness (`scripts/fuzz_parsers.py` +
+  `tests/test_fuzz_parsers.py`): seeded, replayable mutations (byteflip,
+  truncate, length-field, section-table, huge-counts, zero-sizes, splice) of
+  the committed samples and in-memory-packed ELFs, treating any undocumented
+  exception from the public API as a finding that names seed, iteration, file,
+  edit and mutant digest.
+- Benchmark regression gate (`scripts/bench_gate.py` +
+  `tests/test_bench_gate.py`): imports `scripts/bench.py`'s measurement helpers
+  and compares every `best_ms` against a committed best-of-15 baseline (50%
+  default tolerance, missing rows fail, `--repeat` can raise precision but
+  never drop below the baseline's, one confirming re-measure keeps the better
+  pass, `--update-baseline` accepts new numbers, `--platform` picks the
+  baseline).
+
 ### Changed
 
 - Dashboard usability pass (`codevanta gui`): the workflow is now guided
@@ -69,6 +158,15 @@ All notable changes to CODEVANTA are documented here. The format follows
   reserved for data; surfaces are layered (page, card, inset inputs) with a
   single teal accent. Still a fully self-contained page: no CDN, no fonts, no
   external URL, and results remain `textContent`-only.
+
+### Fixed
+
+- Trace attribution (`codevanta.analysis.trace`): a hit above the last known
+  function was attributed to it because an unknown candidate size was treated
+  as unbounded. Candidate extents now come from the symbol size or, failing
+  that, the enclosing executable section, and an address outside every
+  candidate is reported unattributed instead of guessed onto the nearest
+  symbol.
 
 ### Added
 

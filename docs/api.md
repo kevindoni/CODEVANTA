@@ -2,7 +2,7 @@
 
 Every public Python entry point, with the arguments and defaults read from the
 source at the time of writing (`v0.1.0`; the phase 3 sections were read on branch
-`feat/phase3-power`).
+`feat/phase3-power`, the phase 6 sections on branch `feat/phase7-wiring`).
 
 CODEVANTA does static analysis only: it parses file bytes and never executes a
 target on the host. (The phase-3 emulator in
@@ -31,6 +31,12 @@ before you rely on it.
 - [`codevanta.analysis.decompile`: pseudo-C rendering](#codevantaanalysisdecompile-pseudo-c-rendering)
 - [`codevanta.analysis.decompilers`: decompiler providers](#codevantaanalysisdecompilers-decompiler-providers)
 - [`codevanta.analysis.emulate`: bounded offline emulation](#codevantaanalysisemulate-bounded-offline-emulation)
+- [`codevanta.analysis.symbolic`: branch-decision path exploration](#codevantaanalysissymbolic-branch-decision-path-exploration)
+- [`codevanta.analysis.dataflow`: def-use and constant folding](#codevantaanalysisdataflow-def-use-and-constant-folding)
+- [`codevanta.analysis.evidence_bundle`: tamper-evident bundles](#codevantaanalysisevidence_bundle-tamper-evident-bundles)
+- [`codevanta.analysis.trace`: trace replay and attribution](#codevantaanalysistrace-trace-replay-and-attribution)
+- [`codevanta.analysis.dynamic`: provider probes and session scripts](#codevantaanalysisdynamic-provider-probes-and-session-scripts)
+- [`codevanta.plugins`: the plugin SDK](#codevantaplugins-the-plugin-sdk)
 - [`codevanta.storage.session`: persisted sessions](#codevantastoragesession-persisted-sessions)
 - [`codevanta.gui`: local web dashboard](#codevantagui-local-web-dashboard)
 - [`codevanta.mcp_server`: MCP server](#codevantamcp_server-mcp-server)
@@ -942,6 +948,356 @@ recovered key without executing anything; see
 [`docs/phase3.md`](phase3.md#the-xorstring-helpers).
 
 
+## `codevanta.analysis.symbolic`: branch-decision path exploration
+
+```python
+from codevanta.analysis.symbolic import (
+    EMULATOR_AVAILABLE, ANGR_AVAILABLE, angr_available,
+    explore_paths, explore_with_angr,
+    PathExploration, Entry, Branch,
+    DEFAULT_MAX_PATHS, MAX_MAX_PATHS,          # 64 / 4096
+    DEFAULT_MAX_STEPS, MAX_MAX_STEPS,          # 2000 / 200_000
+)
+
+explore_paths(path, info, address, max_paths=DEFAULT_MAX_PATHS,
+              max_steps=DEFAULT_MAX_STEPS, initial_registers=None, *,
+              stack_size=emulate.DEFAULT_STACK_SIZE) -> PathExploration
+
+explore_with_angr(path, info, address, max_paths=64,
+                  initial_registers=None) -> PathExploration   # ceiling 4096
+```
+
+`explore_paths` walks the decision tree of one function breadth-first on a
+private unicorn CPU — the file's bytes are copied onto it, exactly like
+`emulate_function`, and nothing is executed on the host. The direction real
+emulation produced is recorded as `"observed"`; the opposite direction is
+enqueued with its guarding flags or loop counter rewritten and recorded as
+`"seeded"` — an assumption about feasibility, never a solved constraint. There
+are no symbolic variables, no path predicates, no constraint solving anywhere
+in the module.
+
+**`Branch`**: `address`, `mnemonic`, `taken`, `target`, `basis`
+(`"observed"`/`"seeded"`), `note` (the exact seed description; empty when
+observed). **`Entry`**: `index`, `decisions`, `taken_targets`, `registers`
+(end-of-path snapshot), `return_value` (`rax`/`eax` only when the path reached
+a `ret` that left the section — otherwise `None`, even if `rax` holds a value),
+`stopped_reason` (`"return"`, `"budget"`, `"blocked"` or `"unmapped"`),
+`instructions` (replays included), `warnings`, and a `seeded` property counting
+forced directions. **`PathExploration`**: `address`, `explorer`
+(`"unicorn"`/`"angr"`), `architecture`, `bitness`, `max_paths`, `max_steps`
+(`0` for the angr bridge), `steps`, `complete`, `entries`, `warnings`,
+`evidence`, and the `paths` / `unresolved` / `return_values` properties.
+`complete` is `True` only when nothing was left unexplored **and** every
+reported path reached a `ret`; `unresolved` counts the paths that ended
+`blocked` or `unmapped`. All three dataclasses have JSON-safe `to_dict()`
+methods (hex addresses).
+
+Only x86 and x86-64 are supported (the register and stack vocabulary is
+x86-specific); anything else raises `AnalysisError`. So do a missing unicorn
+build, an unusable address, an unknown seed register, a value that does not fit
+the machine word and an out-of-range limit — validation happens before anything
+runs. Register names follow the emulator's vocabulary (`{"edi": 0}` seeds both
+paths).
+
+```python
+from codevanta.analysis.symbolic import angr_available, explore_paths
+from codevanta.core.loader import BinaryLoader
+
+path = "samples/pe64_text.bin"
+info = BinaryLoader().load(path)
+exploration = explore_paths(path, info, info.entry_point)
+print(exploration.explorer, exploration.complete, exploration.paths,
+      exploration.return_values)
+print(angr_available())
+```
+
+```text
+unicorn True 1 (42,)
+False
+```
+
+`angr_available()` / `ANGR_AVAILABLE` probe for a module named `angr` without
+importing it; `explore_with_angr` imports lazily and raises `AnalysisError`
+naming the extra (`pip install -e ".[decompilers]"`) when it is missing. The
+bridge explores to the `ret` addresses a bounded linear sweep found and reports
+`max_steps=0` because angr owns the stopping; states still active or errored
+when it stops are counted in a warning, never silently dropped.
+
+
+## `codevanta.analysis.dataflow`: def-use and constant folding
+
+```python
+from codevanta.analysis.dataflow import (
+    analyze_dataflow, DataFlowSummary, Definition, Use,
+    DEFAULT_MAX_INSTRUCTIONS, MAX_MAX_INSTRUCTIONS,   # 2000 / 8192
+    DEFAULT_MAX_BLOCKS, MAX_MAX_BLOCKS,               # 500 / 4096
+    KIND_CONST, KIND_COPY, KIND_ARITHMETIC, KIND_UNKNOWN,
+    READ, WRITE,
+)
+
+analyze_dataflow(path, info, address,
+                 max_instructions=DEFAULT_MAX_INSTRUCTIONS,
+                 max_blocks=DEFAULT_MAX_BLOCKS) -> DataFlowSummary
+```
+
+The CFG is built with `build_recursive_cfg` from `address` and walked once,
+forward: every read is resolved against the definitions seen so far (and
+recorded in `reaching_definition`), every write replaces what the register held.
+Only provable shapes fold into constants — `mov` immediates, register copies,
+`add`/`sub`/`xor` of two known values, rip-relative loads — and a folded value
+is masked to the written register's width; only full-width writes carry values.
+Register aliases are normalised (`eax` → `rax` on a 64-bit binary; `eax` stays
+canonical on a 32-bit one), and a `call` clobbers the caller-saved registers.
+
+**`Definition`**: `address`, `register` (canonical), `kind` (`const`, `copy`,
+`arithmetic` or `unknown`), `value` (`None` when unknown), `source_register`
+(for copies). **`Use`**: `address`, `register`, `read_or_write`. Within one
+instruction the reads come before the write it makes.
+**`DataFlowSummary`**: `address`, `definitions` and `uses` in ascending address
+order, `constant_registers` (only what is still provably known after the pass),
+`reaching_definition` (`(register, use address) -> definition address`; reads
+with no definition in the region are absent and warned about instead),
+`warnings` (each stated once, capped at `MAX_UNDEFINED_WARNINGS = 8`),
+`evidence`. `to_dict()` is JSON-safe; `reaching_definition` keys render as
+`"register@0x<use>"`.
+
+The pass is a linearization, not a fixpoint: a join takes the
+highest-addressed predecessor. What is reported stays sound one definition at a
+time — a value is only folded from instructions the summary itself proves, and
+only the last definition of a register survives, so no two conflicting origins
+are ever claimed. 32-bit and 64-bit binaries only; a bad address, an
+out-of-range budget or a non-executable address raise `AnalysisError`.
+
+```python
+from codevanta.analysis.dataflow import analyze_dataflow
+from codevanta.core.loader import BinaryLoader
+
+path = "samples/elf64_text.bin"
+info = BinaryLoader().load(path)
+summary = analyze_dataflow(path, info, info.entry_point)
+print(len(summary.definitions), len(summary.uses), dict(summary.constant_registers))
+print(summary.definitions[0].to_dict())
+```
+
+```text
+1 3 {}
+{'address': '0x401001', 'register': 'rbp', 'kind': 'copy', 'value': None, 'source_register': 'rsp'}
+```
+
+
+## `codevanta.analysis.evidence_bundle`: tamper-evident bundles
+
+```python
+from codevanta.analysis.evidence_bundle import (
+    build_bundle, verify_bundle, read_bundle, write_bundle, dumps_bundle,
+    hash_subject, entries_digest, canonical_json,
+    Bundle, BundleManifest, BundleVerification,
+    DEFAULT_ALGORITHM, SUPPORTED_ALGORITHMS,      # "sha256" / {"sha256"}
+    MAX_ENTRIES, MAX_PAYLOAD_BYTES,               # 256 / 16 MiB
+    MEDIA_TYPE_JSON, SUBJECT_CHUNK_BYTES, TOOL_VERSION,
+)
+
+build_bundle(subject_path, payloads, *, label=None) -> Bundle
+verify_bundle(bundle_or_dict, *, subject_path=None) -> BundleVerification
+read_bundle(path) -> Bundle
+write_bundle(bundle, path) -> Path
+dumps_bundle(bundle) -> str
+hash_subject(subject_path) -> str
+entries_digest(entries) -> str
+canonical_json(payload) -> str
+```
+
+`build_bundle` streams the subject binary through SHA-256 in 1 MiB chunks and
+reduces every payload to canonical JSON (`sort_keys`, no spaces, ASCII,
+NaN-free) before hashing it, so both digests are recomputable from the document
+alone. Entries are sorted by name, so two builds from the same inputs serialise
+to identical bytes regardless of insertion order.
+
+**`BundleManifest`**: `created_at` (ISO-8601 UTC), `tool_version`,
+`subject` (the file name, or the caller's `label`), `subject_sha256`,
+`entry_count`, `entries_sha256` (the combined table digest), `algorithm`
+(`"sha256"` only). **`Bundle`**: `manifest`, `entries` (read-only mapping of
+name to `{"sha256", "bytes", "media_type"}`), `names` and `payload(name)`
+(decoded from the exact canonical text that was hashed) — the dataclass is
+frozen and the mappings are proxies, so a built bundle cannot be mutated behind
+the verifier's back. **`BundleVerification`**: `passed`, `problems`,
+`manifest`.
+
+`verify_bundle` runs two independent checks: per entry (re-canonicalise,
+re-hash, re-measure against the recorded `sha256`/`bytes`) and per table
+(`entries_digest` over the recorded table against
+`manifest.entries_sha256` — this catches added, removed or renamed entries,
+including an edited `sha256` whose payload was left alone). `entry_count` and
+`algorithm` are checked too. Structurally damaged input is reported as a
+problem rather than raised; `read_bundle` is the strict counterpart, and
+deliberately does *not* verify digests, so a caller can round-trip and then
+re-verify.
+
+```python
+import json
+
+from codevanta.analysis.evidence_bundle import build_bundle, dumps_bundle, verify_bundle
+
+bundle = build_bundle("samples/elf64_text.bin", {"report": {"format": "ELF"}})
+text = dumps_bundle(bundle)
+print(verify_bundle(bundle, subject_path="samples/elf64_text.bin").passed)
+
+tampered = json.loads(text)
+tampered["entries"]["report"]["payload"]["format"] = "PE"
+verdict = verify_bundle(tampered)
+print(verdict.passed, verdict.problems[0][:60])
+```
+
+```text
+True
+False entry 'report': payload sha256 mismatch (expected 9d2a96643a3699d65c1a
+```
+
+`build_bundle` raises `AnalysisError` for a missing/unreadable subject, a
+non-mapping payload set, a blank entry name, more than `MAX_ENTRIES` entries,
+or a payload that is not JSON-serialisable or exceeds `MAX_PAYLOAD_BYTES`.
+`write_bundle` refuses nothing about the path — the CLI's rule that the output
+must not overwrite the subject lives in `codevanta evidence-bundle` and
+`scripts/report_bundle.py`, which also verify what they wrote.
+
+
+## `codevanta.analysis.trace`: trace replay and attribution
+
+```python
+from codevanta.analysis.trace import (
+    parse_gdb_trace, parse_frida_trace, TraceHit, TraceReport,
+    MAX_TRACE_LINES, MAX_TRACE_HITS,   # 100_000 each
+    MAX_BACKTRACE_FRAMES,              # 64
+    MAX_WARNINGS,                      # 50
+)
+
+parse_gdb_trace(text, *, info=None, functions=(),
+                max_lines=MAX_TRACE_LINES, max_hits=None) -> TraceReport
+
+parse_frida_trace(text, *, info=None, functions=(),
+                  max_lines=MAX_TRACE_LINES, max_hits=None) -> TraceReport
+```
+
+Nothing here launches anything: the input is what a generated session script
+already printed. `parse_gdb_trace` reads the `HIT <address> <reg>=<value> …`
+lines, the `BACKTRACE` marker plus `#N 0x…` frames after each hit, and skips
+gdb's own noise; a `LIMIT` line marks the report `truncated`.
+`parse_frida_trace` reads JSON-lines messages (`{"hit", "address", "tid",
+"args"}`); a malformed line becomes a warning, `{"event": "limit"}` truncates
+and `{"event": "error"}` warns. The only exception raised is `AnalysisError`,
+for an out-of-range `max_lines`/`max_hits`.
+
+**`TraceHit`**: `index`, `kind` (`"breakpoint"`/`"message"`), `address`,
+`function`, `function_name`, `registers` (gdb's register snapshot; Frida's
+`tid` plus up to four `arg0..arg3`), `backtrace` (innermost first; empty for
+Frida). **`TraceReport`**: `provider`, `hits` (kept, in session order),
+`total_hits` (exceeds `len(hits)` only when a bound cut the tail),
+`truncated`, `unique_addresses`, `function_coverage` (hits per attributed
+function start), `warnings` (capped at `MAX_WARNINGS`), `evidence`. `to_dict()`
+is JSON-safe with hex addresses.
+
+**Attribution** — a hit is attributed to the candidate with the greatest start
+`<= address` that either contains the address within its known `size` or, when
+the size is unknown, still starts before the next candidate; a candidate's
+extent comes from its symbol size, else from the enclosing executable section,
+and an address outside every candidate stays **unattributed** rather than being
+guessed onto the nearest symbol. (Before the phase 6 fix, an unknown size was
+treated as unbounded, so a hit above the last function was attributed to it.)
+
+```python
+from codevanta.analysis.trace import parse_gdb_trace
+from codevanta.core.functions import discover_functions
+from codevanta.core.loader import BinaryLoader
+
+path = "samples/elf64_text.bin"
+info = BinaryLoader().load(path)
+with open("samples/gdb_trace.log", encoding="utf-8") as handle:
+    report = parse_gdb_trace(handle.read(), info=info,
+                             functions=discover_functions(info))
+print(report.provider, report.total_hits, len(report.unique_addresses),
+      report.function_coverage)
+```
+
+```text
+gdb 3 2 {4198400: 3}
+```
+
+(`4198400` is `0x401000`: the single unnamed entry-point candidate absorbed all
+three hits.) The committed `samples/gdb_trace.log` and
+`samples/frida_trace.jsonl` replay through both parsers.
+
+
+## `codevanta.analysis.dynamic`: provider probes and session scripts
+
+```python
+from codevanta.analysis.dynamic import (
+    available_backends, provider_status,
+    build_gdb_script, build_frida_script,
+    script_file_name, attach_command,
+    DynamicAvailability, DynamicScript,
+    PROVIDERS, SCRIPT_FILE_NAMES,             # ("gdb", "frida")
+    DEFAULT_MAX_HITS, MAX_MAX_HITS,           # 64 / 100_000
+    BACKTRACE_DEPTH, MAX_FRIDA_ARGS,          # 8 / 4
+)
+
+available_backends() -> tuple[DynamicAvailability, ...]
+provider_status(provider: str) -> DynamicAvailability
+
+build_gdb_script(path, info, addresses, *, max_hits=DEFAULT_MAX_HITS,
+                 follow_forks=False) -> DynamicScript
+attach_command(provider, path, script, pid=None) -> tuple[str, ...]
+```
+
+Dynamic analysis needs a debugger, and a debugger needs a host, so this module
+does the one part that is always safe: decide whether a provider can run here,
+and write the script that provider should execute. Nothing imports gdb or
+Frida, nothing starts a process. Probes never raise: an absent debugger is
+`available=False` with a non-empty `reason` (`version` stays `None` on purpose
+— probing a version would mean executing the provider).
+
+**`DynamicAvailability`**: `name`, `available`, `reason`, `requires`,
+`version`. **`DynamicScript`**: `provider`, `text` (deterministic — the same
+inputs give byte-identical scripts), `entry_commands` (the `set`/`break` lines,
+or the per-address `Interceptor.attach` expressions), `notes` (address
+semantics, hit/backtrace bounds, what the script does not do). The gdb script
+disables pagination, confirmation prompts and ASLR, prints
+`HIT <address> <reg>=<value> …` per hit, `BACKTRACE` +
+`BACKTRACE_DEPTH` `bt` frames, exits after `max_hits` with a `LIMIT` line and
+quits with `DONE <n> hits`; the Frida hook snapshots `MAX_FRIDA_ARGS` argument
+registers and detaches its listeners at the limit. Addresses are validated
+(positive, deduplicated, inside an executable section when `info` is given) and
+`max_hits` against `MAX_MAX_HITS`; violations raise `AnalysisError`.
+
+`attach_command` returns the exact `argv` — ready for
+`subprocess.run(..., shell=False)` — and never a shell string:
+`("gdb", "-q", "-batch", "-x", <script>, "--args", <path>)` or
+`("frida", "-l", <script>, "-f", <path>)` (`"-p", <pid>` when attaching; a pid
+with gdb is refused, because the gdb script ends with `run`). The script's
+provider must match, so a gdb script can never be handed to Frida.
+
+```python
+from codevanta.analysis.dynamic import attach_command, available_backends, build_gdb_script
+from codevanta.core.loader import BinaryLoader
+
+path = "samples/elf64_text.bin"
+info = BinaryLoader().load(path)
+print([(probe.name, probe.available) for probe in available_backends()])
+script = build_gdb_script(path, info, [info.entry_point], max_hits=4)
+print(attach_command("gdb", path, script))
+print(script.entry_commands[:2])
+```
+
+```text
+[('gdb', False), ('frida', False)]
+('gdb', '-q', '-batch', '-x', 'codevanta-session.gdb', '--args', 'D:\\…\\samples\\elf64_text.bin')
+('set pagination off', 'set confirm off')
+```
+
+(Probe results are this Windows machine's answer.) The CLI surface is
+`codevanta attach`; replaying what such a session printed is
+[`codevanta.analysis.trace`](#codevantaanalysistrace-trace-replay-and-attribution).
+
+
 ## `codevanta.storage.session`: persisted sessions
 
 ```python
@@ -983,6 +1339,89 @@ negative address, a note over `MAX_NOTE_LENGTH = 4000`) raises `SessionError`.
 The CLI default database is `$CODEVANTA_DB` (env `SESSION_DB_ENV`), otherwise
 `~/.codevanta/sessions.db`; the `codevanta session …` commands and the `--db`
 option use the same store.
+
+## `codevanta.plugins`: the plugin SDK
+
+```python
+from codevanta.plugins import (
+    register, unregister, registry_snapshot, builtin_plugins,
+    discover, discovery_warnings, load,
+    run_plugin, build_context, canonical_json,
+    PluginInfo, AnalysisContext, PluginResult, AnalyzerPlugin,
+    MetricsAnalyzer, METRICS_PLUGIN,
+    DEFAULT_ENTRY_POINT_GROUP,   # "codevanta.analyzers"
+    PLUGIN_KINDS,                # {"analyzer", "exporter", "provider"}
+    DEFAULT_MAX_SECONDS,         # 30.0
+    DEFAULT_MAX_BYTES,           # 4 MiB
+    DEFAULT_MAX_STRINGS,         # 5000
+)
+
+register(plugin) -> PluginInfo
+unregister(name: str) -> bool
+registry_snapshot() -> dict[str, AnalyzerPlugin]
+builtin_plugins() -> tuple[PluginInfo, ...]
+discover(entry_point_group=DEFAULT_ENTRY_POINT_GROUP) -> tuple[PluginInfo, ...]
+discovery_warnings() -> tuple[str, ...]
+load(entry_point_group=DEFAULT_ENTRY_POINT_GROUP, name="") -> AnalyzerPlugin
+
+build_context(path, *, address=None, functions=None, budget=None) -> AnalysisContext
+run_plugin(plugin, context, max_seconds=DEFAULT_MAX_SECONDS,
+           max_bytes=DEFAULT_MAX_BYTES) -> PluginResult
+canonical_json(payload) -> bytes
+```
+
+An analyser that ships outside the package must not require an edit inside it.
+The contract is deliberately tiny — one dataclass in, one mapping out: an
+object with `name`, `version`, `description` and an
+`analyze(context) -> Mapping` satisfies `AnalyzerPlugin` structurally (a
+`Protocol`; it does not have to import CODEVANTA or subclass anything).
+
+**`AnalysisContext`**: `path` (the raw file), `info` (loaded `BinaryInfo`),
+`address` (focus; `build_context` defaults it to the entry point),
+`functions` (pre-discovered candidates, so a plugin does not repeat core
+work), `budget` (read-only mapping of plugin-specific integer limits).
+**`PluginInfo`**: `name`, `version` (`"unknown"` when the declaring
+distribution has none), `kind`, `entry_point` (`module:attribute`),
+`description`. **`PluginResult`**: `plugin`, `payload` (shallow copy),
+`elapsed_ms`, `warnings` (lifted out of `payload["warnings"]`), `evidence`
+(source `plugin.<name>`, method `plugin.analyze`, `Confidence.MEDIUM` — the
+harness vouches for the run, not for the plugin's method). All have JSON-safe
+`to_dict()` methods.
+
+Discovery reads distribution entry points without importing them — broken
+metadata degrades to a warning (via `discovery_warnings()`), never an
+exception — while `load(name=...)` consults the built-in registry first and
+imports exactly one entry point lazily; a class where an instance is expected,
+a failed import and an unknown name are all `AnalysisError` naming the plugin.
+`run_plugin` bounds the call: the canonical-JSON byte cap is enforced *before*
+the time budget (an oversized payload is never masked by a slow run), the
+elapsed time is measured with `perf_counter` **after** the call returns — the
+call is not interruptible, so a hung plugin still hangs the caller, and the
+error says so. `register`/`unregister` manage the process-local, lock-guarded
+registry (`builtin_plugins()` is the live registry, not a static list, which is
+what makes the built-in path testable end to end).
+
+`MetricsAnalyzer` (`METRICS_PLUGIN`, `name="metrics"`, `version="1.0"`) is the
+wired-in built-in: function/string counts through the public API, honouring a
+`max_strings` budget and warning when the budget makes `string_count` a lower
+bound. `canonical_json` is the shared serialisation (sorted keys, compact
+separators, ASCII, NaN-free) that the byte cap measures.
+
+```python
+from codevanta.plugins import builtin_plugins, build_context, load, run_plugin
+from codevanta.core.loader import BinaryLoader
+
+path = "samples/elf64_text.bin"
+print([(p.name, p.version, p.kind) for p in builtin_plugins()])
+result = run_plugin(load(name="metrics"), build_context(path))
+print(result.plugin.name, result.payload["function_count"],
+      result.payload["string_count"], result.warnings)
+```
+
+```text
+[('metrics', '1.0', 'analyzer')]
+metrics 1 2 []
+```
 
 ## `codevanta.gui`: local web dashboard
 
@@ -1030,7 +1469,7 @@ never returns more than `MAX_RESPONSE_BYTES`, whatever the payload shape. Every
 numeric query parameter is validated against the ceiling of the engine that
 consumes it.
 
-### The ten `/api` routes
+### The fourteen `/api` routes
 
 All routes are `GET` and return `application/json`; `/` returns the HTML page.
 The builders are thin adapters — no analysis is reimplemented here.
@@ -1047,6 +1486,10 @@ The builders are thin adapters — no analysis is reimplemented here.
 | `/api/callgraph` | `path`, `limit_functions` (2000), `limit_edges` (20000) | `build_call_graph` |
 | `/api/diff` | `left`, `right`, `semantic` (0), `threshold` (0.9) | `diff_binaries` |
 | `/api/decompile` | `path`, `address` (entry point), `backend` (`auto`), `max_instructions` (2000), `max_blocks` (500) | `codevanta.analysis.decompilers.decompile_function` |
+| `/api/emulate` | `path`, `address`, `set` (repeatable `REG=VAL`), `max_instructions` (2000) | `emulate_function` |
+| `/api/symbolic` | `path`, `address`, `max_paths` (64), `max_steps` (2000) | `explore_paths` |
+| `/api/session_save` | `path`, `notes` | `SessionStore.save` (the one route that writes; the database comes from `SESSION_DB_ENV`) |
+| `/api/session_list` | `limit` (50) | `SessionStore.list` |
 
 Flags are integer `0`/`1`; addresses accept decimal or `0x` hex. Status codes:
 `421` with `{"error": ...}` for a foreign, missing or port-mismatched `Host`
@@ -1073,7 +1516,7 @@ is_loopback_host(host: str) -> bool
 ```
 
 `build_server()` creates the MCP server (`name="CODEVANTA"`,
-`version="0.1.0"`) and registers the sixteen tools below.
+`version="0.1.0"`) and registers the twenty-two tools below.
 
 `run(transport=...)` accepts
 `SUPPORTED_TRANSPORTS = ("stdio", "sse", "streamable-http")`:
@@ -1098,11 +1541,11 @@ authentication and `Host`/`Origin` validation.
 > --port 8000`. `--allow-remote` is the CLI spelling of `allow_remote=True`, and
 > a rejected transport or bind exits `2`.
 
-### The sixteen tools
+### The twenty-two tools
 
 Registered tool names, with their input properties. Verified by listing the
 tools of a built server (`asyncio.run(build_server().list_tools())`, which
-returns 16 names):
+returns 22 names):
 
 | Tool | Inputs (defaults) | Returns |
 | --- | --- | --- |
@@ -1122,6 +1565,12 @@ returns 16 names):
 | `codevanta_struct` | `path`, `address`, `function`, `max_instructions` (2000), `max_fields` (64), `include_stack` (false) | struct-field suggestion |
 | `codevanta_session_save` | `path`, `db`, `notes` | newly persisted session record |
 | `codevanta_session_list` | `db`, `limit` (20) | sessions, newest first |
+| `codevanta_entropy` | `path`, `threshold` (7.2), `max_sample_bytes` | per-section entropy with packing triage |
+| `codevanta_dwarf` | `path`, `limit` (500) | DWARF functions and type layouts (ELF, optional extra) |
+| `codevanta_vtable` | `path`, `address`, `scan` (false), `min_slots` (3), `max_slots` (256), `max_tables` (64), `resolve_thunks` (true) | vtable candidates and thunk chains |
+| `codevanta_trace` | `path`, `trace_path`, `provider` (`auto`), `max_hits` | replayed trace mapped onto candidates |
+| `codevanta_symbolic` | `path`, `address`, `max_paths` (64), `max_steps` (2000) | `PathExploration` payload |
+| `codevanta_dataflow` | `path`, `address`, `max_instructions` (2000), `max_blocks` (500) | `DataFlowSummary` payload |
 
 `codevanta_decompile` matches `backend` case-insensitively (blank means `auto`)
 and rejects an unknown name with the supported set in the message; an

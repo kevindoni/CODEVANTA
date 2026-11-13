@@ -253,6 +253,8 @@ jobs:
       - name: Benchmark gate tests
         run: python -m pytest tests/test_bench_gate.py -q
 
+  # Windows and macOS run the same suite as platform signal, not gates: parity
+  # is proven by the Linux `test` job, so these runs never block a merge.
   test-platform:
     name: test (py3.13, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -266,7 +268,9 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install
-        run: python -m pip install -e ".[dev]"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]" pytest-cov mypy
       - name: Test
-        run: python -m pytest --cov=codevanta --cov-branch --cov-report=term
+        run: python -m pytest --cov=codevanta --cov-report=term-missing
 

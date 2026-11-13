@@ -17,6 +17,19 @@ from codevanta.analysis.binary_diff import (
 from codevanta.analysis.callgraph import MAX_LIMIT as MAX_CALLGRAPH_LIMIT
 from codevanta.analysis.callgraph import build_call_graph
 from codevanta.analysis.cfg import build_cfg
+from codevanta.analysis.dataflow import (
+    DEFAULT_MAX_BLOCKS as DEFAULT_DATAFLOW_MAX_BLOCKS,
+)
+from codevanta.analysis.dataflow import (
+    DEFAULT_MAX_INSTRUCTIONS as DEFAULT_DATAFLOW_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.dataflow import (
+    MAX_MAX_BLOCKS as MAX_DATAFLOW_MAX_BLOCKS,
+)
+from codevanta.analysis.dataflow import (
+    MAX_MAX_INSTRUCTIONS as MAX_DATAFLOW_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.dataflow import analyze_dataflow
 from codevanta.analysis.debuginfo import DEFAULT_LIMIT as DEFAULT_DWARF_LIMIT
 from codevanta.analysis.debuginfo import MAX_LIMIT as MAX_DWARF_LIMIT
 from codevanta.analysis.debuginfo import extract_debug_info
@@ -38,6 +51,19 @@ from codevanta.analysis.function_hash import function_fingerprint, function_simi
 from codevanta.analysis.jump_tables import MAX_ENTRIES as MAX_JUMP_TABLE_ENTRIES
 from codevanta.analysis.jump_tables import MODE_RELATIVE, resolve_jump_table
 from codevanta.analysis.jump_tables import MODES as JUMP_TABLE_MODES
+from codevanta.analysis.symbolic import (
+    DEFAULT_MAX_PATHS as DEFAULT_SYMBOLIC_MAX_PATHS,
+)
+from codevanta.analysis.symbolic import (
+    DEFAULT_MAX_STEPS as DEFAULT_SYMBOLIC_MAX_STEPS,
+)
+from codevanta.analysis.symbolic import (
+    MAX_MAX_PATHS as MAX_SYMBOLIC_MAX_PATHS,
+)
+from codevanta.analysis.symbolic import (
+    MAX_MAX_STEPS as MAX_SYMBOLIC_MAX_STEPS,
+)
+from codevanta.analysis.symbolic import explore_paths
 from codevanta.analysis.trace import (
     MAX_TRACE_HITS,
     MAX_TRACE_LINES,
@@ -1207,3 +1233,132 @@ def session_list(db: str | None = None, limit: int = 20) -> dict[str, Any]:
         "items": [record.to_dict() for record in records],
         "db": str(db_path),
     }
+
+
+def symbolic(
+    path: str,
+    address: int,
+    max_paths: int = DEFAULT_SYMBOLIC_MAX_PATHS,
+    max_steps: int = DEFAULT_SYMBOLIC_MAX_STEPS,
+) -> dict[str, Any]:
+    """Explore the paths through a function with the unicorn explorer.
+
+    This is a **unicorn exploration**, not a symbolic executor: every path is a
+    sequence of branch decisions replayed on a freshly initialised unicorn CPU,
+    and only the file's own image bytes ever run -- the host never executes the
+    target. Only x86 and x86-64 are emulated, and the optional unicorn extra
+    must be installed. What each direction is worth, stated honestly: the side
+    of a conditional the real emulation takes comes back with
+    ``basis: "observed"``; the other side is produced by rewriting the flag or
+    counter that guards the branch and comes back ``basis: "seeded"`` -- it is
+    assumed feasible, never proven, because no path predicate is built, no
+    constraint is solved and there is no symbolic variable anywhere in the
+    engine. All values are concrete, so a path is evidence about one concrete
+    run of the code, never proof of reachability for arbitrary inputs. Every
+    seeded direction is named in the path's ``warnings``, counted in
+    ``seeded_branches``, listed in the evidence ``assumptions``, and the whole
+    summary drops to ``low`` confidence as soon as any direction was seeded.
+
+    Args:
+        path: PE or ELF file to read; its bytes are only ever run inside the
+            emulator, never on the host.
+        address: Virtual address of the first instruction, inside an
+            executable section with file bytes.
+        max_paths: Path budget (1 ..
+            :data:`codevanta.analysis.symbolic.MAX_MAX_PATHS`).
+        max_steps: Instruction budget for the whole exploration, replays
+            included (1 .. :data:`codevanta.analysis.symbolic.MAX_MAX_STEPS`).
+
+    Returns:
+        ``PathExploration.to_dict()`` -- ``address``, ``explorer``,
+        ``architecture``, ``bitness``, ``max_paths``, ``max_steps``,
+        ``steps``, ``complete``, ``paths``, ``unresolved``, ``return_values``,
+        ``entries``, ``warnings`` and ``evidence`` -- plus ``path`` and the
+        resolved start as ``address_resolved``.
+
+    Raises:
+        AnalysisError: If the file is missing, ``address`` is not a
+            non-negative integer or not inside an executable, mapped, readable
+            section, a budget is out of range or not an integer, unicorn is
+            not installed, or the architecture is not x86/x86-64.
+    """
+    start = _check_address(address)
+    path_limit = _check_bounded_int("max_paths", max_paths, MAX_SYMBOLIC_MAX_PATHS)
+    step_limit = _check_bounded_int("max_steps", max_steps, MAX_SYMBOLIC_MAX_STEPS)
+    target = _validate_path(path)
+    info = load_binary(target)
+    exploration = explore_paths(
+        target,
+        info,
+        start,
+        max_paths=path_limit,
+        max_steps=step_limit,
+    )
+    payload = exploration.to_dict()
+    payload["path"] = str(target)
+    payload["address_resolved"] = f"0x{start:x}"
+    return payload
+
+
+def dataflow(
+    path: str,
+    address: int,
+    max_instructions: int = DEFAULT_DATAFLOW_MAX_INSTRUCTIONS,
+    max_blocks: int = DEFAULT_DATAFLOW_MAX_BLOCKS,
+) -> dict[str, Any]:
+    """Recover definition-use chains, constants and reaching definitions.
+
+    The recursive CFG is built from ``address`` and walked once, forward: each
+    instruction contributes its read uses, resolved against the definitions
+    seen so far, and each register write becomes one definition that kills
+    whatever the register held before. Constants are folded only from shapes
+    the pass itself proves -- immediates, RIP-relative ``lea``/``mov`` targets,
+    copies of known values and ``add``/``sub``/``xor`` over two known values --
+    so ``constant_registers`` never guesses. Reads with no reaching definition
+    in the region are absent from ``reaching_definition`` and reported in
+    ``warnings`` instead.
+
+    Honest limits: the pass is a linearization of the CFG, not a fixpoint --
+    state flows into a block from its highest-addressed predecessor, so a join
+    is approximated rather than merged. What is reported stays sound one
+    definition at a time (a value is only folded where the summary proves it,
+    and only the last definition of a register survives), but the summary is
+    not a dataflow proof over the whole function. Two calls with the same
+    arguments always produce the same result.
+
+    Args:
+        path: PE or ELF file to read; it is read, never executed.
+        address: Virtual address of the first instruction, inside an
+            executable section.
+        max_instructions: Instruction budget (1 ..
+            :data:`codevanta.analysis.dataflow.MAX_MAX_INSTRUCTIONS`).
+        max_blocks: Block budget (1 ..
+            :data:`codevanta.analysis.dataflow.MAX_MAX_BLOCKS`).
+
+    Returns:
+        ``DataFlowSummary.to_dict()`` -- ``address``, ``definition_count``,
+        ``use_count``, ``definitions``, ``uses``, ``constant_registers``,
+        ``reaching_definition``, ``warnings`` and ``evidence``.
+
+    Raises:
+        AnalysisError: If the file is missing, ``address`` is not a
+            non-negative integer or not inside an executable section, or a
+            budget is out of range or not an integer.
+    """
+    start = _check_address(address)
+    instruction_budget = _check_bounded_int(
+        "max_instructions", max_instructions, MAX_DATAFLOW_MAX_INSTRUCTIONS
+    )
+    block_budget = _check_bounded_int(
+        "max_blocks", max_blocks, MAX_DATAFLOW_MAX_BLOCKS
+    )
+    target = _validate_path(path)
+    info = load_binary(target)
+    summary = analyze_dataflow(
+        target,
+        info,
+        start,
+        max_instructions=instruction_budget,
+        max_blocks=block_budget,
+    )
+    return summary.to_dict()

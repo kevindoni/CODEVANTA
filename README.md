@@ -261,6 +261,7 @@ installs, and the full setup/uninstall reference.
 codevanta info      C:\Windows\System32\notepad.exe
 codevanta functions C:\Windows\System32\kernel32.dll --limit 8
 codevanta strings   C:\Windows\System32\notepad.exe --min-length 8
+codevanta entropy   C:\Windows\System32\notepad.exe --threshold 7.2
 codevanta disasm    C:\Windows\System32\notepad.exe --count 40
 codevanta analyze   samples\elf64_text.bin --output samples\report.json
 
@@ -298,6 +299,21 @@ codevanta decompile samples\pe64_text.bin --max-instructions 20 --output renderi
 codevanta emulate   samples\pe64_text.bin                              # returns 42
 codevanta emulate   samples\pe64_text.bin --set rdi=2 --mem 0x600000=48454c4c4f
 codevanta emulate   C:\Windows\System32\notepad.exe --resolve-target   # jmp/call [rip+..]
+
+# Phase 5 — symbol-grade views and dynamic sessions
+codevanta dwarf     samples\hello-dwarf                                # DWARF symbols + type layouts
+codevanta vtable    samples\shapes-vtable --scan                       # vtable candidates + thunk chains
+codevanta trace     samples\elf64_text.bin --input samples\gdb_trace.log
+codevanta trace     samples\elf64_text.bin --input samples\frida_trace.jsonl --json
+codevanta attach    samples\elf64_text.bin 0x401000 --provider gdb --max-hits 4 --write session
+
+# Phase 6 — exploration, dataflow, evidence, plugins
+codevanta symbolic        samples\pe64_text.bin --max-paths 16 --set edi=1
+codevanta symbolic        samples\pe64_text.bin --json                 # PathExploration document
+codevanta dataflow        samples\elf64_text.bin                       # def-use + provable constants
+codevanta evidence-bundle samples\elf64_text.bin --entry report=samples\report_elf64.json -o bundle.json
+codevanta plugins list
+codevanta plugins run     metrics samples\elf64_text.bin
 ```
 
 `diff --semantic` prints one dim
@@ -414,11 +430,14 @@ codevanta gui --no-browser     # print the URL and wait
 
 `codevanta gui` serves one self-contained dashboard page over a loopback-only,
 read-only HTTP server — no extra dependencies, no network access, and the
-analysed file is never executed or written. The page drives ten JSON routes
+analysed file is never executed or written. The page drives fourteen JSON routes
 (`/api/health`, `/api/info`, `/api/functions`, `/api/strings`, `/api/xrefs`,
-`/api/cfg`, `/api/struct`, `/api/callgraph`, `/api/diff`, `/api/decompile`), each
+`/api/cfg`, `/api/struct`, `/api/callgraph`, `/api/diff`, `/api/decompile`,
+`/api/emulate`, `/api/symbolic`, `/api/session_save`, `/api/session_list`), each
 a thin adapter over the engine of the same name, so the browser shows the same
-evidence payload the CLI prints. Try it on the committed samples:
+evidence payload the CLI prints (`/api/session_save` is the one route that
+writes — one session row in the local SQLite store). Try it on the committed
+samples:
 
 ```powershell
 codevanta info    samples\pe64_text.bin        # PE32+ with one export
@@ -442,6 +461,8 @@ codevanta setup --client cursor --yes --verify   # apply and verify
 codevanta setup --client claude --scope user
 codevanta setup --client vscode --scope project --project .
 codevanta uninstall --client cursor
+codevanta mcp serve                              # run the server over stdio
+codevanta mcp serve --transport sse --port 8000  # HTTP transports are opt-in
 ```
 
 Supported clients: `claude` (Claude Code), `cursor`, `cline` (VS Code
@@ -451,16 +472,24 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools (twenty): `codevanta_info`, `codevanta_functions`,
+MCP tools (twenty-two): `codevanta_info`, `codevanta_functions`,
 `codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
 `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
 `codevanta_jump_table`, `codevanta_function_hash`, `codevanta_similarity`,
 `codevanta_struct`, `codevanta_entropy`, `codevanta_decompile`,
 `codevanta_dwarf`, `codevanta_vtable`, `codevanta_trace`,
+`codevanta_symbolic`, `codevanta_dataflow`,
 `codevanta_session_save`, `codevanta_session_list`.
 `codevanta_analyze` mirrors
 the CLI flags (`include_xrefs` / `include_cfg` / `include_callgraph`, default off)
 so a single call can carry the phase 2 sections when an agent prefers one payload.
+
+`codevanta_symbolic` (`path`, `address`, `max_paths`, `max_steps`) and
+`codevanta_dataflow` (`path`, `address`, `max_instructions`, `max_blocks`)
+expose the phase 6 engines: the honest-unicorn path exploration (seeded
+directions flagged, no constraint solving) and the def-use / constant-folding
+pass over the recursive CFG. Both return the module's `to_dict()` payload with
+`evidence`; neither executes anything on the host.
 
 `codevanta_decompile` takes `path`, `address`, `backend` (`auto` by default) and
 the same `max_instructions`/`max_blocks` budgets as the CLI, and returns the
@@ -534,11 +563,13 @@ plus smoke-tests the wheel on 3.13.
 - [Project specification](PROJECT_SPEC.md)
 - [Architecture](docs/architecture.md)
 - [API reference](docs/api.md) — every public Python entry point, the evidence
-  contract, the ten dashboard routes, and the sixteen MCP tools
+  contract, the fourteen dashboard routes, and the twenty-two MCP tools
 - [Sample binaries](docs/samples.md) — the committed PE/Mach-O/ELF fixtures and
   how to regenerate them
 - [Contributor attribution](docs/attribution.md) — how agent commits are credited,
   and how to make an agent appear in GitHub's contributor graph
+- [Release checklist](docs/release-checklist.md) — the pending PyPI publisher,
+  the `pypi` environment, dry runs, tagging and CI re-runs (maintainers)
 - [Phase 2 — cross-references, CFGs, sessions](docs/phase2.md)
 - [Phase 2b — call graphs, graph export, session annotations](docs/phase2b.md)
 - [Phase 2c — import/indirect calls, embedded call graphs, MCP call graph](docs/phase2c.md)
@@ -551,6 +582,7 @@ plus smoke-tests the wheel on 3.13.
 - [Phase 2j — semantic diff pairing, similarity over MCP, signedness hints](docs/phase2j.md)
 - [Phase 2k — diff options over MCP, cross-architecture guard, merged struct windows](docs/phase2k.md)
 - [Phase 3 — pseudo-C decompilation, bounded emulation, decompiler backends](docs/phase3.md)
+- [Phase 6 — path exploration, dataflow, evidence bundles, plugin SDK, fuzz and bench gates](docs/phase6.md)
 
 ## Roadmap
 
@@ -561,11 +593,11 @@ from `src/`. A phase can be **delivered with named gaps** — those gaps are the
 
 | Phase | Delivered | Open |
 |-------|-----------|------|
-| **1 · Foundation** | ✅ PE / ELF / Mach-O (fat slices too) / DEX loaders — `core/loader.py:363-379` (`dex\n` magic → `_load_dex`)<br>✅ Disassembly, ASCII + UTF-16 strings, function discovery, JSON evidence report — `core/disassembler.py`, `core/strings.py`, `core/functions.py`, `core/report.py`<br>✅ Per-section entropy and packing triage — `core/entropy.py` (`shannon_entropy`, `analyze_entropy`), `codevanta entropy`<br>✅ CLI: 20 commands (19 `@app.command()` + `mcp serve`) plus the `session` sub-app with 5 subcommands — `cli/main.py`<br>✅ MCP server exposing 17 tools — `mcp_server/server.py` (`build_server().list_tools()` returns 17)<br>✅ Guided agent setup for Claude Code, Cursor, Cline and VS Code — `setup/` (`clients.py`, `plan.py`, `apply.py`, `verify.py`) | ⬜ **.NET (CLR), WebAssembly and JVM `.class`/JAR formats** — `loader.py` recognises PE, ELF, Mach-O and DEX only |
-| **2 · RE views** | ✅ Cross-references, incl. `call_import` / `call_indirect` slot resolution — `analysis/xrefs.py`<br>✅ Linear **and** recursive CFG — `analysis/cfg.py` (`build_cfg`, `build_recursive_cfg`), `codevanta cfg --traversal recursive`<br>✅ Call graphs with DOT / GraphML / HTML export — `analysis/callgraph.py`, `analysis/graph_export.py`, `analysis/html_view.py`<br>✅ Absolute and relative jump tables — `analysis/jump_tables.py` (`MODE_ABSOLUTE`, `MODE_RELATIVE`)<br>✅ SQLite sessions with address annotations — `storage/session.py`, `codevanta session save/list/show/annotate/notes`<br>✅ Structural binary diff, function fingerprints, function similarity — `analysis/binary_diff.py`, `analysis/function_hash.py`<br>✅ Struct-field recovery — `analysis/type_recovery.py`, `codevanta struct`<br>✅ Read-only loopback dashboard, 10 endpoints — `gui/server.py` (`ROUTES`) | ⬜ **Live debugger attach** — `codevanta attach` states outright that "the provider is never launched: this command writes a file and prints a command line"; nothing runs gdb/Frida against a target<br>⬜ **GUI session persistence** — `gui/server.py:ROUTES` has 10 endpoints and none is session-related<br>⬜ **Graph-oriented viewer application** — the shipped viewer is the static HTML/SVG export (`analysis/html_view.py`), not an interactive app |
+| **1 · Foundation** | ✅ PE / ELF / Mach-O (fat slices too) / DEX loaders — `core/loader.py:363-379` (`dex\n` magic → `_load_dex`)<br>✅ Disassembly, ASCII + UTF-16 strings, function discovery, JSON evidence report — `core/disassembler.py`, `core/strings.py`, `core/functions.py`, `core/report.py`<br>✅ Per-section entropy and packing triage — `core/entropy.py` (`shannon_entropy`, `analyze_entropy`), `codevanta entropy`<br>✅ CLI: 20 commands (19 `@app.command()` + `mcp serve`) plus the `session` sub-app with 5 subcommands — `cli/main.py`<br>✅ MCP server exposing 22 tools — `mcp_server/server.py` (`build_server().list_tools()` returns 22)<br>✅ Guided agent setup for Claude Code, Cursor, Cline and VS Code — `setup/` (`clients.py`, `plan.py`, `apply.py`, `verify.py`) | ⬜ **.NET (CLR), WebAssembly and JVM `.class`/JAR formats** — `loader.py` recognises PE, ELF, Mach-O and DEX only |
+| **2 · RE views** | ✅ Cross-references, incl. `call_import` / `call_indirect` slot resolution — `analysis/xrefs.py`<br>✅ Linear **and** recursive CFG — `analysis/cfg.py` (`build_cfg`, `build_recursive_cfg`), `codevanta cfg --traversal recursive`<br>✅ Call graphs with DOT / GraphML / HTML export — `analysis/callgraph.py`, `analysis/graph_export.py`, `analysis/html_view.py`<br>✅ Absolute and relative jump tables — `analysis/jump_tables.py` (`MODE_ABSOLUTE`, `MODE_RELATIVE`)<br>✅ SQLite sessions with address annotations — `storage/session.py`, `codevanta session save/list/show/annotate/notes`<br>✅ Structural binary diff, function fingerprints, function similarity — `analysis/binary_diff.py`, `analysis/function_hash.py`<br>✅ Struct-field recovery — `analysis/type_recovery.py`, `codevanta struct`<br>✅ Read-only loopback dashboard, 14 endpoints — `gui/server.py` (`ROUTES`) | ⬜ **Live debugger execution** — `codevanta attach` states outright that "the provider is never launched: this command writes a file and prints a command line"; the gdb/Frida session layer generates scripts and replays traces (`analysis/dynamic.py`, `analysis/trace.py`) but nothing runs gdb/Frida against a target<br>✅ GUI session persistence — `/api/session_save` and `/api/session_list` over `storage/session.py`<br>⬜ **Graph-oriented viewer application** — the shipped viewer is the static HTML/SVG export (`analysis/html_view.py`), not an interactive app |
 | **3 · Decompilation** | ✅ Pseudo-C through three providers — `analysis/decompile.py`, `analysis/decompilers/` (`native`, `angr`, `ghidra` reported by `available_backends()`)<br>✅ Type propagation over decompiled output — `analysis/type_propagation.py`<br>✅ Decompiler parity enforced in CI instead of assumed — `.github/workflows/ci.yml` jobs `decompile-parity` and `ghidra-parity` | ⬜ **Embedded Python scripting** — no script command and no sandboxed interpreter; `session` stores annotations only |
-| **4 · Emulation** | ✅ Bounded, offline emulation that never executes on the host, with explicit `return` / `budget` / `unmapped` / `unsupported` stop reasons — `analysis/emulate.py` (Unicorn), `codevanta emulate`<br>✅ 29 emulation tests — `tests/test_emulate.py` | ⬜ **Typed / SSA IR lifting** — `ir/base.py` and `ir/adapters/` are a contract plus an empty registry ("Concrete adapters arrive in phase 4")<br>⬜ **Symbolic execution** — no `Simulator`/`SimulationManager`/Z3 usage anywhere in `src/` |
-| **5 · Platform** | ✅ CI/CD with real gates — `ci.yml` runs 7 job runs (3 Python versions × `test`, plus `type-check` (mypy), `package` (wheel smoke test), `decompile-parity`, `ghidra-parity`) and `pyproject.toml` sets `fail_under = 85` coverage<br>✅ Release pipeline — `release.yml`: `build` → `publish-pypi` (trusted publishing) → `github-release`<br>✅ Dynamic provider probing, script generation and trace replay reachable from the CLI — `analysis/dynamic.py`, `analysis/trace.py` (`parse_gdb_trace`, `parse_frida_trace`), `codevanta attach`, `codevanta trace` | ⬜ **Plugin SDK** — `plugins/__init__.py` is a single docstring line, "Plugin system — phase 5"<br>⬜ **Full AI layer** and **multi-user** — no auth, user or tenant model exists in `src/`<br>⬜ **Evidence bundle** export — `evidence/` has `models`, `provenance` and `confidence`, but no bundle writer; only the `analyze` JSON report is emitted<br>⬜ **Fuzz and benchmark gates** — `scripts/bench.py` and `tests/test_bench.py` exist, yet no CI job enforces either and there is no fuzzer<br>⬜ **Windows / macOS CI** — every job in both workflows is `runs-on: ubuntu-latest`<br>⬜ **PyPI release** — publishing is wired but has never run: `git tag -l` is empty, so no `v*` tag has been cut |
+| **4 · Emulation** | ✅ Bounded, offline emulation that never executes on the host, with explicit `return` / `budget` / `unmapped` / `unsupported` stop reasons — `analysis/emulate.py` (Unicorn), `codevanta emulate`<br>✅ 29 emulation tests — `tests/test_emulate.py` | ⬜ **Typed / SSA IR lifting** — `ir/base.py` and `ir/adapters/` are a contract plus an empty registry ("Concrete adapters arrive in phase 4")<br>⚠️ **Symbolic execution** — bounded path exploration over Unicorn exists (`analysis/symbolic.py`, seeded branches recorded as assumptions); no solver-based symbolic execution (`Simulator`/`SimulationManager`/Z3) in `src/` |
+| **5 · Platform** | ✅ CI/CD with real gates — `ci.yml` runs 7 job runs (3 Python versions × `test`, plus `type-check` (mypy), `package` (wheel smoke test), `decompile-parity`, `ghidra-parity`) and `pyproject.toml` sets `fail_under = 85` coverage<br>✅ Release pipeline — `release.yml`: `build` → `publish-pypi` (trusted publishing) → `github-release`<br>✅ Dynamic provider probing, script generation and trace replay reachable from the CLI — `analysis/dynamic.py`, `analysis/trace.py` (`parse_gdb_trace`, `parse_frida_trace`), `codevanta attach`, `codevanta trace` | ✅ **Plugin SDK** — `plugins/` (entry-point discovery, bounded `run_plugin`, built-in registry, `MetricsAnalyzer`)<br>⬜ **Full AI layer** and **multi-user** — no auth, user or tenant model exists in `src/`<br>✅ **Evidence bundle** — `analysis/evidence_bundle.py` (manifest, per-entry tamper detection) and `scripts/report_bundle.py` (report + trace → verifiable bundle)<br>✅ **Fuzz and benchmark** — `scripts/fuzz_parsers.py` (`fuzz-smoke` job) and `scripts/bench_gate.py` (`benchmark` job, informational)<br>✅ **Windows / macOS CI** — `test-platform` matrix py3.13 on windows-latest and macos-latest (non-blocking platform signal)<br>⬜ **PyPI release** — publishing is wired but has never run: `git tag -l` is empty, so no `v*` tag has been cut |
 
 ## Product principles
 

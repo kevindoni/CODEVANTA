@@ -478,6 +478,62 @@ def build_server() -> MCPServer:
     def codevanta_session_list(db: str | None = None, limit: int = 20) -> dict:
         return tools.session_list(db=db, limit=limit)
 
+    @server.tool(
+        description=(
+            "Explore the paths through a function with the unicorn branch-decision "
+            "replay. Honest limits: this is a unicorn exploration, not a symbolic "
+            "executor -- the observed side of a branch is the real emulation "
+            "result, the other side is forced by rewriting the guarding flag or "
+            "counter ('seeded') and is assumed feasible, never proven: no path "
+            "predicate, no constraint solving, no symbolic variables. Values are "
+            "concrete, x86/x86-64 only, and the optional unicorn extra is "
+            "required (pip install 'codevanta[emulation]'). The file is read and "
+            "only ever executed inside the emulator, never on the host. Seeded "
+            "directions are flagged per path and drop the summary to low "
+            "confidence; a path is evidence about one concrete run, not a "
+            "reachability proof."
+        )
+    )
+    def codevanta_symbolic(
+        path: str,
+        address: int,
+        max_paths: int = 64,
+        max_steps: int = 2000,
+    ) -> dict:
+        return tools.symbolic(
+            path,
+            address,
+            max_paths=max_paths,
+            max_steps=max_steps,
+        )
+
+    @server.tool(
+        description=(
+            "Recover definition-use chains, constants and reaching definitions "
+            "for the function at an address: one forward pass over the recursive "
+            "CFG in which register writes become definitions that kill earlier "
+            "ones and reads resolve against what is still known. Only provable "
+            "shapes fold into 'constant_registers' (immediates, rip-relative "
+            "loads, copies, add/sub/xor of two known values). Honest limits: "
+            "the pass is a linearization, not a fixpoint -- joins take the "
+            "highest-addressed predecessor -- so the summary is sound one "
+            "definition at a time, not a dataflow proof. Undefined reads are "
+            "reported in 'warnings'. The binary is read, never executed."
+        )
+    )
+    def codevanta_dataflow(
+        path: str,
+        address: int,
+        max_instructions: int = 2000,
+        max_blocks: int = 500,
+    ) -> dict:
+        return tools.dataflow(
+            path,
+            address,
+            max_instructions=max_instructions,
+            max_blocks=max_blocks,
+        )
+
     return server
 
 

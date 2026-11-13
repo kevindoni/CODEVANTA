@@ -611,6 +611,42 @@ _BODY = """
         <button type="button" data-action="callgraph">Show call map</button>
       </div>
 
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">ex</span><b>Emulate</b></div>
+        <p class="desc">Runs the function at an address on a sandboxed virtual CPU &mdash; nothing is executed on your machine &mdash; and reports where it stopped, its registers and its return value.</p>
+        <div class="tool-opts">
+          <div class="full mono">
+            <label for="emu-address">Function address</label>
+            <input id="emu-address" type="text" spellcheck="false" autocomplete="off" value="0x401000">
+          </div>
+          <div class="full">
+            <label for="emu-max" title="instruction budget for one run">Max instructions</label>
+            <input id="emu-max" type="number" min="1" max="100000" step="1" value="2000">
+          </div>
+        </div>
+        <button type="button" id="emu-run" data-action="emulate">Emulate function</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">pa</span><b>Paths</b></div>
+        <p class="desc">Explores the branch decisions of one function and lists every path it can take, with the register state each path ends in.</p>
+        <div class="tool-opts">
+          <div class="full mono">
+            <label for="sym-address">Function address</label>
+            <input id="sym-address" type="text" spellcheck="false" autocomplete="off" value="0x401000">
+          </div>
+          <div>
+            <label for="sym-max-paths" title="how many paths the explorer may report">Max paths</label>
+            <input id="sym-max-paths" type="number" min="1" max="4096" step="1" value="64">
+          </div>
+          <div>
+            <label for="sym-max-steps" title="instruction budget for the whole exploration">Max steps</label>
+            <input id="sym-max-steps" type="number" min="1" max="200000" step="1" value="2000">
+          </div>
+        </div>
+        <button type="button" id="sym-run" data-action="symbolic">Explore paths</button>
+      </div>
+
     </div>
   </section>
 
@@ -707,6 +743,8 @@ _SCRIPT = """
     callgraph: "/api/callgraph",
     diff: "/api/diff",
     decompile: "/api/decompile",
+    emulate: "/api/emulate",
+    symbolic: "/api/symbolic",
     session_save: "/api/session_save",
     session_list: "/api/session_list"
   };
@@ -806,6 +844,13 @@ _SCRIPT = """
     } else if (action === "decompile") {
       addParam(parts, "address", fieldValue("dc-address"));
       addParam(parts, "backend", fieldValue("backend") || "auto");
+    } else if (action === "emulate") {
+      addParam(parts, "address", fieldValue("emu-address"));
+      addParam(parts, "max_instructions", fieldValue("emu-max"));
+    } else if (action === "symbolic") {
+      addParam(parts, "address", fieldValue("sym-address"));
+      addParam(parts, "max_paths", fieldValue("sym-max-paths"));
+      addParam(parts, "max_steps", fieldValue("sym-max-steps"));
     }
     return parts;
   }
@@ -825,6 +870,7 @@ _SCRIPT = """
       "strings",
       "blocks",
       "fields",
+      "entries",
       "nodes",
       "sections",
       "array_groups",

@@ -189,6 +189,71 @@ Both samples execute the same hand-assembled x86_64 sequence
 | `0x24` | `c3` | `ret` | |
 | `0x25` | ... | `codevanta x64 sample\0` | ASCII payload (21 bytes) |
 
+## `gdb_trace.log` / `frida_trace.jsonl` — saved dynamic-session traces
+
+Two saved traces that `codevanta trace` can replay offline — nothing here starts
+a debugger. Both record one session against the same two functions,
+`main` @ `0x401000` and `helper` @ `0x401002`, with three hits each run
+(`main` twice, `helper` once):
+
+| File | Provider | Format | Hits |
+| --- | --- | --- | --- |
+| `gdb_trace.log` | gdb | `HIT <address> <reg>=<value> ...` lines (the generated script's x86_64 snapshot `rip rax rbx rcx rdx rsi rdi`), a `BACKTRACE` marker plus `bt` frames after each hit, wrapped in gdb's own noise (`Breakpoint N at`, `[Inferior 1 ... exited]`, `DONE 3 hits`) | 3 (2 unique addresses) |
+| `frida_trace.jsonl` | frida | one JSON message per line, `{"hit", "address", "tid", "args"}` — `tid` plus up to four `arg0..arg3` values, no stack | 3 (2 unique addresses) |
+
+Both files replay against any binary that maps `0x401000` as executable. The
+committed `samples/elf64_text.bin` does exactly that (`.text` @ `0x401000`,
+stripped, so its only candidate is the unnamed entry point):
+
+```powershell
+codevanta trace samples/elf64_text.bin --input samples/gdb_trace.log
+codevanta trace samples/elf64_text.bin --input samples/frida_trace.jsonl
+```
+
+```text
+  Trace hits by function (1)
++----------------------------+
+| Function |  Address | Hits |
+|----------+----------+------|
+| -        | 0x401000 |    3 |
++----------------------------+
+provider: gdb (auto-detected) · hits: 3 · kept: 3 · unique addresses: 2 ·
+functions hit: 1 · unattributed: 0 · truncated: no
+```
+
+`--provider auto` reads the format off the file shape, so the frida file needs no
+flag either; the frida render adds the note that runtime addresses only attribute
+when the image was not relocated. Exit code is 0 in both cases.
+
+Against the PE sample they still parse (exit 0) but nothing attributes, because
+`pe64_text.bin` only has a candidate at `0x140001000`:
+
+```powershell
+codevanta trace samples/pe64_text.bin --input samples/gdb_trace.log
+```
+
+```text
+no hit landed inside a discovered function
+provider: gdb (auto-detected) · hits: 3 · kept: 3 · unique addresses: 2 ·
+functions hit: 0 · unattributed: 3 · truncated: no
+```
+
+The named-function replay lives in `tests/test_trace_samples.py`: it assembles a
+tiny ELF64 fixture byte by byte under `tmp_path` (the same builder
+`tests/test_cli_trace.py` uses) with a symbol table naming `main` @ `0x401000`
+and `helper` @ `0x401002`, then replays both committed files through
+`parse_gdb_trace`/`parse_frida_trace` plus the real loader and the
+`codevanta trace` CLI itself:
+
+```powershell
+pytest tests/test_trace_samples.py -q    # 5 tests, asserts provider resolution,
+                                         # 3 hits per file, unattributed == 0,
+                                         # and JSON-safe to_dict() output
+```
+
+The traces are static text, not produced by `scripts/make_samples.py`, so they
+are not covered by its `--check` byte-for-byte regeneration.
+
 ## Other files in this directory
 
 * `elf32_min.bin`, `elf32_text.bin`, `elf64_min.bin`, `elf64_text.bin` — the
