@@ -8,6 +8,19 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- Vtable discovery and thunk resolution (`codevanta.analysis.vtables` +
+  `codevanta vtable` + MCP tool `codevanta_vtable`): indirect cross-references
+  the xref scanner cannot see. Candidates are runs of consecutive code
+  pointers in non-executable data sections (`vtable.candidate` /
+  `vtable.slot_ref`, medium confidence — a run of code pointers is a
+  heuristic, not proof); PIE builds work because pointer slots that are zero
+  on disk are filled through a dynamic-relocation overlay. Slot targets that
+  are one-instruction tail-call thunks resolve to the final callee
+  (`resolved_target` + `vtable.thunk_chain`). Address mode decodes one
+  candidate at an exact address, skipping up to two leading Itanium-header
+  slots (offset-to-top, RTTI); `--scan` sweeps every data section.
+  `samples/shapes-vtable` (8.4 KB aarch64 ELF, two C++ classes built with the
+  NDK's clang++) backs the tests.
 - DWARF debug-info extraction (`codevanta.analysis.debuginfo` + `codevanta
   dwarf` + MCP tool `codevanta_dwarf`): when a build kept its debug info, the
   strongest symbol evidence available is now first-class — producer-grade

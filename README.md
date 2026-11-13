@@ -380,6 +380,15 @@ and fails with a typed message naming the extra when it is missing.
 PDB (PE) stays open: the LIEF OSS build gates its PDB parser behind the
 Extended distribution.
 
+`codevanta vtable` recovers indirect cross-references the xref scanner cannot
+see: C++ vtable candidates — runs of consecutive code pointers in data
+sections (PIE slots are filled via dynamic-relocation overlay, so virtualized
+builds work) — and thunk chains, where a slot target is a one-instruction
+tail-call that forwards to the real override (`resolved_target`). Every
+candidate and slot carries `vtable.candidate` / `vtable.slot_ref` /
+`vtable.thunk_chain` evidence at **medium** confidence: a run of code pointers
+is a heuristic, not proof.
+
 Phase 3 adds the two commands that read a function instead of a file:
 `codevanta decompile` renders one function as pseudo-C and `codevanta emulate`
 computes what it returns. Decompilation is `low` confidence by design — control
@@ -442,12 +451,13 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools (eighteen): `codevanta_info`, `codevanta_functions`,
+MCP tools (nineteen): `codevanta_info`, `codevanta_functions`,
 `codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
 `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
 `codevanta_jump_table`, `codevanta_function_hash`, `codevanta_similarity`,
 `codevanta_struct`, `codevanta_entropy`, `codevanta_decompile`,
-`codevanta_dwarf`, `codevanta_session_save`, `codevanta_session_list`.
+`codevanta_dwarf`, `codevanta_vtable`, `codevanta_session_save`,
+`codevanta_session_list`.
 `codevanta_analyze` mirrors
 the CLI flags (`include_xrefs` / `include_cfg` / `include_callgraph`, default off)
 so a single call can carry the phase 2 sections when an agent prefers one payload.

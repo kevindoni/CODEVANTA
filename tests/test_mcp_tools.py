@@ -63,7 +63,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
     assert report["disassembly"]["instruction_count"] == 3
 
 
-def test_server_lists_eighteen_tools() -> None:
+def test_server_lists_nineteen_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
     assert names == [
@@ -84,6 +84,7 @@ def test_server_lists_eighteen_tools() -> None:
         "codevanta_similarity",
         "codevanta_strings",
         "codevanta_struct",
+        "codevanta_vtable",
         "codevanta_xrefs",
     ]
 
