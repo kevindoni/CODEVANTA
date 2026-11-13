@@ -37,6 +37,7 @@ from codevanta.analysis.callgraph import (
     build_call_graph,
 )
 from codevanta.analysis.cfg import FunctionCFG, build_cfg, build_recursive_cfg
+from codevanta.analysis.debuginfo import extract_debug_info
 from codevanta.analysis.decompile import (
     DEFAULT_MAX_BLOCKS as DECOMPILE_MAX_BLOCKS,
 )
@@ -245,6 +246,56 @@ def entropy(
             "[dim]high entropy suggests packing or compression — a heuristic, "
             "not proof; check imports and entry-point stubs before concluding.[/]"
         )
+
+
+@app.command()
+def dwarf(
+    path: Annotated[Path, typer.Argument(help="Path to an ELF binary with DWARF debug info")],
+    limit: Annotated[
+        int, typer.Option(help="Maximum functions and types displayed")
+    ] = 500,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of tables")
+    ] = False,
+) -> None:
+    """Extract function names, extents and type layouts from DWARF debug info."""
+    loaded = _load(path)
+    try:
+        result = extract_debug_info(path, loaded, limit=limit)
+    except AnalysisError as exc:
+        _fail(str(exc), 4)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    functions_table = Table(title="DWARF functions (producer metadata)")
+    functions_table.add_column("Address", justify="right")
+    functions_table.add_column("Size", justify="right")
+    functions_table.add_column("Name")
+    functions_table.add_column("Linkage name")
+    functions_table.add_column("External")
+    for function in result.functions:
+        functions_table.add_row(
+            f"0x{function.address:x}",
+            str(function.size),
+            escape(function.name),
+            escape(function.linkage_name or "-"),
+            "yes" if function.is_external else "-",
+        )
+    console.print(functions_table)
+    if result.types:
+        types_table = Table(title="Named types")
+        types_table.add_column("Kind")
+        types_table.add_column("Name")
+        types_table.add_column("Byte size", justify="right")
+        for debug_type in result.types:
+            types_table.add_row(
+                debug_type.kind,
+                escape(debug_type.name),
+                str(debug_type.byte_size),
+            )
+        console.print(types_table)
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
 
 
 @app.command()

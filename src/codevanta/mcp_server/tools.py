@@ -16,6 +16,9 @@ from codevanta.analysis.binary_diff import (
 from codevanta.analysis.callgraph import MAX_LIMIT as MAX_CALLGRAPH_LIMIT
 from codevanta.analysis.callgraph import build_call_graph
 from codevanta.analysis.cfg import build_cfg
+from codevanta.analysis.debuginfo import DEFAULT_LIMIT as DEFAULT_DWARF_LIMIT
+from codevanta.analysis.debuginfo import MAX_LIMIT as MAX_DWARF_LIMIT
+from codevanta.analysis.debuginfo import extract_debug_info
 from codevanta.analysis.decompile import (
     DEFAULT_MAX_BLOCKS as DEFAULT_DECOMPILE_MAX_BLOCKS,
 )
@@ -798,6 +801,18 @@ def similarity(
         max_instructions=limit,
     )
     return comparison.to_dict()
+
+
+def dwarf(
+    path: str,
+    limit: int = DEFAULT_DWARF_LIMIT,
+) -> dict[str, Any]:
+    """Extract DWARF debug-info functions and named types with evidence."""
+    if limit < 1 or limit > MAX_DWARF_LIMIT:
+        raise AnalysisError(f"limit must be between 1 and {MAX_DWARF_LIMIT}")
+    target = _validate_path(path)
+    info = load_binary(target)
+    return extract_debug_info(target, info, limit=limit).to_dict()
 
 
 def struct(

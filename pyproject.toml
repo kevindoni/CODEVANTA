@@ -49,9 +49,15 @@ dev = [
   "ruff>=0.5",
   "build>=1.2",
   "unicorn>=2.0",
+  "pyelftools>=0.31",
 ]
 emulation = [
   "unicorn>=2.0",
+]
+# DWARF debug-info extraction (ELF). Pure-Python and tiny, so it ships in
+# `dev`; `pip install -e ".[dwarf]"` enables `codevanta dwarf` standalone.
+dwarf = [
+  "pyelftools>=0.31",
 ]
 # Real decompiler providers. Deliberately NOT part of `dev`: angr is heavy, so only
 # the `decompile-parity` CI job installs it. `pip install -e ".[decompilers]"` is

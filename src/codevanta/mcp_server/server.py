@@ -394,6 +394,16 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Extract DWARF debug-info functions and named type layouts from an ELF "
+            "with producer metadata (highest-grade symbol evidence). Requires the "
+            "optional pyelftools extra: pip install -e \".[dwarf]\"."
+        )
+    )
+    def codevanta_dwarf(path: str, limit: int = 500) -> dict:
+        return tools.dwarf(path, limit=limit)
+
+    @server.tool(
+        description=(
             "Analyze a binary and persist its fingerprint, function count, and "
             "string count as a new session in the local SQLite session database."
         )

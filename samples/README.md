@@ -129,6 +129,26 @@ codevanta functions samples/hello.dex
 codevanta strings samples/hello.dex --min-length 6
 ```
 
+## `hello-dwarf` — ELF aarch64 with DWARF debug info
+
+A 7 752-byte aarch64 PIE executable built with the Android NDK's clang
+(`-g -O0`) from a three-function `main.c` (`compute`, `scale_and_shift`,
+`main`) with a `struct point`. It is the fixture for `codevanta dwarf`:
+producer-grade symbol evidence with byte-exact extents and named type
+layouts, only available when a build keeps its debug info.
+
+| Property | Value |
+| --- | --- |
+| Format | ELF64, aarch64, little-endian, PIE, **not stripped** |
+| DWARF functions | `compute` @ `0x708` (64 B, external), `scale_and_shift` @ `0x748` (52 B), `main` @ `0x77c` (64 B, external) |
+| Named types | `struct point` — 8 bytes |
+| Size | 7 752 bytes |
+
+```powershell
+codevanta dwarf samples/hello-dwarf
+codevanta dwarf samples/hello-dwarf --json
+```
+
 ## Shared code body
 
 Both samples execute the same hand-assembled x86_64 sequence
