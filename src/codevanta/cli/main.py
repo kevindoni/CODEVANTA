@@ -120,6 +120,7 @@ from codevanta.analysis.type_recovery import (
 )
 from codevanta.analysis.vtables import find_vtables
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
+from codevanta.cli.web import asar, web_app
 from codevanta.core.disassembler import DisassemblyError
 from codevanta.core.entropy import analyze_entropy
 from codevanta.core.functions import discover_functions
@@ -2642,6 +2643,8 @@ def dataflow(
 
 plugins_app = typer.Typer(help="Analysis plugin commands")
 app.add_typer(plugins_app, name="plugins")
+app.add_typer(web_app, name="web")
+app.command("asar", help="List an Electron ASAR archive; optionally extract one entry")(asar)
 
 
 @plugins_app.command("list")

@@ -131,6 +131,7 @@ from codevanta.core.unknowns import (
     records_to_payload,
     resolve_unknowns,
 )
+from codevanta.mcp_server.ext_web import codevanta_asar, codevanta_web_inspect  # noqa: F401 - registration of the ext_web MCP tools
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore
 
