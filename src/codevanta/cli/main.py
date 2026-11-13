@@ -120,6 +120,9 @@ from codevanta.analysis.type_recovery import (
 )
 from codevanta.analysis.vtables import find_vtables
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
+from codevanta.cli.containers import app as containers_app
+from codevanta.cli.crash import app as crash_app
+from codevanta.cli.mobile import app as mobile_app
 from codevanta.core.disassembler import DisassemblyError
 from codevanta.core.entropy import analyze_entropy
 from codevanta.core.functions import discover_functions
@@ -2642,6 +2645,9 @@ def dataflow(
 
 plugins_app = typer.Typer(help="Analysis plugin commands")
 app.add_typer(plugins_app, name="plugins")
+app.add_typer(containers_app)
+app.add_typer(crash_app, name="crash")
+app.add_typer(mobile_app, name="mobile")
 
 
 @plugins_app.command("list")
