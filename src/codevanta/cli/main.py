@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from codevanta.analysis import dynamic
+from codevanta.analysis import debug_session, dynamic
 from codevanta.analysis import emulate as emulator
 from codevanta.analysis.binary_diff import (
     DEFAULT_MAX_FUNCTIONS as DIFF_MAX_FUNCTIONS,
@@ -2224,6 +2224,184 @@ def attach(
             "[dim]nothing was written: save the text above under that file name in the "
             "working directory, or pass --write DIR, before running the command[/]"
         )
+
+
+# ---- phase 8 item 1: live debug session --------------------------------------
+
+
+#: Actions ``codevanta debug`` performs at the stop, mirroring
+#: :data:`codevanta.analysis.debug_session.DEBUG_ACTIONS`.
+DebugAction = Literal[
+    "registers", "memory", "backtrace", "continue", "step", "next", "quit"
+]
+
+
+def _print_debug_break(break_payload: dict) -> None:
+    """Render the breakpoint entry plus the stop it produced."""
+    info = break_payload
+    breakpoint_info = info.get("breakpoint") or info
+    location = (
+        breakpoint_info.get("function") or breakpoint_info.get("address") or "pending"
+    )
+    console.print(
+        f"[green]breakpoint {breakpoint_info.get('number')}[/] at {escape(str(location))}"
+        + (" [yellow](pending)[/]" if breakpoint_info.get("pending") else "")
+    )
+    run = info.get("run") or {}
+    stop = run.get("stop") or {}
+    address = stop.get("address")
+    rendered = f"0x{int(address, 16):x}" if isinstance(address, str) else "-"
+    console.print(
+        f"[dim]stopped: {escape(str(stop.get('reason', 'unknown')))} at {rendered}"
+        f" · function: {escape(str(stop.get('function') or '-'))}[/]"
+    )
+    for warning in run.get("warnings", []):
+        console.print(f"[yellow]warning:[/] {escape(str(warning))}")
+
+
+def _print_debug_result(action: str, result: dict | None) -> None:
+    """Render one debug action result as a table (or a line when there is none)."""
+    if result is None:
+        console.print(f"[dim]action {escape(action)}: nothing to report (launch/quit only)[/]")
+        return
+    if action == "registers":
+        table = Table(title=escape(f"Registers ({result.get('count', 0)})"))
+        table.add_column("#", justify="right")
+        table.add_column("Register")
+        table.add_column("Value", justify="right")
+        for register in result.get("registers", []):
+            table.add_row(
+                str(register.get("number", "-")),
+                escape(str(register.get("name", "-"))),
+                escape(str(register.get("value")) if register.get("value") is not None else "-"),
+            )
+        console.print(table)
+        if result.get("truncated"):
+            console.print("[yellow]register list was truncated[/]")
+    elif action == "backtrace":
+        frames = result.get("frames", [])
+        table = Table(title=escape(f"Backtrace ({len(frames)})"))
+        table.add_column("Level", justify="right")
+        table.add_column("Address", justify="right")
+        table.add_column("Function")
+        table.add_column("Source")
+        for frame in frames:
+            table.add_row(
+                str(frame.get("level")) if frame.get("level") is not None else "-",
+                str(frame.get("address") or "-"),
+                escape(str(frame.get("function") or "-")),
+                escape(str(frame.get("source") or "-")),
+            )
+        console.print(table)
+        if result.get("truncated"):
+            console.print("[yellow]backtrace was truncated at the requested frame budget[/]")
+    elif action == "memory":
+        console.print(
+            f"[bold]memory at {escape(str(result.get('address')))}[/]: "
+            f"{result.get('length')} of the requested {result.get('requested_length')} byte(s)"
+        )
+        contents = str(result.get("contents_hex", ""))
+        for offset in range(0, len(contents), 64):
+            console.print(f"  {contents[offset : offset + 64]}", markup=False, soft_wrap=True)
+        if result.get("short_read"):
+            console.print("[yellow]short read: fewer bytes came back than requested[/]")
+    else:
+        stop = result.get("stop", {})
+        address = stop.get("address")
+        rendered = f"0x{int(address, 16):x}" if isinstance(address, str) else "-"
+        console.print(
+            f"[bold]stopped:[/] {escape(str(stop.get('reason', 'unknown')))} at {rendered}"
+            f" · function: {escape(str(stop.get('function') or '-'))}"
+        )
+    for warning in result.get("warnings", []):
+        console.print(f"[yellow]warning:[/] {escape(str(warning))}")
+    evidence = result.get("evidence") or {}
+    console.print(
+        f"[dim]evidence: {escape(str(evidence.get('source')))} via "
+        f"{escape(str(evidence.get('method')))} · confidence: "
+        f"{escape(str(evidence.get('confidence')))}[/]"
+    )
+
+
+@app.command()
+def debug(
+    target: Annotated[Path, typer.Argument(help="Path to the program gdb will load")],
+    break_at: Annotated[
+        str | None,
+        typer.Option(
+            "--break-at",
+            help="Break here first: a function name or an address (0x401000); the target is run to it",
+        ),
+    ] = None,
+    action: Annotated[
+        DebugAction, typer.Option("--action", help="What to do at the stop")
+    ] = "registers",
+    address: Annotated[
+        str | None,
+        typer.Option(
+            "--address", help="Virtual address the 'memory' action reads (decimal or 0x hex)"
+        ),
+    ] = None,
+    length: Annotated[
+        int, typer.Option("--length", help="Bytes the 'memory' action reads")
+    ] = 64,
+    max_frames: Annotated[
+        int, typer.Option("--max-frames", help="Frame budget for the 'backtrace' action")
+    ] = 20,
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="Per-command wall-clock budget in seconds")
+    ] = debug_session.DEFAULT_TIMEOUT,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the session payloads instead of a table")
+    ] = False,
+) -> None:
+    """Run one LIVE gdb debug session: launch, break, inspect, verified exit.
+
+    Unlike every other CODEVANTA command, this one executes the target -- inside
+    a gdb machine-interface session this command owns. gdb is launched on TARGET
+    (``--interpreter=mi2``), an optional ``--break-at`` location is inserted and
+    the target is run to it, then ``--action`` is performed at the stop:
+    ``registers`` (default), ``memory`` (needs ``--address`` and ``--length``),
+    ``backtrace`` (bounded by ``--max-frames``), ``continue``, ``step``, ``next``
+    or ``quit`` (launch and shut down only, the session smoke test). The
+    debugger is always shut down again and the exit is verified.
+
+    Every command runs under the ``--timeout`` budget; a session that misses it
+    exits 2 saying so. A machine without gdb on PATH also exits 2 with the
+    install hint -- never a traceback. Each result carries an ``evidence`` line
+    naming the MI command that produced it: these are observations of one run,
+    not static properties of the binary. ``--json`` prints the raw payloads.
+    """
+    parsed_address: int | None = None
+    if address is not None:
+        parsed_address = _parse_address(address, label="--address")
+    try:
+        payload = debug_session.run_debug(
+            target,
+            action=action,
+            break_at=break_at,
+            address=parsed_address,
+            length=length,
+            max_frames=max_frames,
+            timeout=timeout,
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(payload))
+        return
+    status = debug_session.gdb_status()
+    if payload.get("break") is not None:
+        _print_debug_break(payload["break"])
+    _print_debug_result(str(payload.get("action")), payload.get("result"))
+    quit_payload = payload.get("quit") or {}
+    verdict = "verified" if quit_payload.get("clean") else "FORCED"
+    console.print(
+        f"[dim]gdb session closed ({verdict}, exit code {quit_payload.get('exit_code')}) "
+        f"· availability: {escape(status['reason'])}[/]"
+    )
+    for warning in quit_payload.get("warnings", []):
+        console.print(f"[yellow]warning:[/] {escape(str(warning))}")
 
 
 # ---- phase 7: path exploration and data flow --------------------------------

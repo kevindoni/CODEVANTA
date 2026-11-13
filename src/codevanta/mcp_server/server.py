@@ -48,7 +48,9 @@ HttpTransport = Literal["sse", "streamable-http"]
 
 INSTRUCTIONS = (
     "CODEVANTA performs static analysis of PE and ELF binaries and never executes "
-    "targets. Every result carries evidence: check 'source', 'method', and "
+    "targets, with exactly one exception: the codevanta_debug tool runs a live gdb "
+    "session and executes the target inside it, on the analyst's explicit request. "
+    "Every result carries evidence: check 'source', 'method', and "
     "'confidence' before relying on a finding. Exports and function symbols are "
     "high confidence; the entry point is a medium-confidence code candidate, not a "
     "proven function boundary. All addresses are absolute virtual addresses (VA)."
@@ -421,6 +423,46 @@ def build_server() -> MCPServer:
             # provider mismatch or a bad max_hits is the caller's to fix, but the
             # framework would otherwise replace the reason with a generic
             # "Error executing tool" message that hides which argument failed.
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Run one LIVE gdb debug session: launch a target under "
+            "gdb --interpreter=mi2 (this tool executes the target in a debugger "
+            "it owns - the one exception to CODEVANTA's read-only rule), insert an "
+            "optional breakpoint (function name or 0x address), perform one action "
+            "at the stop (registers / memory at an address / backtrace / continue / "
+            "step / next / quit), then shut the debugger down and verify the exit. "
+            "Requires gdb on PATH; a machine without it gets a typed error naming "
+            "the install step, never a traceback. Every result carries an "
+            "'evidence' record naming the MI command that produced it and is "
+            "evidence of one run, not a static property of the binary."
+        )
+    )
+    def codevanta_debug(
+        path: str,
+        action: Literal[
+            "registers", "memory", "backtrace", "continue", "step", "next", "quit"
+        ] = "registers",
+        break_at: str | None = None,
+        address: int | None = None,
+        length: int = 64,
+        max_frames: int = 20,
+    ) -> dict:
+        try:
+            return tools.debug(
+                path,
+                action,
+                break_at=break_at,
+                address=address,
+                length=length,
+                max_frames=max_frames,
+            )
+        except AnalysisError as exc:
+            # A missing gdb, a bad action/argument combination or an MI refusal
+            # is caller-correctable, but the framework would otherwise replace
+            # the reason with a generic "Error executing tool" message that
+            # hides which argument failed.
             raise ToolError(str(exc)) from exc
 
     @server.tool(

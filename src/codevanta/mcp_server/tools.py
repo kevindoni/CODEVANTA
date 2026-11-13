@@ -30,6 +30,10 @@ from codevanta.analysis.dataflow import (
     MAX_MAX_INSTRUCTIONS as MAX_DATAFLOW_MAX_INSTRUCTIONS,
 )
 from codevanta.analysis.dataflow import analyze_dataflow
+from codevanta.analysis.debug_session import (
+    DEBUG_ACTIONS,
+    run_debug,
+)
 from codevanta.analysis.debuginfo import DEFAULT_LIMIT as DEFAULT_DWARF_LIMIT
 from codevanta.analysis.debuginfo import MAX_LIMIT as MAX_DWARF_LIMIT
 from codevanta.analysis.debuginfo import extract_debug_info
@@ -1201,6 +1205,66 @@ def trace(
     payload["trace_path"] = str(source)
     payload["provider_resolved"] = resolved
     return payload
+
+
+def debug(
+    path: str,
+    action: str = "registers",
+    break_at: str | None = None,
+    address: int | None = None,
+    length: int = 64,
+    max_frames: int = 20,
+    transport: Any = None,
+) -> dict[str, Any]:
+    """Run one live gdb debug session: launch the target, act, verified exit.
+
+    Unlike every other tool here, this one *executes* something: it owns a
+    ``gdb --interpreter=mi2`` process for the duration of the call, inserting
+    an optional breakpoint (``break_at`` names a function or an address), running
+    the target to it, performing ``action`` at the stop, then shutting the
+    debugger down and verifying it exited. gdb missing is a typed error, never
+    an ImportError: the error names what to install.
+
+    Actions: ``registers`` (default; the register file at the stop),
+    ``memory`` (needs ``address``, reads ``length`` bytes, capped at
+    MAX_MEMORY_BYTES), ``backtrace`` (capped at MAX_BACKTRACE_FRAMES frames),
+    ``continue``, ``step``, ``next`` and ``quit`` (launch, optionally break,
+    exit). Every payload carries an ``evidence`` record naming the MI command
+    that produced it; everything is evidence of one run, not a static
+    property of the binary.
+
+    Args:
+        path: Program for gdb to load.
+        action: One of :data:`DEBUG_ACTIONS`.
+        break_at: Optional function name or ``0x``-address to break at first.
+        address: Virtual address for the ``memory`` action.
+        length: Bytes the ``memory`` action reads (1 .. MAX_MEMORY_BYTES).
+        max_frames: Backtrace budget (1 .. MAX_BACKTRACE_FRAMES).
+        transport: Injectable MI transport (tests); ``None`` launches gdb.
+
+    Returns:
+        ``target``, ``break`` (breakpoint plus the stop it produced, when
+        requested), ``action``, ``result`` and the verified ``quit`` payload.
+
+    Raises:
+        AnalysisError: An unknown action, an action/argument mismatch, an
+            out-of-range length or frame budget, a missing gdb executable, or
+            any MI-level refusal (each names the offending input).
+    """
+    if action not in DEBUG_ACTIONS:
+        raise AnalysisError(f"action must be one of {', '.join(DEBUG_ACTIONS)}, got {action!r}")
+    target = _validate_path(path)
+    if break_at is not None and (not isinstance(break_at, str) or not break_at.strip()):
+        raise AnalysisError(f"break_at must be a function name or an address, got {break_at!r}")
+    return run_debug(
+        target,
+        action=action,
+        break_at=break_at,
+        address=address,
+        length=length,
+        max_frames=max_frames,
+        transport=transport,
+    )
 
 
 def session_save(
