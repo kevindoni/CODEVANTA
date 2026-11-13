@@ -120,6 +120,7 @@ from codevanta.analysis.type_recovery import (
 )
 from codevanta.analysis.vtables import find_vtables
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
+from codevanta.cli.meta import meta_app
 from codevanta.core.disassembler import DisassemblyError
 from codevanta.core.entropy import analyze_entropy
 from codevanta.core.functions import discover_functions
@@ -3060,6 +3061,7 @@ def uninstall(
 
 session_app = typer.Typer(help="Persisted analysis sessions (SQLite)")
 app.add_typer(session_app, name="session")
+app.add_typer(meta_app, name="metadata")
 
 
 @session_app.command("save")

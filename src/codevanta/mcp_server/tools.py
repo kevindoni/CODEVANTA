@@ -131,6 +131,9 @@ from codevanta.core.unknowns import (
     records_to_payload,
     resolve_unknowns,
 )
+from codevanta.mcp_server.ext_meta import (
+    codevanta_metadata as codevanta_metadata,  # lane-meta: ONE MCP registration line
+)
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore
 
