@@ -4,6 +4,25 @@ All notable changes to CODEVANTA are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-11-13
+
+### Added
+
+- **Live gdb debug sessions** (`codevanta.analysis.debug_session` + `codevanta debug`
+  + MCP tool `codevanta_debug`): the layer now owns a real `gdb --interpreter=mi2`
+  process - launch, break-at (symbol or address), continue, step/next, register
+  reads, bounded memory reads, backtrace frames, verified quit - each result typed,
+  JSON-safe and evidence-backed (`gdb.mi2`, HIGH, one-run provenance). A missing gdb
+  is a typed `AnalysisError` with an install hint, never a traceback.
+- MCP tool count is now 23; the MCP `INSTRUCTIONS` document `debug` as the one
+  explicit execution exception.
+
+### Changed
+
+- README is fully de-hardcoded: real screenshots of the CLI, the loopback dashboard
+  and a 97-node call graph export; installation starts from PyPI; volatile counts
+  and Windows-only example paths removed; docs describe the actual CI gates.
+
 ## [Unreleased]
 
 ### Added
