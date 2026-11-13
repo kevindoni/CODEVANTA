@@ -138,6 +138,12 @@ from codevanta.mcp_server.ext_meta import (
     codevanta_metadata as codevanta_metadata,  # lane-meta: ONE MCP registration line
 )
 from codevanta.mcp_server.ext_mobile import codevanta_adb as codevanta_adb
+from codevanta.mcp_server.ext_nav import codevanta_nav, codevanta_nav_providers  # noqa: F401 -- registration of the ext_nav MCP tools
+from codevanta.mcp_server.ext_signal import (  # lane-signal: ONE MCP registration line
+    codevanta_dtb,  # noqa: F401
+    codevanta_signal_sr,  # noqa: F401
+    codevanta_uart_decode,  # noqa: F401
+)
 from codevanta.mcp_server.ext_solver import codevanta_symbolic_solve  # noqa: F401 -- one-line registration of the ext solver MCP tool
 from codevanta.mcp_server.ext_web import codevanta_asar, codevanta_web_inspect  # noqa: F401 - registration of the ext_web MCP tools
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
