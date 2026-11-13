@@ -8,6 +8,18 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- DWARF debug-info extraction (`codevanta.analysis.debuginfo` + `codevanta
+  dwarf` + MCP tool `codevanta_dwarf`): when a build kept its debug info, the
+  strongest symbol evidence available is now first-class — producer-grade
+  function names with byte-exact extents (`dwarf.debug_info` /
+  `DIE_subprogram`, high confidence) and named type layouts (structs, unions,
+  enums, classes) with byte sizes. ELF only via the optional pyelftools extra
+  (`pip install -e ".[dwarf]"`, included in `dev`); missing extra and
+  non-ELF inputs fail with typed messages naming the limitation. PDB (PE)
+  stays open: the LIEF OSS build gates its PDB parser behind the Extended
+  distribution, so there is no OSS backend to wrap yet.
+  `samples/hello-dwarf` (7.7 KB aarch64 ELF built with the NDK's clang `-g`)
+  backs the test suite.
 - DEX loader (`codevanta.core.loader`): Android DEX containers (magic
   `dex\n`) now load through LIEF's dedicated DEX parser with format, version
   endianness, and Dalvik method extraction. Defined methods become

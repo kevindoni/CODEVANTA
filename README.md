@@ -371,6 +371,15 @@ counted in `indirect_skipped`, which `codevanta xrefs --json` prints.
 functions and 5000 edges, and marks it `truncated` when a cap cuts it short.
 The `xrefs` and `cfg` sections use the same opt-in shape (`--xrefs`, `--cfg`).
 
+`codevanta dwarf` reads DWARF debug info that a build kept: producer-grade
+function names with byte-exact extents plus named type layouts (structs,
+unions, enums, classes) with byte sizes — the strongest symbol evidence a
+binary can carry (`dwarf.debug_info`, high confidence). ELF only; needs the
+optional `pyelftools` extra (`pip install -e ".[dwarf]"`, already in `dev`),
+and fails with a typed message naming the extra when it is missing.
+PDB (PE) stays open: the LIEF OSS build gates its PDB parser behind the
+Extended distribution.
+
 Phase 3 adds the two commands that read a function instead of a file:
 `codevanta decompile` renders one function as pseudo-C and `codevanta emulate`
 computes what it returns. Decompilation is `low` confidence by design — control
@@ -433,12 +442,13 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools (sixteen): `codevanta_info`, `codevanta_functions`,
+MCP tools (eighteen): `codevanta_info`, `codevanta_functions`,
 `codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
 `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
 `codevanta_jump_table`, `codevanta_function_hash`, `codevanta_similarity`,
 `codevanta_struct`, `codevanta_entropy`, `codevanta_decompile`,
-`codevanta_session_save`, `codevanta_session_list`. `codevanta_analyze` mirrors
+`codevanta_dwarf`, `codevanta_session_save`, `codevanta_session_list`.
+`codevanta_analyze` mirrors
 the CLI flags (`include_xrefs` / `include_cfg` / `include_callgraph`, default off)
 so a single call can carry the phase 2 sections when an agent prefers one payload.
 
