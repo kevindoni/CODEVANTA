@@ -138,6 +138,7 @@ from codevanta.mcp_server.ext_meta import (
     codevanta_metadata as codevanta_metadata,  # lane-meta: ONE MCP registration line
 )
 from codevanta.mcp_server.ext_mobile import codevanta_adb as codevanta_adb
+from codevanta.mcp_server.ext_web import codevanta_asar, codevanta_web_inspect  # noqa: F401 - registration of the ext_web MCP tools
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore
 

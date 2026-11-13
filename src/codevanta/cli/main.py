@@ -124,6 +124,7 @@ from codevanta.cli.containers import app as containers_app
 from codevanta.cli.crash import app as crash_app
 from codevanta.cli.meta import meta_app
 from codevanta.cli.mobile import app as mobile_app
+from codevanta.cli.web import asar, web_app
 from codevanta.core.disassembler import DisassemblyError
 from codevanta.core.entropy import analyze_entropy
 from codevanta.core.functions import discover_functions
@@ -2649,6 +2650,8 @@ app.add_typer(plugins_app, name="plugins")
 app.add_typer(containers_app)
 app.add_typer(crash_app, name="crash")
 app.add_typer(mobile_app, name="mobile")
+app.add_typer(web_app, name="web")
+app.command("asar", help="List an Electron ASAR archive; optionally extract one entry")(asar)
 
 
 @plugins_app.command("list")
