@@ -16,6 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from codevanta.analysis import dynamic
 from codevanta.analysis import emulate as emulator
 from codevanta.analysis.binary_diff import (
     DEFAULT_MAX_FUNCTIONS as DIFF_MAX_FUNCTIONS,
@@ -67,6 +68,7 @@ from codevanta.analysis.jump_tables import (
     JumpTableResult,
     resolve_jump_table,
 )
+from codevanta.analysis.trace import TraceReport, parse_frida_trace, parse_gdb_trace
 from codevanta.analysis.type_recovery import (
     DEFAULT_MAX_FIELDS as STRUCT_MAX_FIELDS,
 )
@@ -1959,6 +1961,249 @@ def callgraph(
     )
     for warning in graph.warnings:
         console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+# --------------------------------------------------------------------------- #
+# Dynamic sessions: replay a saved trace, generate an attach script
+# --------------------------------------------------------------------------- #
+
+#: Providers ``codevanta trace`` accepts; ``auto`` reads the provider off the file.
+TraceProvider = Literal["gdb", "frida", "auto"]
+
+#: Providers ``codevanta attach`` generates a session script for.
+AttachProvider = Literal["gdb", "frida"]
+
+#: Lines ``--provider auto`` reads before it gives up on detecting the provider.
+_DETECT_LINES = 200
+
+#: First-line markers the generated gdb script prints, in the order they appear.
+_GDB_TRACE_MARKERS = ("HIT ", "BACKTRACE", "LIMIT ", "DONE ")
+
+
+def _detect_trace_provider(text: str) -> str | None:
+    """Return which provider wrote ``text``, or ``None`` when nothing matches.
+
+    Detection reads the file shape, not a flag: a line that parses as a JSON
+    object is one of the messages the Frida hook sends, and a line opening with
+    ``HIT``/``BACKTRACE``/``LIMIT``/``DONE`` is one the gdb script prints. Only
+    the first :data:`_DETECT_LINES` non-blank lines are inspected, so a large
+    trace costs no more than a small one, and an unrecognisable file returns
+    ``None`` instead of being guessed onto whichever provider has more markers.
+    """
+    for line in text.splitlines()[:_DETECT_LINES]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            try:
+                message = json.loads(stripped)
+            except ValueError:
+                continue
+            if isinstance(message, dict):
+                return "frida"
+            continue
+        if stripped.startswith(_GDB_TRACE_MARKERS):
+            return "gdb"
+    return None
+
+
+def _print_trace_report(report: TraceReport, *, auto_detected: bool) -> None:
+    """Render a parsed trace as a per-function table, its totals and its warnings."""
+    names: dict[int, str] = {}
+    for hit in report.hits:
+        if hit.function is not None:
+            names.setdefault(hit.function, hit.function_name or "-")
+    unattributed = sum(1 for hit in report.hits if hit.function is None)
+    provider = f"{report.provider} (auto-detected)" if auto_detected else report.provider
+    if report.function_coverage:
+        table = Table(title=f"Trace hits by function ({len(report.function_coverage)})")
+        table.add_column("Function")
+        table.add_column("Address", justify="right")
+        table.add_column("Hits", justify="right")
+        for address, count in sorted(report.function_coverage.items()):
+            table.add_row(escape(names.get(address, "-")), f"0x{address:x}", str(count))
+        console.print(table)
+    else:
+        console.print("[yellow]no hit landed inside a discovered function[/]")
+    console.print(
+        f"[dim]provider: {escape(provider)} · hits: {report.total_hits}"
+        f" · kept: {len(report.hits)} · unique addresses: {len(report.unique_addresses)}"
+        f" · functions hit: {len(report.function_coverage)} · unattributed: {unattributed}"
+        f" · truncated: {'yes' if report.truncated else 'no'}[/]"
+    )
+    if report.provider == "frida":
+        console.print(
+            "[dim]frida reports runtime addresses, so a hit is attributed to a function "
+            "only when the image was not relocated[/]"
+        )
+    for warning in report.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+
+
+@app.command()
+def trace(
+    path: Annotated[Path, typer.Argument(help="Path to the binary the session ran against")],
+    trace_file: Annotated[
+        Path,
+        typer.Option(
+            "--input", help="Saved session trace to parse (gdb output or frida JSON lines)"
+        ),
+    ],
+    provider: Annotated[
+        TraceProvider,
+        typer.Option(
+            "--provider", help="Trace format: gdb, frida, or auto to detect it from the file"
+        ),
+    ] = "auto",
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit TraceReport.to_dict() instead of a table")
+    ] = False,
+) -> None:
+    """Replay a saved session trace and map its hits onto function candidates.
+
+    Nothing here starts a debugger: ``--input`` is what a generated session
+    script already printed, so a run can be re-read offline as often as needed.
+    ``--provider auto`` reads the provider off the file shape -- a JSON object
+    line is a Frida message, a ``HIT``/``BACKTRACE``/``LIMIT``/``DONE`` line is
+    gdb -- and the render states which one it used; a file it cannot place exits
+    2 instead of being guessed onto a provider.
+
+    The table has one row per function that was hit: its name (``-`` when the
+    candidate is unnamed), its start address, and how many hits landed inside it.
+    The dim line under the table carries the totals -- hits seen, hits kept,
+    unique addresses, functions hit, hits that fell outside every candidate, and
+    whether the parse was cut -- and every dropped or malformed line keeps its
+    own ``warning:`` line. ``--json`` prints ``TraceReport.to_dict()`` unchanged.
+    """
+    try:
+        text = trace_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        _fail(f"cannot read {trace_file}: {exc}", 2)
+    auto_detected = provider == "auto"
+    chosen = _detect_trace_provider(text) if auto_detected else provider
+    if chosen is None:
+        _fail(
+            f"cannot tell whether {str(trace_file)!r} is a gdb or a frida trace; "
+            "pass --provider gdb or --provider frida",
+            2,
+        )
+    loaded = _load(path)
+    functions = discover_functions(loaded)
+    try:
+        if chosen == "gdb":
+            report = parse_gdb_trace(text, info=loaded, functions=functions)
+        else:
+            report = parse_frida_trace(text, info=loaded, functions=functions)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(report.to_dict()))
+        return
+    _print_trace_report(report, auto_detected=auto_detected)
+
+
+@app.command()
+def attach(
+    path: Annotated[Path, typer.Argument(help="Path to the binary to instrument")],
+    addresses: Annotated[
+        list[str] | None,
+        typer.Argument(
+            help="Breakpoint/hook addresses (decimal or 0x hex); defaults to the entry point"
+        ),
+    ] = None,
+    provider: Annotated[
+        AttachProvider,
+        typer.Option("--provider", help="Provider to generate a session script for: gdb or frida"),
+    ] = "gdb",
+    max_hits: Annotated[
+        int, typer.Option("--max-hits", help="Stop the session after this many hits")
+    ] = dynamic.DEFAULT_MAX_HITS,
+    write: Annotated[
+        Path | None,
+        typer.Option("--write", help="Write the script into this directory (created if missing)"),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the script, its path and its command as JSON")
+    ] = False,
+) -> None:
+    """Generate a session script and the exact command that runs it -- never run it.
+
+    The script comes from :func:`codevanta.analysis.dynamic.build_gdb_script` or
+    :func:`codevanta.analysis.dynamic.build_frida_script`, and the command from
+    :func:`codevanta.analysis.dynamic.attach_command`, so neither is spelled out
+    a second time here. ADDRESS is repeatable and defaults to the entry point;
+    ``--max-hits`` bounds the session and the script states that bound.
+
+    ``--write DIR`` creates the directory, saves the script under its fixed name
+    (:data:`codevanta.analysis.dynamic.SCRIPT_FILE_NAMES`) and prints that path;
+    without it the script text goes to stdout and nothing is written. In both
+    cases the exact ``argv`` follows, and the dim line under it says what has to
+    happen before that command is run. ``--json`` prints the script text, its
+    path (``null`` when not written), the argv as a list and the probe.
+
+    The provider is never launched: this command writes a file and prints a
+    command line. A provider that cannot run here -- :func:`available_backends`
+    decides that without executing anything -- exits 2 with its ``reason``
+    rather than handing over a command line that would fail.
+    """
+    status = dynamic.provider_status(provider)
+    if not status.available:
+        _fail(f"{provider} is unavailable: {status.reason}", 2)
+    loaded = _load(path)
+    points = [_parse_address(text) for text in addresses or ()]
+    try:
+        if not points:
+            points = [resolve_target(loaded, None, None)]
+        if provider == "gdb":
+            script = dynamic.build_gdb_script(path, loaded, points, max_hits=max_hits)
+        else:
+            script = dynamic.build_frida_script(path, loaded, points, max_hits=max_hits)
+        argv = dynamic.attach_command(provider, path, script)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    script_name = dynamic.script_file_name(provider)
+    script_path: Path | None = None
+    if write is not None:
+        script_path = write / script_name
+        try:
+            write.mkdir(parents=True, exist_ok=True)
+            script_path.write_text(script.text, encoding="utf-8", newline="\n")
+        except OSError as exc:
+            _fail(f"cannot write {script_path}: {exc}", 2)
+    if json_output:
+        console.print_json(
+            json.dumps(
+                {
+                    "provider": provider,
+                    "availability": status.to_dict(),
+                    "script": script.to_dict(),
+                    "script_path": None if script_path is None else str(script_path),
+                    "attach_command": list(argv),
+                    "addresses": [f"0x{address:x}" for address in points],
+                    "max_hits": max_hits,
+                }
+            )
+        )
+        return
+    if script_path is not None:
+        console.print(f"[green]script written:[/] {escape(str(script_path))}")
+    else:
+        console.print(script.text, markup=False, soft_wrap=True)
+    console.print(f"[bold]attach:[/] {escape(' '.join(argv))}")
+    console.print(
+        f"[dim]provider: {escape(provider)} · targets: {len(points)} · max hits: {max_hits}"
+        f" · script: {escape(script_name)} · availability: {escape(status.reason)}[/]"
+    )
+    if script_path is not None:
+        console.print(
+            f"[dim]run the command above from {escape(str(script_path.parent))}, because the "
+            "argv names the script by its fixed file name[/]"
+        )
+    else:
+        console.print(
+            "[dim]nothing was written: save the text above under that file name in the "
+            "working directory, or pass --write DIR, before running the command[/]"
+        )
 
 
 mcp_app = typer.Typer(help="Model Context Protocol server commands")

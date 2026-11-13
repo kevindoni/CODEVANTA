@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from pathlib import Path
@@ -37,6 +38,12 @@ from codevanta.analysis.function_hash import function_fingerprint, function_simi
 from codevanta.analysis.jump_tables import MAX_ENTRIES as MAX_JUMP_TABLE_ENTRIES
 from codevanta.analysis.jump_tables import MODE_RELATIVE, resolve_jump_table
 from codevanta.analysis.jump_tables import MODES as JUMP_TABLE_MODES
+from codevanta.analysis.trace import (
+    MAX_TRACE_HITS,
+    MAX_TRACE_LINES,
+    parse_frida_trace,
+    parse_gdb_trace,
+)
 from codevanta.analysis.type_recovery import (
     DEFAULT_MAX_FIELDS,
     DEFAULT_MAX_INSTRUCTIONS,
@@ -84,6 +91,16 @@ MAX_XREF_BYTES = 64_000_000
 #: fingerprint tools, so no single call can be asked for unbounded work.
 MAX_TOOL_LIMIT = 20_000
 
+#: Trace formats :func:`trace` accepts; ``auto`` reads the provider off the file.
+AUTO_TRACE_PROVIDER = "auto"
+TRACE_PROVIDERS: tuple[str, ...] = (AUTO_TRACE_PROVIDER, "gdb", "frida")
+
+#: Hard ceiling on the bytes one call reads from a saved trace (8 MiB).
+MAX_TRACE_BYTES = 8_000_000
+
+#: Lines ``auto`` inspects before it decides it cannot identify the provider.
+TRACE_DETECT_LINES = 200
+
 #: Backend requested when the caller does not name one: pick the best available.
 AUTO_BACKEND = "auto"
 
@@ -106,6 +123,107 @@ def _validate_path(path: str) -> Path:
     if not candidate.is_file():
         raise AnalysisError(f"not a regular file: {path}")
     return candidate
+
+
+def _validate_trace_path(trace_path: str) -> Path:
+    """Return ``trace_path`` as an existing regular file, or raise naming it.
+
+    The binary has :func:`_validate_path`; a saved trace needs its own wording
+    because ``file not found: x`` would not say which of the two inputs was
+    wrong, and a caller that mixed them up would chase the wrong argument.
+
+    Args:
+        trace_path: Path to the saved session capture.
+
+    Returns:
+        The path, confirmed to exist and to be a regular file.
+
+    Raises:
+        AnalysisError: If ``trace_path`` is not a non-empty string, does not
+            exist, or is not a regular file.
+    """
+    if not isinstance(trace_path, str):
+        raise AnalysisError(
+            f"trace_path must be a string, got {type(trace_path).__name__}"
+        )
+    text = trace_path.strip()
+    if not text:
+        raise AnalysisError("trace_path must not be empty")
+    candidate = Path(text).expanduser()
+    if not candidate.exists():
+        raise AnalysisError(f"trace file not found: {trace_path}")
+    if not candidate.is_file():
+        raise AnalysisError(f"not a regular trace file: {trace_path}")
+    return candidate
+
+
+def _read_trace_text(source: Path) -> tuple[str, bool]:
+    """Read a saved trace, bounded to :data:`MAX_TRACE_BYTES`.
+
+    The cut deliberately never lands mid-line: when the byte budget ends the
+    read, everything after the last newline is dropped, so a bounded read cannot
+    invent a malformed ``HIT`` line or a half JSON message that would then show
+    up as a bogus warning.
+
+    Args:
+        source: Trace file already validated by :func:`_validate_trace_path`.
+
+    Returns:
+        ``(text, byte_cut)``: the decoded capture (invalid UTF-8 replaced, never
+        raised) and whether the byte budget stopped the read early.
+
+    Raises:
+        AnalysisError: If the file cannot be opened or read.
+    """
+    try:
+        with source.open("rb") as handle:
+            raw = handle.read(MAX_TRACE_BYTES + 1)
+    except OSError as exc:
+        raise AnalysisError(f"cannot read trace file {str(source)!r}: {exc}") from exc
+    byte_cut = len(raw) > MAX_TRACE_BYTES
+    if byte_cut:
+        raw = raw[:MAX_TRACE_BYTES]
+        newline = raw.rfind(b"\n")
+        if newline >= 0:
+            raw = raw[: newline + 1]
+    return raw.decode("utf-8", errors="replace"), byte_cut
+
+
+def _detect_trace_provider(text: str) -> str | None:
+    """Return which provider wrote ``text``, or ``None`` when nothing matches.
+
+    Detection reads the file shape, not a flag: a line that parses as a JSON
+    object is one of the messages the Frida hook sends, and a line opening with
+    ``HIT``/``BACKTRACE``/``LIMIT``/``DONE`` is one the gdb script prints. Only
+    the first :data:`TRACE_DETECT_LINES` lines are inspected, so a large capture
+    costs no more than a small one, and an unrecognisable file returns ``None``
+    instead of being guessed onto whichever provider has more markers.
+
+    This is the same rule ``codevanta trace --provider auto`` applies, restated
+    here rather than imported because the MCP layer must not depend on the CLI.
+
+    Args:
+        text: The captured trace.
+
+    Returns:
+        ``"gdb"``, ``"frida"``, or ``None`` when neither shape is recognised.
+    """
+    markers = ("HIT ", "BACKTRACE", "LIMIT ", "DONE ")
+    for line in text.splitlines()[:TRACE_DETECT_LINES]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            try:
+                message = json.loads(stripped)
+            except ValueError:
+                continue
+            if isinstance(message, dict):
+                return "frida"
+            continue
+        if stripped.startswith(markers):
+            return "gdb"
+    return None
 
 
 def _resolve_session_db(db: str | Path | None) -> Path:
@@ -946,6 +1064,117 @@ def struct(
         include_stack=stack_flag,
     )
     return suggestion.to_dict()
+
+
+def trace(
+    path: str,
+    trace_path: str,
+    provider: str = AUTO_TRACE_PROVIDER,
+    max_hits: int | None = None,
+) -> dict[str, Any]:
+    """Replay a saved dynamic-session trace and map its hits onto functions.
+
+    Nothing is launched: ``trace_path`` is what a generated gdb or Frida session
+    script already printed, so one capture can be re-read offline as often as
+    needed and a session never has to be repeated to re-analyse it. The binary and
+    the capture are read, never executed.
+
+    ``provider`` selects the format. ``auto`` (the default) reads it off the file
+    shape -- a JSON object line is a Frida message, a ``HIT``/``BACKTRACE``/
+    ``LIMIT``/``DONE`` line is gdb -- and the choice comes back as
+    ``provider_resolved``. A capture that cannot be placed is an error rather
+    than a guess, and so is an explicit ``provider`` that contradicts the file.
+
+    Every hit is attributed to the :func:`discover_functions` candidate that
+    encloses its address; a hit outside every candidate stays unattributed
+    instead of being guessed onto the nearest symbol. Hits are evidence of one
+    run, not proof that the branch executes in production.
+
+    Work is bounded: at most :data:`MAX_TRACE_BYTES` bytes are read,
+    :data:`codevanta.analysis.trace.MAX_TRACE_LINES` lines are parsed, and at
+    most ``max_hits`` hits are kept. A cut of any kind sets ``truncated`` and is
+    explained in ``warnings``; malformed lines become warnings too and never
+    fail the call.
+
+    Args:
+        path: PE or ELF file the session ran against.
+        trace_path: Saved gdb output or Frida JSON-lines capture.
+        provider: ``"auto"``, ``"gdb"`` or ``"frida"``.
+        max_hits: Hit budget (1 ..
+            :data:`codevanta.analysis.trace.MAX_TRACE_HITS`) or ``None`` for the
+            parser default. Hits past it are counted in ``total_hits`` but not
+            kept, and ``truncated`` is set.
+
+    Returns:
+        ``TraceReport.to_dict()`` -- ``provider``, ``hits``, ``total_hits``,
+        ``truncated``, ``unique_addresses``, ``function_coverage``, ``warnings``
+        and ``evidence`` -- plus ``path``, ``trace_path`` and
+        ``provider_resolved``.
+
+    Raises:
+        AnalysisError: If a path is missing or unreadable, the trace file is not
+            a regular file, ``provider`` is not one of :data:`TRACE_PROVIDERS`,
+            the provider cannot be resolved, the capture contradicts the
+            requested provider, or ``max_hits`` is out of range.
+    """
+    if provider not in TRACE_PROVIDERS:
+        raise AnalysisError(
+            f"provider must be one of {', '.join(TRACE_PROVIDERS)}, got {provider!r}"
+        )
+    hit_limit = (
+        None
+        if max_hits is None
+        else _check_bounded_int("max_hits", max_hits, MAX_TRACE_HITS)
+    )
+    target = _validate_path(path)
+    source = _validate_trace_path(trace_path)
+    text, byte_cut = _read_trace_text(source)
+
+    detected = _detect_trace_provider(text)
+    if provider == AUTO_TRACE_PROVIDER:
+        if detected is None:
+            raise AnalysisError(
+                f"cannot tell whether {str(source)!r} is a gdb or a frida trace; "
+                "pass provider='gdb' or provider='frida'"
+            )
+        resolved = detected
+    elif detected is not None and detected != provider:
+        raise AnalysisError(
+            f"provider mismatch: {str(source)!r} is a {detected} trace, not {provider}"
+        )
+    else:
+        resolved = provider
+
+    info = load_binary(target)
+    functions = discover_functions(info)
+    if resolved == "gdb":
+        report = parse_gdb_trace(
+            text,
+            info=info,
+            functions=functions,
+            max_lines=MAX_TRACE_LINES,
+            max_hits=hit_limit,
+        )
+    else:
+        report = parse_frida_trace(
+            text,
+            info=info,
+            functions=functions,
+            max_lines=MAX_TRACE_LINES,
+            max_hits=hit_limit,
+        )
+
+    payload = report.to_dict()
+    if byte_cut:
+        payload["truncated"] = True
+        payload["warnings"] = [
+            *payload["warnings"],
+            f"trace truncated to the first {MAX_TRACE_BYTES} byte(s)",
+        ]
+    payload["path"] = str(target)
+    payload["trace_path"] = str(source)
+    payload["provider_resolved"] = resolved
+    return payload
 
 
 def session_save(

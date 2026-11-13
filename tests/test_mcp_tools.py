@@ -63,7 +63,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
     assert report["disassembly"]["instruction_count"] == 3
 
 
-def test_server_lists_nineteen_tools() -> None:
+def test_server_lists_twenty_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
     assert names == [
@@ -84,6 +84,7 @@ def test_server_lists_nineteen_tools() -> None:
         "codevanta_similarity",
         "codevanta_strings",
         "codevanta_struct",
+        "codevanta_trace",
         "codevanta_vtable",
         "codevanta_xrefs",
     ]
@@ -924,6 +925,235 @@ def test_struct_caps_fields_and_validates_arguments(tmp_path: Path) -> None:
         tools.struct(str(binary), 0)
     with pytest.raises(AnalysisError, match="file not found"):
         tools.struct(str(tmp_path / "missing.bin"), TEXT_ADDRESS)
+
+
+# --- saved dynamic-session traces ---------------------------------------------
+
+
+#: The two addresses the hand-written captures hit: inside the fixture ``.text``.
+TRACE_HIT_ADDRESSES = (TEXT_ADDRESS, TEXT_ADDRESS + 2)
+
+#: ``mov eax, 42; ret`` -- long enough for both hits to land in one candidate.
+TRACE_CODE = bytes.fromhex("b82a000000c3")
+
+
+def _gdb_trace_text() -> str:
+    """Return a gdb capture as the generated session script prints it: two hits.
+
+    One ``HIT`` line carries a ``BACKTRACE`` with two frames, the other carries
+    none, and gdb's own noise (``Breakpoint 1 at``, ``Inferior 1 exited``,
+    ``DONE``) wraps the capture exactly as a saved log does.
+    """
+    first, second = TRACE_HIT_ADDRESSES
+    frames = f"#0  0x{first:016x} in main ()\n#1  0x{first + 0x10:016x} in ?? ()"
+    lines = [
+        f"Breakpoint 1 at 0x{first:x}",
+        f"HIT 0x{first:x} pc=0x{first:x} sp=0x7ffffffde0 rip=0x{first:x} rax=0x1",
+        "BACKTRACE",
+        frames,
+        f"HIT 0x{second:x} pc=0x{second:x} sp=0x7ffffffdd0 rip=0x{second:x} rax=0x2",
+        "[Inferior 1 (process 4321) exited normally]",
+        "DONE 2 hits",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _frida_trace_text() -> str:
+    """Return the JSON lines a generated Frida hook sends for the same two hits."""
+    return (
+        "\n".join(
+            json.dumps(
+                {
+                    "hit": index,
+                    "address": hex(address),
+                    "tid": 4321,
+                    "args": ["0x1", "0x2"],
+                }
+            )
+            for index, address in enumerate(TRACE_HIT_ADDRESSES, start=1)
+        )
+        + "\n"
+    )
+
+
+def test_trace_replays_a_hand_written_gdb_capture(tmp_path: Path) -> None:
+    binary = _write_elf64(tmp_path / "trace_gdb.bin", TRACE_CODE)
+    capture = tmp_path / "session.gdb.log"
+    capture.write_text(_gdb_trace_text(), encoding="utf-8")
+
+    payload = tools.trace(str(binary), str(capture))
+
+    assert payload["provider"] == "gdb"
+    assert payload["provider_resolved"] == "gdb"
+    assert payload["total_hits"] == 2
+    assert payload["truncated"] is False
+    assert payload["warnings"] == []
+    assert payload["path"] == str(binary)
+    assert payload["trace_path"] == str(capture)
+    first, second = payload["hits"]
+    assert [first["address"], second["address"]] == [
+        f"0x{address:x}" for address in TRACE_HIT_ADDRESSES
+    ]
+    assert first["kind"] == "breakpoint"
+    assert first["function"] == f"0x{TEXT_ADDRESS:x}"
+    assert first["backtrace"] == [f"0x{TEXT_ADDRESS:x}", f"0x{TEXT_ADDRESS + 0x10:x}"]
+    assert second["backtrace"] == []
+    assert payload["unique_addresses"] == [
+        f"0x{address:x}" for address in TRACE_HIT_ADDRESSES
+    ]
+    assert payload["function_coverage"] == {f"0x{TEXT_ADDRESS:x}": 2}
+    assert payload["evidence"]["method"] == "parse_gdb_trace"
+    assert payload["evidence"]["extra"]["provider"] == "gdb"
+    # Every other tool returns JSON-safe values; so must this one.
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_trace_detects_the_provider_off_the_file(tmp_path: Path) -> None:
+    binary = _write_elf64(tmp_path / "trace_frida.bin", TRACE_CODE)
+    capture = tmp_path / "session.frida.jsonl"
+    capture.write_text(_frida_trace_text(), encoding="utf-8")
+
+    payload = tools.trace(str(binary), str(capture))
+
+    assert payload["provider"] == "frida"
+    assert payload["provider_resolved"] == "frida"
+    assert payload["total_hits"] == 2
+    assert payload["evidence"]["method"] == "parse_frida_trace"
+    hit = payload["hits"][0]
+    assert hit["kind"] == "message"
+    assert hit["function"] == f"0x{TEXT_ADDRESS:x}"
+    # A Frida message carries no register dump or stack, only tid plus args.
+    assert hit["registers"] == {"tid": 4321, "arg0": 1, "arg1": 2}
+    assert hit["backtrace"] == []
+
+
+def test_trace_rejects_a_provider_that_contradicts_the_file(tmp_path: Path) -> None:
+    binary = _write_elf64(tmp_path / "trace_mismatch.bin", TRACE_CODE)
+    gdb_capture = tmp_path / "session.gdb.log"
+    gdb_capture.write_text(_gdb_trace_text(), encoding="utf-8")
+    frida_capture = tmp_path / "session.jsonl"
+    frida_capture.write_text(_frida_trace_text(), encoding="utf-8")
+
+    with pytest.raises(AnalysisError, match="provider mismatch") as excinfo:
+        tools.trace(str(binary), str(gdb_capture), provider="frida")
+    assert "gdb" in str(excinfo.value)
+
+    with pytest.raises(AnalysisError, match="provider mismatch"):
+        tools.trace(str(binary), str(frida_capture), provider="gdb")
+
+    # An explicit provider that agrees with the file is honoured.
+    agreed = tools.trace(str(binary), str(gdb_capture), provider="gdb")
+    assert agreed["provider_resolved"] == "gdb"
+
+    with pytest.raises(AnalysisError, match="provider must be one of"):
+        tools.trace(str(binary), str(gdb_capture), provider="lldb")
+
+
+def test_trace_reports_a_missing_or_unusable_trace_file(tmp_path: Path) -> None:
+    binary = _write_elf64(tmp_path / "trace_missing.bin", TRACE_CODE)
+
+    with pytest.raises(AnalysisError, match="trace file not found") as excinfo:
+        tools.trace(str(binary), str(tmp_path / "missing.gdb.log"))
+    assert "missing.gdb.log" in str(excinfo.value)
+
+    with pytest.raises(AnalysisError, match="not a regular trace file"):
+        tools.trace(str(binary), str(tmp_path))
+
+    with pytest.raises(AnalysisError, match="trace_path"):
+        tools.trace(str(binary), "")
+
+    # The binary keeps its own, already-established wording.
+    with pytest.raises(AnalysisError, match="file not found"):
+        tools.trace(str(tmp_path / "missing.bin"), str(tmp_path / "missing.gdb.log"))
+
+
+def test_trace_refuses_to_guess_an_unrecognisable_capture(tmp_path: Path) -> None:
+    binary = _write_elf64(tmp_path / "trace_noise.bin", TRACE_CODE)
+    capture = tmp_path / "noise.log"
+    capture.write_text("nothing here\nnor here\n", encoding="utf-8")
+
+    with pytest.raises(AnalysisError, match="cannot tell"):
+        tools.trace(str(binary), str(capture))
+
+    # Named explicitly, the same file parses and simply reports no hits.
+    payload = tools.trace(str(binary), str(capture), provider="gdb")
+    assert payload["provider_resolved"] == "gdb"
+    assert payload["total_hits"] == 0
+    assert payload["hits"] == []
+
+
+def test_trace_bounds_the_hits_it_keeps(tmp_path: Path) -> None:
+    binary = _write_elf64(tmp_path / "trace_cap.bin", TRACE_CODE)
+    capture = tmp_path / "session.gdb.log"
+    capture.write_text(_gdb_trace_text(), encoding="utf-8")
+
+    capped = tools.trace(str(binary), str(capture), max_hits=1)
+
+    assert capped["total_hits"] == 2
+    assert len(capped["hits"]) == 1
+    assert capped["truncated"] is True
+    assert any("hit limit 1" in warning for warning in capped["warnings"])
+
+    for max_hits in (0, True, tools.MAX_TRACE_HITS + 1):
+        with pytest.raises(AnalysisError, match="max_hits"):
+            tools.trace(str(binary), str(capture), max_hits=max_hits)
+
+
+def test_trace_bounds_the_bytes_it_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = _write_elf64(tmp_path / "trace_bytes.bin", TRACE_CODE)
+    capture = tmp_path / "session.gdb.log"
+    capture.write_text(_gdb_trace_text(), encoding="utf-8")
+    monkeypatch.setattr(tools, "MAX_TRACE_BYTES", 40)
+
+    payload = tools.trace(str(binary), str(capture), provider="gdb")
+
+    # The budget stops inside the first line, so nothing parses -- and the cut is
+    # reported rather than handed to the parser as a half ``HIT`` line.
+    assert payload["truncated"] is True
+    assert payload["hits"] == []
+    assert any(
+        "truncated to the first 40 byte" in warning for warning in payload["warnings"]
+    )
+
+
+def test_trace_tool_is_registered_with_a_stable_schema() -> None:
+    listed = {tool.name: tool for tool in asyncio.run(build_server().list_tools())}
+    schema = listed["codevanta_trace"].input_schema
+
+    assert schema["required"] == ["path", "trace_path"]
+    assert set(schema["properties"]) == {"path", "trace_path", "provider", "max_hits"}
+    assert schema["properties"]["provider"]["enum"] == ["auto", "gdb", "frida"]
+    assert schema["properties"]["provider"]["default"] == "auto"
+    assert schema["properties"]["max_hits"]["default"] is None
+
+
+def test_server_call_tool_trace_returns_the_report(tmp_path: Path) -> None:
+    binary = _write_elf64(tmp_path / "trace_server.bin", TRACE_CODE)
+    capture = tmp_path / "session.jsonl"
+    capture.write_text(_frida_trace_text(), encoding="utf-8")
+
+    result = asyncio.run(
+        build_server().call_tool(
+            "codevanta_trace",
+            {"path": str(binary), "trace_path": str(capture), "provider": "auto"},
+        )
+    )
+
+    payload = _payload(result)
+    assert payload["provider_resolved"] == "frida"
+    assert payload["total_hits"] == 2
+    assert payload["function_coverage"] == {f"0x{TEXT_ADDRESS:x}": 2}
+
+    # A wrong provider reaches the client as a ToolError naming the tool.
+    with pytest.raises(ToolError, match="provider mismatch"):
+        asyncio.run(
+            build_server().call_tool(
+                "codevanta_trace",
+                {"path": str(binary), "trace_path": str(capture), "provider": "gdb"},
+            )
+        )
 
 
 # --- bind host normalisation, loopback guard and SDK hardening -----------------

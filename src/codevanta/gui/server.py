@@ -19,6 +19,8 @@ reimplemented here:
 * ``/api/callgraph`` -- :func:`codevanta.analysis.callgraph.build_call_graph`
 * ``/api/diff`` -- :func:`codevanta.analysis.binary_diff.diff_binaries`
 * ``/api/decompile`` -- :func:`codevanta.analysis.decompilers.decompile_function`
+* ``/api/session_save`` -- :meth:`codevanta.storage.session.SessionStore.save`
+* ``/api/session_list`` -- :meth:`codevanta.storage.session.SessionStore.list`
 
 Contract:
 
@@ -29,8 +31,11 @@ Contract:
   against the ceiling of the engine that consumes it (string, xref, call-graph,
   struct and disassembly limits), so a request cannot ask for more work than the
   engines already allow.
-* **Read-only.** Bytes are parsed, never executed and never written. The
-  dashboard never mutates the analysed file.
+* **Read-only analysis.** Bytes are parsed, never executed and never written.
+  The dashboard never mutates the analysed file. The one thing a request may
+  write is a *session* record -- the optional ``/api/session_save`` route
+  appends one row to the session database (see :data:`SESSION_DB_ENV`) and
+  touches nothing else; every other route only reads.
 * **Origin checked.** Every request must carry a ``Host`` header naming the
   dashboard itself -- ``127.0.0.1``, ``localhost`` or ``[::1]``, with either the
   bound port or no port at all -- otherwise it is answered with ``421`` before
@@ -56,6 +61,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import socket
 import sys
 import webbrowser
@@ -111,19 +117,26 @@ from codevanta.core.report import (
     build_report,
 )
 from codevanta.core.strings import StringExtractor
+from codevanta.storage.session import DEFAULT_LIMIT as DEFAULT_SESSION_LIMIT
+from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
+from codevanta.storage.session import MAX_NOTE_LENGTH as MAX_SESSION_NOTE_LENGTH
+from codevanta.storage.session import SessionError, SessionRecord, SessionStore
 
 from .layout import render_dashboard_html
 
 __all__ = [
+    "DEFAULT_SESSION_DB",
     "MAX_RESPONSE_BYTES",
     "ROUTES",
     "SECURITY_HEADERS",
+    "SESSION_DB_ENV",
     "VERSION",
     "create_handler",
     "create_server",
     "is_allowed_host",
     "normalize_host",
     "serve",
+    "session_db_path",
 ]
 
 #: Version reported by ``/api/health`` when the package metadata is unavailable.
@@ -151,6 +164,17 @@ DECOMPILE_BACKENDS: frozenset[str] = frozenset(
 
 #: Prefix of the block-coverage line the native renderer writes in its header.
 _HEADER_BLOCKS_PREFIX = " * blocks: "
+
+#: Environment variable that overrides the session database location. It is the
+#: same variable the CLI and the MCP tools read, so a dashboard, a ``codevanta
+#: session list`` shell and an agent all share one database.
+SESSION_DB_ENV = "CODEVANTA_DB"
+
+#: Session database used when :data:`SESSION_DB_ENV` is unset.
+DEFAULT_SESSION_DB = Path.home() / ".codevanta" / "sessions.db"
+
+#: Minimum ``/api/session_list`` limit: ``SessionStore.list`` rejects ``<= 0``.
+MIN_SESSION_LIMIT = 1
 
 #: Content types used by the two response kinds.
 _JSON_CONTENT_TYPE = "application/json; charset=utf-8"
@@ -195,6 +219,27 @@ def _package_version() -> str:
 
 #: Version string exposed by ``/api/health``.
 VERSION = _package_version()
+
+
+def session_db_path() -> Path:
+    """Return the session database the two session routes read and write.
+
+    Resolution matches the CLI (``codevanta session ...``) and the MCP tools:
+    ``$CODEVANTA_DB`` when it is set to a non-blank value, otherwise
+    :data:`DEFAULT_SESSION_DB`. A blank variable counts as unset, so exporting
+    ``CODEVANTA_DB=`` never resolves to the current directory.
+
+    There is deliberately **no** ``db`` query parameter: the route table takes
+    the location from the server's own environment, so a request can never
+    point the dashboard at an arbitrary file to create or overwrite.
+
+    Returns:
+        The database path (it need not exist yet; the store creates it).
+    """
+    configured = os.environ.get(SESSION_DB_ENV)
+    if configured and configured.strip():
+        return Path(configured.strip()).expanduser()
+    return DEFAULT_SESSION_DB
 
 
 class _RouteError(ValueError):
@@ -329,6 +374,45 @@ def _query_int(
     if value < minimum or value > maximum:
         raise _RouteError(f"{name} must be within {minimum}..{maximum}, got {value}")
     return value
+
+
+def _reject_unknown(params: dict[str, str], allowed: frozenset[str]) -> None:
+    """Reject every query parameter outside ``allowed``.
+
+    The analysis routes tolerate extra parameters (each one reads only the names
+    it understands, so an older page keeps working against a newer server). The
+    session routes are different: they *write*, so a typo such as ``notse=`` must
+    be reported instead of silently saving a session with no note. Unknown names
+    are listed in the error, because the caller needs to see which one was wrong.
+    """
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        shown = ", ".join(repr(name) for name in unknown)
+        raise _RouteError(
+            f"unknown query parameter(s) {shown}; this route accepts "
+            f"{', '.join(sorted(allowed)) or 'no parameters'}"
+        )
+
+
+def _query_notes(params: dict[str, str], name: str) -> str | None:
+    """Parse the optional free-text ``notes`` parameter.
+
+    Notes are stored verbatim (newlines and non-ASCII characters included) but
+    are bounded: the store itself only checks the type, so the route reuses the
+    per-note ceiling the storage layer already declares, keeping one request
+    from parking an unbounded blob in the database. A blank value means "no
+    note" rather than an empty one, so the listing does not have to tell the two
+    spellings apart.
+    """
+    raw = _first(params, name)
+    if raw is None:
+        return None
+    if len(raw) > MAX_SESSION_NOTE_LENGTH:
+        raise _RouteError(
+            f"{name} must be at most {MAX_SESSION_NOTE_LENGTH} characters, "
+            f"got {len(raw)}"
+        )
+    return raw
 
 
 def _query_float(
@@ -659,6 +743,76 @@ def _api_decompile(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
     return payload
 
 
+def _session_item(record: SessionRecord) -> dict[str, Any]:
+    """Project a stored session onto the fields the listing exposes.
+
+    The full record also carries the SHA-256, bitness, entry point and the two
+    counts; the dashboard panel shows one row per session and needs the
+    path/format/architecture identity plus the note, so only those are returned.
+    """
+    return {
+        "session_id": record.session_id,
+        "path": record.binary_path,
+        "format": record.format,
+        "architecture": record.architecture,
+        "created_at": record.created_at,
+        "notes": record.notes,
+    }
+
+
+def _api_session_save(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Analyze a binary and persist the run as a session row.
+
+    This is the only route with an effect: it appends one row to the database
+    named by :func:`session_db_path` and returns the identifiers of that row so
+    the page can show it without a second request. Re-saving the same binary is
+    legal and appends another row -- the store keeps an audit trail of repeated
+    analyses rather than overwriting.
+    """
+    _reject_unknown(params, frozenset({"path", "notes"}))
+    path = _query_path(params, "path", allow_paths)
+    notes = _query_notes(params, "notes")
+    info = _load(path)
+    # The counts are the two numbers the store persists next to the fingerprint;
+    # they are computed by the same engines ``/api/functions`` and ``/api/strings``
+    # serve, so the saved row can never disagree with what the page displayed.
+    functions_count = len(discover_functions(info))
+    strings_count = len(StringExtractor().extract(path, info=info))
+    with SessionStore(session_db_path()) as store:
+        record = store.save(
+            info,
+            functions_count,
+            strings_count,
+            notes=notes,
+        )
+    return {"session_id": record.session_id, "created_at": record.created_at}
+
+
+def _api_session_list(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return the stored sessions, newest first, bounded by ``limit``.
+
+    ``limit`` is validated against the storage bounds -- ``1`` up to
+    :data:`~codevanta.storage.session.MAX_LIMIT` -- and defaults to the store's
+    own :data:`~codevanta.storage.session.DEFAULT_LIMIT`, so the route never
+    asks the store for a window it would reject or silently shrink.
+    """
+    _reject_unknown(params, frozenset({"limit"}))
+    limit = _query_int(
+        params,
+        "limit",
+        DEFAULT_SESSION_LIMIT,
+        MIN_SESSION_LIMIT,
+        MAX_SESSION_LIMIT,
+    )
+    with SessionStore(session_db_path()) as store:
+        records = store.list(limit=limit)
+    return {
+        "limit": limit,
+        "count": len(records),
+        "sessions": [_session_item(record) for record in records],
+    }
+
+
 #: Route table: request path -> payload builder. Builders take the query
 #: parameters and the handler's ``paths_allowed`` flag.
 ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
@@ -672,6 +826,8 @@ ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
     "/api/callgraph": _api_callgraph,
     "/api/diff": _api_diff,
     "/api/decompile": _api_decompile,
+    "/api/session_save": _api_session_save,
+    "/api/session_list": _api_session_list,
 }
 
 def _json_default(value: Any) -> Any:
@@ -870,7 +1026,7 @@ class _GuiRequestHandler(BaseHTTPRequestHandler):
         params = _parse_query(split.query)
         try:
             payload = builder(params, self.allow_paths)
-        except (ValueError, AnalysisError, BinaryLoadError) as exc:
+        except (ValueError, AnalysisError, BinaryLoadError, SessionError) as exc:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
                 {"error": str(exc) or type(exc).__name__},

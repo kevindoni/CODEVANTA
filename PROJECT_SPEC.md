@@ -112,12 +112,18 @@ multi-user collaboration, AI binary modification.
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| 1 | Foundation (loader, disassembler, strings, functions, CLI, JSON) | delivered |
-| 1.5 | MCP server + guided agent setup | delivered |
-| 2 | Cross-references, CFG (linear + recursive), call graphs, jump tables, sessions | delivered — debugger and graph-oriented *viewer application* remain open |
-| 3 | Type recovery, binary diff, Python scripting | largely delivered (struct recovery, diff, fingerprints, similarity) — embedded Python scripting remains open |
-| 4 | Unicorn emulation, IR lifting, symbolic execution (optional) | open |
-| 5 | Plugin system, full AI layer, multi-user, CI/CD | open |
+| 1 | Foundation (loader, disassembler, strings, functions, CLI, JSON) | **delivered** — `core/loader.py` (PE, ELF, Mach-O incl. fat slices, DEX), `core/disassembler.py`, `core/strings.py`, `core/functions.py`, `core/report.py`, `cli/main.py` |
+| 1.5 | MCP server + guided agent setup | **delivered** — 17 tools in `mcp_server/server.py`, `setup/` adapters |
+| 2 | Cross-references, CFG (linear + recursive), call graphs, jump tables, sessions | **delivered** — `analysis/xrefs.py`, `analysis/cfg.py`, `analysis/callgraph.py`, `analysis/jump_tables.py`, `storage/session.py`. Remaining open: **live debugger attach**, the graph-oriented **viewer application**, **GUI session persistence** |
+| 3 | Type recovery, binary diff, Python scripting | **delivered** except embedded Python scripting — struct recovery (`analysis/type_recovery.py`), diff (`analysis/binary_diff.py`), fingerprints (`analysis/function_hash.py`), similarity, decompilation via `native` / `angr` / `ghidra` (`analysis/decompilers/`). Remaining open: **embedded Python scripting**, **evidence bundle** export |
+| 4 | Unicorn emulation, IR lifting, symbolic execution (optional) | **emulation delivered** (unchanged: `analysis/emulate.py`, bounded and offline, never executes on the host). Remaining open: **IR lifting / typed SSA** (`ir/adapters/` is an empty registry — no concrete adapter), **symbolic execution** (no symbolic path or Z3 in `src/`) |
+| 5 | Plugin system, full AI layer, multi-user, CI/CD | **CI/CD delivered** — `ci.yml` (test on 3.11/3.13/3.14, type-check via mypy, package/wheel smoke test, decompile-parity, ghidra-parity) plus `release.yml` (build → publish-pypi → github-release), with an 85% coverage gate. Remaining open: **plugin SDK** (`plugins/__init__.py` is a stub), **full AI layer**, **multi-user** |
+
+Cross-cutting work that no phase delivers yet: **.NET / WebAssembly / JVM
+`.class` formats**, **fuzz and benchmark gates** (`scripts/bench.py` exists but
+no CI job enforces it), **Windows and macOS CI** (every job is
+`runs-on: ubuntu-latest`), and an actual **PyPI release** (the publishing job is
+wired, but no `v*` tag has been cut).
 
 ## Responsible use
 

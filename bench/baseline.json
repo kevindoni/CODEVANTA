@@ -1,0 +1,31 @@
+{
+  "benchmarks": {
+    "build_call_graph (samples/elf64_text.bin)": 0.28,
+    "build_call_graph (samples/pe64_text.bin)": 0.684,
+    "build_cfg (samples/elf64_text.bin)": 0.281,
+    "build_cfg (samples/pe64_text.bin)": 0.845,
+    "diff_binaries (samples/pe64_text.bin -> samples/elf64_text.bin)": 0.622,
+    "disassemble_entry (samples/elf64_text.bin)": 0.065,
+    "disassemble_entry (samples/pe64_text.bin)": 0.362,
+    "discover_functions (samples/elf64_text.bin)": 0.004,
+    "discover_functions (samples/pe64_text.bin)": 0.006,
+    "extract_strings (samples/elf64_text.bin)": 0.076,
+    "extract_strings (samples/pe64_text.bin)": 0.111,
+    "find_xrefs (samples/elf64_text.bin)": 0.257,
+    "find_xrefs (samples/pe64_text.bin)": 0.681,
+    "function_fingerprint (samples/elf64_text.bin)": 0.282,
+    "function_fingerprint (samples/pe64_text.bin)": 0.736,
+    "load (samples/elf64_text.bin)": 0.244,
+    "load (samples/pe64_text.bin)": 0.249,
+    "suggest_struct (samples/elf64_text.bin)": 0.284,
+    "suggest_struct (samples/pe64_text.bin)": 0.961
+  },
+  "format": "codevanta-bench-gate",
+  "limits": {
+    "limit_functions": 64,
+    "max_instructions": 2000
+  },
+  "repeat": 15,
+  "unit": "ms",
+  "version": 1
+}

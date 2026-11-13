@@ -394,6 +394,37 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Replay a saved dynamic-session trace against a binary and map every "
+            "recorded hit onto the discovered function candidates. 'trace_path' "
+            "is a capture the generated gdb or Frida script already printed: "
+            "nothing is launched and no target is executed. 'provider' picks the "
+            "format; 'auto' detects it from the file and 'provider_resolved' "
+            "reports the choice, while a capture that cannot be placed, or that "
+            "contradicts an explicit provider, is an error instead of a guess. "
+            "The work is bounded (8 MB and 100000 lines read, plus 'max_hits'): "
+            "'truncated' means a bound or the session's own limit cut the parse, "
+            "and malformed lines land in 'warnings' rather than failing the "
+            "call. Hits outside every candidate stay unattributed. A hit is "
+            "evidence of one run, not proof that the code always executes."
+        )
+    )
+    def codevanta_trace(
+        path: str,
+        trace_path: str,
+        provider: Literal["auto", "gdb", "frida"] = "auto",
+        max_hits: int | None = None,
+    ) -> dict:
+        try:
+            return tools.trace(path, trace_path, provider=provider, max_hits=max_hits)
+        except AnalysisError as exc:
+            # A missing capture, an unreadable one, an unresolvable provider, a
+            # provider mismatch or a bad max_hits is the caller's to fix, but the
+            # framework would otherwise replace the reason with a generic
+            # "Error executing tool" message that hides which argument failed.
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
             "Extract DWARF debug-info functions and named type layouts from an ELF "
             "with producer metadata (highest-grade symbol evidence). Requires the "
             "optional pyelftools extra: pip install -e \".[dwarf]\"."
