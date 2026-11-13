@@ -50,6 +50,10 @@ dev = [
   "build>=1.2",
   "unicorn>=2.0",
   "pyelftools>=0.31",
+  "z3-solver>=4.13",
+]
+solver = [
+  "z3-solver>=4.13",
 ]
 emulation = [
   "unicorn>=2.0",

@@ -640,6 +640,17 @@ def build_server() -> MCPServer:
             status=status,
         )
 
+    @server.tool(
+        description=(
+            "Auto-detect format metadata for a file or directory: APK signing "
+            "block (v1/v2/v3), Go build info, Rust cargo-auditable, Python .pyc "
+            "header, Electron fuses, ELF notes, kernel-module .modinfo, or a "
+            "desktop app layout (Unity, IL2CPP, Unreal, Electron, .NET)."
+        )
+    )
+    def codevanta_metadata(path: str) -> dict:
+        return tools.codevanta_metadata(path)
+
     return server
 
 

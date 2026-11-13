@@ -91,6 +91,10 @@ from codevanta.analysis.jump_tables import (
     JumpTableResult,
     resolve_jump_table,
 )
+from codevanta.analysis.solver import (
+    DEFAULT_TIMEOUT_MS as SOLVER_DEFAULT_TIMEOUT_MS,
+)
+from codevanta.analysis.solver import SolverOverlay, solve_exploration
 from codevanta.analysis.symbolic import (
     DEFAULT_MAX_PATHS as SYMBOLIC_MAX_PATHS,
 )
@@ -120,6 +124,11 @@ from codevanta.analysis.type_recovery import (
 )
 from codevanta.analysis.vtables import find_vtables
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
+from codevanta.cli.containers import app as containers_app
+from codevanta.cli.crash import app as crash_app
+from codevanta.cli.meta import meta_app
+from codevanta.cli.mobile import app as mobile_app
+from codevanta.cli.web import asar, web_app
 from codevanta.core.disassembler import DisassemblyError
 from codevanta.core.entropy import analyze_entropy
 from codevanta.core.functions import discover_functions
@@ -2430,8 +2439,14 @@ def debug(
 # ---- phase 7: path exploration and data flow --------------------------------
 
 
-def _print_symbolic_exploration(result: PathExploration) -> None:
-    """Print one :class:`PathExploration` as a path table plus its warnings."""
+def _print_symbolic_exploration(result: PathExploration, overlay: SolverOverlay | None = None) -> None:
+    """Print one :class:`PathExploration` as a path table plus its warnings.
+
+    ``overlay`` is the optional z3-backed solver verdict; when it ran, pruned
+    paths are left out of the table (each pruned path has its own warning)
+    and the dim line grows a ``solver`` section.
+    """
+    pruned = set(overlay.pruned) if overlay is not None else set()
     table = Table(title=escape(f"Paths through 0x{result.address:x} ({result.paths})"))
     table.add_column("#", justify="right")
     table.add_column("Decisions")
@@ -2439,6 +2454,8 @@ def _print_symbolic_exploration(result: PathExploration) -> None:
     table.add_column("Stopped")
     table.add_column("Steps", justify="right")
     for entry in result.entries:
+        if entry.index in pruned:
+            continue
         decisions = " ".join(
             f"{branch.mnemonic}{'+' if branch.taken else '-'}" for branch in entry.decisions
         )
@@ -2452,16 +2469,25 @@ def _print_symbolic_exploration(result: PathExploration) -> None:
             str(entry.instructions),
         )
     console.print(table)
-    console.print(
+    summary = (
         f"[dim]explorer: {escape(result.explorer)} · arch: {escape(result.architecture)} "
         f"({result.bitness}-bit) · paths: {result.paths} · unresolved: {result.unresolved} · "
         f"steps: {result.steps} · complete: {'yes' if result.complete else 'no'}[/]"
     )
+    if overlay is not None and overlay.ran:
+        summary = (
+            f"{summary[:-3]} · solver: z3 · checked: {overlay.checked} · "
+            f"pruned: {len(overlay.pruned)} · solver ms: {overlay.solver_ms}[/]"
+        )
+    console.print(summary)
     for warning in result.warnings:
         console.print(f"[yellow]warning:[/] {escape(warning)}")
     for entry in result.entries:
         for warning in entry.warnings:
             console.print(f"[yellow]warning:[/] [path {entry.index}] {escape(warning)}")
+    if overlay is not None:
+        for warning in overlay.warnings:
+            console.print(f"[yellow]warning:[/] {escape(warning)}")
 
 
 @app.command()
@@ -2482,6 +2508,13 @@ def symbolic(
             "--max-steps", help="Instruction budget for the whole exploration, replays included"
         ),
     ] = SYMBOLIC_MAX_STEPS,
+    solver_mode: Annotated[
+        str,
+        typer.Option(
+            "--solver",
+            help="Path feasibility checker: 'auto' uses z3 when importable, 'naive' never does",
+        ),
+    ] = "auto",
     set_values: Annotated[
         list[str] | None,
         typer.Option(
@@ -2521,6 +2554,15 @@ def symbolic(
     engine; when it is missing this exits 2 and never raises ``ImportError``.
     A bad address, a bad seed and an address outside an executable section all
     exit 2 as well.
+
+    ``--solver`` adds the optional feasibility check behind the paths:
+    ``auto`` (the default) hands every path's branch decisions to the z3
+    BitVec solver when ``z3-solver`` is importable (``pip install z3-solver``),
+    prunes the paths whose constraints cannot hold together with a ``warning:``
+    line and reports the survivors with ``feasible``/``model``/``solver_ms``
+    in the JSON payload; ``naive`` never touches a solver. Without z3 the
+    command behaves exactly as before, plus one ``warning:`` line naming the
+    naive evaluation; every solver call is time- and memory-bounded.
     """
     if not SYMBOLIC_EMULATOR_AVAILABLE:
         _fail(
@@ -2542,12 +2584,15 @@ def symbolic(
             max_steps=max_steps,
             initial_registers=registers,
         )
+        overlay = solve_exploration(
+            result, mode=solver_mode, timeout_ms=SOLVER_DEFAULT_TIMEOUT_MS
+        )
     except AnalysisError as exc:
         _fail(str(exc), 2)
     if json_output:
-        console.print_json(json.dumps(result.to_dict()))
+        console.print_json(json.dumps(overlay.augmented_dict(result)))
         return
-    _print_symbolic_exploration(result)
+    _print_symbolic_exploration(result, overlay)
 
 
 def _print_dataflow_summary(result: DataFlowSummary) -> None:
@@ -2642,6 +2687,11 @@ def dataflow(
 
 plugins_app = typer.Typer(help="Analysis plugin commands")
 app.add_typer(plugins_app, name="plugins")
+app.add_typer(containers_app)
+app.add_typer(crash_app, name="crash")
+app.add_typer(mobile_app, name="mobile")
+app.add_typer(web_app, name="web")
+app.command("asar", help="List an Electron ASAR archive; optionally extract one entry")(asar)
 
 
 @plugins_app.command("list")
@@ -3060,6 +3110,7 @@ def uninstall(
 
 session_app = typer.Typer(help="Persisted analysis sessions (SQLite)")
 app.add_typer(session_app, name="session")
+app.add_typer(meta_app, name="metadata")
 
 
 @session_app.command("save")

@@ -131,6 +131,15 @@ from codevanta.core.unknowns import (
     records_to_payload,
     resolve_unknowns,
 )
+from codevanta.mcp_server.ext_bin import codevanta_binmeta as codevanta_binmeta
+from codevanta.mcp_server.ext_bin import codevanta_sqlite as codevanta_sqlite
+from codevanta.mcp_server.ext_crash import codevanta_crash as codevanta_crash
+from codevanta.mcp_server.ext_meta import (
+    codevanta_metadata as codevanta_metadata,  # lane-meta: ONE MCP registration line
+)
+from codevanta.mcp_server.ext_mobile import codevanta_adb as codevanta_adb
+from codevanta.mcp_server.ext_solver import codevanta_symbolic_solve  # noqa: F401 -- one-line registration of the ext solver MCP tool
+from codevanta.mcp_server.ext_web import codevanta_asar, codevanta_web_inspect  # noqa: F401 - registration of the ext_web MCP tools
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore
 
