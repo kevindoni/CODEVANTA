@@ -15,9 +15,21 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
+from codevanta.analysis.cdp_client import DEFAULT_ENDPOINT as WEB_DEFAULT_ENDPOINT
+from codevanta.analysis.cdp_client import DEFAULT_OBSERVE_MS as WEB_DEFAULT_OBSERVE_MS
+from codevanta.analysis.solver import DEFAULT_TIMEOUT_MS as SOLVER_DEFAULT_TIMEOUT_MS
+from codevanta.analysis.uart_decode import DEFAULT_BAUD as UART_DEFAULT_BAUD
+from codevanta.analysis.uart_decode import DEFAULT_DATA_BITS as UART_DEFAULT_DATA_BITS
+from codevanta.analysis.uart_decode import DEFAULT_PARITY as _UART_DEFAULT_PARITY
+from codevanta.analysis.uart_decode import DEFAULT_STOP_BITS as UART_DEFAULT_STOP_BITS
 from codevanta.core.report import AnalysisError
 
 from . import tools
+from .ext_solver import TOOL_DESCRIPTION as SYMBOLIC_SOLVE_DESCRIPTION
+
+#: Upstream ``DEFAULT_PARITY`` is inferred plain ``str``; the MCP schema
+#: publishes the literal union the UART decoder actually accepts.
+UART_DEFAULT_PARITY = cast(Literal["none", "even", "odd"], _UART_DEFAULT_PARITY)
 
 SERVER_NAME = "CODEVANTA"
 SERVER_VERSION = "0.1.0"
@@ -650,6 +662,195 @@ def build_server() -> MCPServer:
     )
     def codevanta_metadata(path: str) -> dict:
         return tools.codevanta_metadata(path)
+
+    @server.tool(
+        description=(
+            "Summarise a crash dump file, auto-detecting the format: a Linux "
+            "ELF core dump or an Apple .ips crash report (the leading magic "
+            "bytes decide). Offline and read-only: the file is parsed, never "
+            "executed, and the payload carries the format, the parsed summary "
+            "fields and an evidence record stating how much of the finding "
+            "was parse-verified."
+        )
+    )
+    def codevanta_crash(path: str) -> dict:
+        return tools.codevanta_crash(path)
+
+    @server.tool(
+        description=(
+            "Auto-detect container formats in one file: WASM, EVM (a labelled "
+            "heuristic verdict, evm_like), GGUF, safetensors, pcap/pcapng and "
+            "firmware magics. Offline and read-only; the summary carries an "
+            "evidence record with source/method/confidence."
+        )
+    )
+    def codevanta_binmeta(path: str) -> dict:
+        return tools.codevanta_binmeta(path)
+
+    @server.tool(
+        description=(
+            "Introspect a SQLite database strictly read-only through the "
+            "mode=ro&immutable=1 URI: a bounded table list with row counts, "
+            "and with `table` that table's columns plus up to 10 sample rows "
+            "(JSON-safe values). The tool cannot write, create journals or "
+            "replay a WAL; a present -wal file is reported as ignored. "
+            "Offline."
+        )
+    )
+    def codevanta_sqlite(path: str, table: str | None = None) -> dict:
+        return tools.codevanta_sqlite(path, table)
+
+    @server.tool(
+        description=(
+            "Read-only Android device queries over adb: action='devices' "
+            "lists attached devices/emulators; action='props'/'packages'/"
+            "'processes' inspect the device named by `device`. Requires adb "
+            "on PATH - its absence surfaces as a typed error naming the "
+            "platform-tools install step, never a traceback. Mutating actions "
+            "(install, screencap, bugreport) are deliberately not exposed."
+        )
+    )
+    def codevanta_adb(
+        action: Literal["devices", "props", "packages", "processes"],
+        device: str | None = None,
+    ) -> dict:
+        return tools.codevanta_adb(action, device)
+
+    @server.tool(
+        description=(
+            "Passively inspect one live Electron/Chromium page over CDP: list "
+            "the debugger endpoint's targets, pick target_id (or the first "
+            "page target) and return title, url, bounded resources and "
+            "console traffic overheard during observe_ms. Skip-gated on "
+            "endpoint reachability: an unreachable endpoint comes back as "
+            "{\"available\": false, \"reason\": ...} with evidence, not an "
+            "error. Read-only: only domain enables and navigation/resource "
+            "queries are sent, never Runtime.evaluate."
+        )
+    )
+    def codevanta_web_inspect(
+        endpoint: str = WEB_DEFAULT_ENDPOINT,
+        target_id: str | None = None,
+        observe_ms: int = WEB_DEFAULT_OBSERVE_MS,
+    ) -> dict:
+        return tools.codevanta_web_inspect(
+            endpoint,
+            target_id=target_id,
+            observe_ms=observe_ms,
+        )
+
+    @server.tool(
+        description=(
+            "List an Electron ASAR archive offline (bounded 512 file entries "
+            "with honest totals), or with `extract` naming one in-archive "
+            "entry read that entry (bounded 8 MiB) and report its size and "
+            "SHA-256. Pure byte parsing; nothing is executed."
+        )
+    )
+    def codevanta_asar(path: str, extract: str | None = None) -> dict:
+        return tools.codevanta_asar(path, extract)
+
+    @server.tool(description=SYMBOLIC_SOLVE_DESCRIPTION)
+    def codevanta_symbolic_solve(
+        path: str,
+        address: int | None = None,
+        max_paths: int = tools.DEFAULT_SYMBOLIC_MAX_PATHS,
+        max_steps: int = tools.DEFAULT_SYMBOLIC_MAX_STEPS,
+        solver_mode: Literal["auto", "naive"] = "auto",
+        timeout_ms: int = SOLVER_DEFAULT_TIMEOUT_MS,
+    ) -> dict:
+        return tools.codevanta_symbolic_solve(
+            path,
+            address,
+            max_paths=max_paths,
+            max_steps=max_steps,
+            solver_mode=solver_mode,
+            timeout_ms=timeout_ms,
+        )
+
+    @server.tool(
+        description=(
+            "Summarize one sigrok .sr session archive offline: version, "
+            "sample rate, device, channels, logic-file names and byte sizes, "
+            "and the annotation count when the archive carries one. "
+            "ZIP-bomb guarded; the logic data is stat'ed but never inflated."
+        )
+    )
+    def codevanta_signal_sr(path: str) -> dict:
+        return tools.codevanta_signal_sr(path)
+
+    @server.tool(
+        description=(
+            "Decode a raw logic-0/1 capture file as UART with the pure-Python "
+            "decoder-lite (medium confidence by design). One byte per sample: "
+            "0 is logic low, anything else high; samplerate_hz must give at "
+            "least 2 samples per baud bit. Offline; garbage captures decode "
+            "to few or zero bytes with warnings."
+        )
+    )
+    def codevanta_uart_decode(
+        path: str,
+        samplerate_hz: int,
+        baud: int = UART_DEFAULT_BAUD,
+        databits: int = UART_DEFAULT_DATA_BITS,
+        parity: Literal["none", "even", "odd"] = UART_DEFAULT_PARITY,
+        stopbits: int = UART_DEFAULT_STOP_BITS,
+    ) -> dict:
+        return tools.codevanta_uart_decode(
+            path,
+            samplerate_hz,
+            baud=baud,
+            databits=databits,
+            parity=parity,
+            stopbits=stopbits,
+        )
+
+    @server.tool(
+        description=(
+            "Parse one flattened devicetree blob (DTB) offline: a shallow, "
+            "bounded walk returning the tree structure and, with `node`, the "
+            "properties of that top-level node (the root's own properties "
+            "when omitted). Unknown node names are typed errors."
+        )
+    )
+    def codevanta_dtb(path: str, node: str | None = None) -> dict:
+        return tools.codevanta_dtb(path, node)
+
+    @server.tool(
+        description=(
+            "Read or write one session's navigation state: action='mark' "
+            "pins a bookmark, 'comment' attaches a note, 'goto' moves the "
+            "cursor and records the visit, 'cursor' reads it back and "
+            "'bookmarks'/'comments'/'history' list the bounded state. Every "
+            "action needs `session` and the session database path `db`; "
+            "mark/comment/goto also need `address` (int or 0x-prefixed hex "
+            "string). A missing session is a typed error with the "
+            "'codevanta session save' hint. Offline."
+        )
+    )
+    def codevanta_nav(
+        action: Literal[
+            "mark", "comment", "goto", "cursor", "bookmarks", "comments", "history"
+        ],
+        session: str | None = None,
+        address: int | str | None = None,
+        name: str | None = None,
+        text: str | None = None,
+        db: str | None = None,
+    ) -> dict:
+        return tools.codevanta_nav(action, session, address, name, text, db)
+
+    @server.tool(
+        description=(
+            "Report which external GUI navigation providers (Hopper, Cutter, "
+            "Ghidra) could attach on this machine: one capability report each "
+            "with name/available/reason, plus the nav.providers evidence "
+            "record. The probes never launch anything and never raise; "
+            "CODEVANTA's own navigation works regardless. Offline."
+        )
+    )
+    def codevanta_nav_providers() -> dict:
+        return tools.codevanta_nav_providers()
 
     return server
 
