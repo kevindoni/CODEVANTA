@@ -4,6 +4,17 @@ All notable changes to CODEVANTA are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-13
+
+### Fixed
+
+- The 12 ext MCP tools introduced in 0.2.0 (crash, metadata auto-detect's
+  siblings: binmeta, sqlite, adb, web_inspect, asar, symbolic_solve,
+  signal_sr, uart_decode, dtb, nav, nav_providers) had import lines but were
+  never wired into `build_server`, so only 26 of the intended 38 tools were
+  actually registered. All 12 now have `@server.tool` wrappers and the full
+  38-name list is asserted in the test suite. `list_tools()` now returns 38.
+
 ## [0.2.0] - 2026-11-13
 
 ### Added
