@@ -4,6 +4,45 @@ All notable changes to CODEVANTA are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-13
+
+### Added
+
+- **Typed comparators** (`codevanta compare <a.json> <b.json>` + MCP tool
+  `codevanta_compare`): function inventories matched by name and by fingerprint,
+  string-set diffs, and evidence-bundle membership diffs - all offline, typed,
+  evidence-backed.
+- **Residual-unknown ledger** (`codevanta unknowns`): typed `UnknownRecord` with
+  deterministic ids and an open/resolve lifecycle, surfaced in the evidence bundle
+  and over MCP (`codevanta_unknowns`).
+- **Six REA-parity lanes** (PR #50): ELF-core + Apple `.ips` crash parsers
+  (`codevanta core`/`codevanta ips`, MCP `codevanta_crash`); auto-detecting
+  format metadata (APK signing v2/v3, Go buildinfo, Rust cargo-auditable, `.pyc`
+  headers, Electron fuses, ELF notes/modinfo, desktop classification;
+  `codevanta metadata`, MCP `codevanta_metadata`); binary containers (WASM
+  sections, EVM disasm-lite, GGUF, safetensors, pcap, firmware magic scan,
+  `codevanta binmeta`/`codevanta evm`) and a read-only SQLite viewer
+  (`codevanta sqlite`, MCP `codevanta_binmeta`/`codevanta_sqlite`); the ADB
+  mobile lane with offline transcript parsers and skip-gated live wrappers
+  (`codevanta mobile`, MCP `codevanta_adb`); the Web/Electron lane (stdlib
+  CDP client, passive page inspection, screenshot, WebMCP probe, ASAR
+  reconstruction; `codevanta web`/`codevanta asar`, MCP
+  `codevanta_web_inspect`/`codevanta_asar`); and solver-backed symbolic
+  execution gated on optional z3-solver with an unchanged naive fallback
+  (`--solver auto`, MCP `codevanta_symbolic_solve`).
+- **Signal/firmware lane** (PR #51): sigrok `.sr` session archives, a pure-Python
+  UART decoder-lite with parity/stop validation, flattened devicetree (FDT)
+  parsing, and a skip-gated sigrok-cli wrapper (`codevanta signal`/`codevanta dtb`,
+  MCP `codevanta_signal_sr`/`codevanta_uart_decode`/`codevanta_dtb`).
+- **Provider-neutral navigation state** (PR #51): bookmarks, comments, cursor and
+  goto-history per session over the session store, plus typed external-GUI
+  provider probes (`codevanta nav`, MCP `codevanta_nav`/`codevanta_nav_providers`).
+
+### Changed
+
+- MCP server now exposes 38 tools (from 22 at v0.1.0); `z3-solver>=4.13` joined
+  the dev extras so CI exercises the solver lane for real.
+
 ## [0.1.1] - 2026-11-13
 
 ### Added
