@@ -11,7 +11,7 @@ cd CODEVANTA
 python -m pip install -e ".[dev]"
 ```
 
-Python 3.10+ is required; CI runs on 3.11 and 3.13.
+Python 3.10+ is required; CI runs on 3.11, 3.13, and 3.14.
 
 ## Checks before opening a pull request
 
@@ -95,9 +95,13 @@ walks through the account, the noreply address, the helper and the check.
 
 ## Pull requests
 
-`main` is protected: a pull request is required and the CI checks
-(`test (py3.11)`, `test (py3.13)`, `build and smoke-test wheel`) must pass before
-a squash merge. Direct pushes to `main` are rejected, including for maintainers.
+`main` is protected: a pull request is required and CI must pass before a
+squash merge. A CI run produces 11 checks — `test (py3.11)`, `test (py3.13)`,
+`test (py3.14)`, `type-check (mypy)`, `build and smoke-test wheel`,
+`decompile-parity`, `fuzz smoke (parser hardening)` (blocking), plus
+`ghidra-parity`, `benchmark (informational)`, and `test (py3.13,
+windows-latest)` / `test (py3.13, macos-latest)` (non-blocking platform
+signal). Direct pushes to `main` are rejected, including for maintainers.
 
 Work on a branch, push it, and open a pull request:
 

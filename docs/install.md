@@ -37,14 +37,15 @@ uv tool install git+https://github.com/kevindoni/CODEVANTA.git   # isolated
 # from a local clone: python -m pip install -e ".[dev]"
 ```
 
-## From PyPI (after the first release)
+## From PyPI
 
 ```powershell
-uv tool install codevanta       # or: pipx install codevanta
+python -m pip install codevanta   # or: uv tool install codevanta / pipx install codevanta
 codevanta setup --dry-run --client claude
 ```
 
-Until the first PyPI release is published, use the GitHub one-liners above.
+The GitHub one-liners above install from `main`; use them when you want the
+latest unreleased changes instead of the published version.
 
 ## Connect a coding agent
 

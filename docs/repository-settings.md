@@ -11,7 +11,7 @@ Applied through the GitHub API (`PUT /repos/kevindoni/CODEVANTA/branches/main/pr
 |------|-------|
 | Require a pull request before merging | yes (0 approvals, so a maintainer can self-merge) |
 | Dismiss stale approvals on new commits | yes |
-| Require status checks | `test (py3.11)`, `test (py3.13)`, `build and smoke-test wheel` |
+| Require status checks | `test (py3.11)`, `test (py3.13)`, `test (py3.14)`, `type-check (mypy)`, `build and smoke-test wheel`, `decompile-parity`, `fuzz smoke (parser hardening)` — the full CI run is listed in §6 |
 | Require branches to be up to date | yes (strict) |
 | Require linear history | yes (squash or rebase merges only) |
 | Block force pushes | yes |
@@ -74,7 +74,7 @@ both files to the GitHub release. Update `CHANGELOG.md` before tagging.
 
 | Workflow | Trigger | Jobs |
 |----------|---------|------|
-| `ci.yml` | push to `main`, pull requests, manual | lint + tests on 3.11/3.13, wheel build and clean-venv smoke test |
+| `ci.yml` | push to `main`, pull requests, manual | lint + tests on 3.11/3.13/3.14, mypy type-check, wheel build and clean-venv smoke test, `decompile-parity` (angr), `ghidra-parity` (best effort), `fuzz smoke`, `benchmark` (informational), py3.13 windows/macos platform runs (non-blocking) |
 | `release.yml` | tag `v*` | build, PyPI trusted publish, GitHub release assets |
 
 Python 3.11, 3.13, and 3.14 are in the CI matrix. Older interpreters are
