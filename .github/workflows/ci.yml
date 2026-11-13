@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 on:
   push:
@@ -110,7 +110,7 @@ jobs:
       - name: Report the available decompiler backends
         run: python scripts/check_decompiler_backends.py
       - name: Decompiler parity
-        run: python -m pytest tests/test_decompiler_parity.py -q
+        run: python -m pytest tests/test_decompiler_parity.py tests/test_solver.py -q
 
   # SECOND real provider, and deliberately BEST EFFORT. Unlike angr (pure wheels),
   # the ghidra backend needs two things this repository does not own: a ~570 MB
