@@ -451,13 +451,13 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools (nineteen): `codevanta_info`, `codevanta_functions`,
+MCP tools (twenty): `codevanta_info`, `codevanta_functions`,
 `codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
 `codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
 `codevanta_jump_table`, `codevanta_function_hash`, `codevanta_similarity`,
 `codevanta_struct`, `codevanta_entropy`, `codevanta_decompile`,
-`codevanta_dwarf`, `codevanta_vtable`, `codevanta_session_save`,
-`codevanta_session_list`.
+`codevanta_dwarf`, `codevanta_vtable`, `codevanta_trace`,
+`codevanta_session_save`, `codevanta_session_list`.
 `codevanta_analyze` mirrors
 the CLI flags (`include_xrefs` / `include_cfg` / `include_callgraph`, default off)
 so a single call can carry the phase 2 sections when an agent prefers one payload.
@@ -554,11 +554,18 @@ plus smoke-tests the wheel on 3.13.
 
 ## Roadmap
 
-- [x] Phase 1 — core engine foundation: PE/ELF/Mach-O/DEX loading, disassembly, strings, functions, CLI, JSON evidence reports
-- [ ] Phase 2 — cross-references, CFG views, session storage, basic debugger
-- [ ] Phase 3 — basic type recovery, binary diff, Python scripting
-- [ ] Phase 4 — emulation (Unicorn), IR lifting, symbolic execution (optional)
-- [ ] Phase 5 — plugin system, full AI layer, multi-user, CI/CD
+Verified against this repository, not against intent. Every ✅ names the file
+that implements it, so each claim is one file lookup away; every ⬜ is absent
+from `src/`. A phase can be **delivered with named gaps** — those gaps are the
+*Open* column, not a follow-up phase.
+
+| Phase | Delivered | Open |
+|-------|-----------|------|
+| **1 · Foundation** | ✅ PE / ELF / Mach-O (fat slices too) / DEX loaders — `core/loader.py:363-379` (`dex\n` magic → `_load_dex`)<br>✅ Disassembly, ASCII + UTF-16 strings, function discovery, JSON evidence report — `core/disassembler.py`, `core/strings.py`, `core/functions.py`, `core/report.py`<br>✅ Per-section entropy and packing triage — `core/entropy.py` (`shannon_entropy`, `analyze_entropy`), `codevanta entropy`<br>✅ CLI: 20 commands (19 `@app.command()` + `mcp serve`) plus the `session` sub-app with 5 subcommands — `cli/main.py`<br>✅ MCP server exposing 17 tools — `mcp_server/server.py` (`build_server().list_tools()` returns 17)<br>✅ Guided agent setup for Claude Code, Cursor, Cline and VS Code — `setup/` (`clients.py`, `plan.py`, `apply.py`, `verify.py`) | ⬜ **.NET (CLR), WebAssembly and JVM `.class`/JAR formats** — `loader.py` recognises PE, ELF, Mach-O and DEX only |
+| **2 · RE views** | ✅ Cross-references, incl. `call_import` / `call_indirect` slot resolution — `analysis/xrefs.py`<br>✅ Linear **and** recursive CFG — `analysis/cfg.py` (`build_cfg`, `build_recursive_cfg`), `codevanta cfg --traversal recursive`<br>✅ Call graphs with DOT / GraphML / HTML export — `analysis/callgraph.py`, `analysis/graph_export.py`, `analysis/html_view.py`<br>✅ Absolute and relative jump tables — `analysis/jump_tables.py` (`MODE_ABSOLUTE`, `MODE_RELATIVE`)<br>✅ SQLite sessions with address annotations — `storage/session.py`, `codevanta session save/list/show/annotate/notes`<br>✅ Structural binary diff, function fingerprints, function similarity — `analysis/binary_diff.py`, `analysis/function_hash.py`<br>✅ Struct-field recovery — `analysis/type_recovery.py`, `codevanta struct`<br>✅ Read-only loopback dashboard, 10 endpoints — `gui/server.py` (`ROUTES`) | ⬜ **Live debugger attach** — `codevanta attach` states outright that "the provider is never launched: this command writes a file and prints a command line"; nothing runs gdb/Frida against a target<br>⬜ **GUI session persistence** — `gui/server.py:ROUTES` has 10 endpoints and none is session-related<br>⬜ **Graph-oriented viewer application** — the shipped viewer is the static HTML/SVG export (`analysis/html_view.py`), not an interactive app |
+| **3 · Decompilation** | ✅ Pseudo-C through three providers — `analysis/decompile.py`, `analysis/decompilers/` (`native`, `angr`, `ghidra` reported by `available_backends()`)<br>✅ Type propagation over decompiled output — `analysis/type_propagation.py`<br>✅ Decompiler parity enforced in CI instead of assumed — `.github/workflows/ci.yml` jobs `decompile-parity` and `ghidra-parity` | ⬜ **Embedded Python scripting** — no script command and no sandboxed interpreter; `session` stores annotations only |
+| **4 · Emulation** | ✅ Bounded, offline emulation that never executes on the host, with explicit `return` / `budget` / `unmapped` / `unsupported` stop reasons — `analysis/emulate.py` (Unicorn), `codevanta emulate`<br>✅ 29 emulation tests — `tests/test_emulate.py` | ⬜ **Typed / SSA IR lifting** — `ir/base.py` and `ir/adapters/` are a contract plus an empty registry ("Concrete adapters arrive in phase 4")<br>⬜ **Symbolic execution** — no `Simulator`/`SimulationManager`/Z3 usage anywhere in `src/` |
+| **5 · Platform** | ✅ CI/CD with real gates — `ci.yml` runs 7 job runs (3 Python versions × `test`, plus `type-check` (mypy), `package` (wheel smoke test), `decompile-parity`, `ghidra-parity`) and `pyproject.toml` sets `fail_under = 85` coverage<br>✅ Release pipeline — `release.yml`: `build` → `publish-pypi` (trusted publishing) → `github-release`<br>✅ Dynamic provider probing, script generation and trace replay reachable from the CLI — `analysis/dynamic.py`, `analysis/trace.py` (`parse_gdb_trace`, `parse_frida_trace`), `codevanta attach`, `codevanta trace` | ⬜ **Plugin SDK** — `plugins/__init__.py` is a single docstring line, "Plugin system — phase 5"<br>⬜ **Full AI layer** and **multi-user** — no auth, user or tenant model exists in `src/`<br>⬜ **Evidence bundle** export — `evidence/` has `models`, `provenance` and `confidence`, but no bundle writer; only the `analyze` JSON report is emitted<br>⬜ **Fuzz and benchmark gates** — `scripts/bench.py` and `tests/test_bench.py` exist, yet no CI job enforces either and there is no fuzzer<br>⬜ **Windows / macOS CI** — every job in both workflows is `runs-on: ubuntu-latest`<br>⬜ **PyPI release** — publishing is wired but has never run: `git tag -l` is empty, so no `v*` tag has been cut |
 
 ## Product principles
 

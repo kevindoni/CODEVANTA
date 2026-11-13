@@ -329,24 +329,28 @@ details.diffbox > summary:hover { color: var(--ink); }
 .kv-row .v { padding: 9px 14px; font: 500 12.5px/1.5 var(--mono); color: #c3cedd; word-break: break-all; }
 .kv-note { margin: 0; font-size: 12px; color: var(--dim); }
 .kv-note b { color: var(--mut); font-weight: 650; }
+.kv-note.error { color: var(--err); }
 
-.table-wrap {
+.table-wrap, .session-wrap {
   overflow: auto;
   max-height: 56vh;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #0b0e13;
 }
-table#tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-table#tbl th, table#tbl td {
+table#tbl, table#session-tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+table#tbl th, table#tbl td,
+table#session-tbl th, table#session-tbl td {
   padding: 8px 12px;
   border-bottom: 1px solid var(--line);
   text-align: left; vertical-align: top;
   font-family: var(--mono);
 }
-table#tbl tbody tr:last-child td { border-bottom: none; }
-table#tbl tbody tr:hover td { background: rgba(45, 212, 191, 0.04); }
-table#tbl th {
+table#tbl tbody tr:last-child td,
+table#session-tbl tbody tr:last-child td { border-bottom: none; }
+table#tbl tbody tr:hover td,
+table#session-tbl tbody tr:hover td { background: rgba(45, 212, 191, 0.04); }
+table#tbl th, table#session-tbl th {
   position: sticky; top: 0; z-index: 1;
   color: var(--dim);
   font: 700 10px/1.2 var(--sans);
@@ -648,6 +652,43 @@ _BODY = """
     </div>
   </details>
 
+  <section class="card" id="sessions">
+    <p class="step-tag"><span class="n">3</span> Sessions &mdash; keep what you found</p>
+    <p class="hero-hint" style="margin-top:0">
+      Saving stores the file above as a session record, so the list is still here after a
+      reload, a restart or in another tab. Records live in the local session database and
+      the file itself is never modified.
+    </p>
+    <div class="hero-row">
+      <div class="grow mono">
+        <label for="session-notes">Note for this session (optional)</label>
+        <input id="session-notes" type="text" spellcheck="false" autocomplete="off"
+               placeholder="e.g. candidate build, crash repro, reviewed by hand">
+      </div>
+      <div>
+        <label style="visibility:hidden">save</label>
+        <button type="button" id="session-save" class="primary" data-action="session_save">Save session</button>
+      </div>
+    </div>
+    <div class="hero-row" style="margin-top:14px">
+      <div style="max-width:190px">
+        <label for="session-limit" title="how many stored sessions the list asks for">Rows to list</label>
+        <input id="session-limit" type="number" min="1" max="10000" step="1" value="50">
+      </div>
+      <div>
+        <label style="visibility:hidden">refresh</label>
+        <button type="button" id="session-refresh" data-action="session_list">Refresh list</button>
+      </div>
+    </div>
+    <div class="session-wrap hidden" id="session-wrap" style="margin-top:14px">
+      <table id="session-tbl">
+        <thead><tr></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="kv-note" id="session-note" style="margin-top:10px">No sessions loaded yet.</p>
+  </section>
+
 </main>
 """
 
@@ -665,7 +706,9 @@ _SCRIPT = """
     struct: "/api/struct",
     callgraph: "/api/callgraph",
     diff: "/api/diff",
-    decompile: "/api/decompile"
+    decompile: "/api/decompile",
+    session_save: "/api/session_save",
+    session_list: "/api/session_list"
   };
 
   var MAX_TABLE_ROWS = 200;
@@ -726,6 +769,18 @@ _SCRIPT = """
       addParam(parts, "right", fieldValue("right"));
       addParam(parts, "semantic", fieldValue("semantic") || "0");
       addParam(parts, "threshold", fieldValue("threshold"));
+      return parts;
+    }
+    // The session routes accept a closed set of parameters and answer anything
+    // else with 400, so they are built here instead of falling through to the
+    // generic "path" line below: the list route takes no path at all.
+    if (action === "session_save") {
+      addParam(parts, "path", fieldValue("path"));
+      addParam(parts, "notes", fieldValue("session-notes"));
+      return parts;
+    }
+    if (action === "session_list") {
+      addParam(parts, "limit", fieldValue("session-limit"));
       return parts;
     }
     addParam(parts, "path", fieldValue("path"));
@@ -874,6 +929,115 @@ _SCRIPT = """
       });
       body.appendChild(tr);
     });
+  }
+
+  // Columns of the Sessions panel, in display order. They are the fields
+  // /api/session_list returns, spelled once so the header and the cells can
+  // never drift apart.
+  var SESSION_COLUMNS = [
+    "session_id",
+    "created_at",
+    "path",
+    "format",
+    "architecture",
+    "notes"
+  ];
+
+  function setSessionNote(message, isError) {
+    var element = byId("session-note");
+    if (!element) {
+      return;
+    }
+    element.textContent = message;
+    element.className = isError ? "kv-note error" : "kv-note";
+  }
+
+  function sessionRows(data) {
+    if (!data || typeof data !== "object" || !isRowList(data.sessions)) {
+      return [];
+    }
+    return data.sessions;
+  }
+
+  function renderSessions(data) {
+    var table = byId("session-tbl");
+    var wrap = byId("session-wrap");
+    var rows = sessionRows(data);
+    if (!table || !table.tHead || !table.tBodies.length) {
+      return rows.length;
+    }
+    var head = table.tHead.rows[0];
+    var body = table.tBodies[0];
+    while (head.cells.length > 0) {
+      head.deleteCell(-1);
+    }
+    while (body.firstChild) {
+      body.removeChild(body.firstChild);
+    }
+    SESSION_COLUMNS.forEach(function (name) {
+      var cell = document.createElement("th");
+      cell.textContent = name;
+      head.appendChild(cell);
+    });
+    rows.slice(0, MAX_TABLE_ROWS).forEach(function (row) {
+      var tr = document.createElement("tr");
+      SESSION_COLUMNS.forEach(function (name) {
+        var td = document.createElement("td");
+        // textContent only: a path or a note is attacker-controlled text and is
+        // never parsed as markup.
+        td.textContent = cellText(row && typeof row === "object" ? row[name] : row);
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+    if (wrap) {
+      wrap.className = rows.length ? "session-wrap" : "session-wrap hidden";
+    }
+    return rows.length;
+  }
+
+  function loadSessions(announce) {
+    // Used on page load and after a save: it keeps the panel current without
+    // touching the status line or the raw-JSON box the user may be reading.
+    // ``announce`` says whether the panel note may be rewritten -- the startup
+    // call wants the restored count, while the refresh that follows a save must
+    // leave the "saved <id>" confirmation in place.
+    var parts = [];
+    addParam(parts, "limit", fieldValue("session-limit"));
+    var url = ENDPOINTS.session_list + (parts.length ? "?" + parts.join("&") : "");
+    fetch(url, { headers: { Accept: "application/json" } })
+      .then(function (response) {
+        return response
+          .json()
+          .then(function (data) {
+            return { ok: response.ok, status: response.status, data: data };
+          })
+          .catch(function () {
+            return { ok: response.ok, status: response.status, data: { error: "invalid JSON" } };
+          });
+      })
+      .then(function (result) {
+        if (!result.ok) {
+          if (announce) {
+            var detail = result.data && result.data.error ? result.data.error : "request failed";
+            setSessionNote("HTTP " + result.status + " " + detail, true);
+          }
+          return;
+        }
+        var count = renderSessions(result.data);
+        if (announce) {
+          if (count > 0) {
+            setSessionNote(count + " saved session(s) restored from the session database", false);
+          } else {
+            setSessionNote("No sessions stored yet \u2014 pick a file and press Save session.", false);
+          }
+        }
+      })
+      .catch(function (error) {
+        if (announce) {
+          setSessionNote("session list failed: " + String(error), true);
+        }
+      });
   }
 
   function humanSize(bytes) {
@@ -1035,6 +1199,25 @@ _SCRIPT = """
               ? " · " + result.data.warnings.length + " warning(s)"
               : "";
             setStatus("HTTP " + result.status + " · engine " + engineName + warnCount, false);
+          } else if (action === "session_list") {
+            var listed = renderSessions(result.data);
+            setSessionNote(
+              "HTTP " + result.status + " \u00b7 " + listed + " session(s) in the list",
+              false
+            );
+            setStatus("HTTP " + result.status + " \u00b7 " + listed + " session(s)", false);
+          } else if (action === "session_save") {
+            var savedId = result.data && result.data.session_id
+              ? String(result.data.session_id)
+              : "?";
+            var savedAt = result.data && result.data.created_at
+              ? String(result.data.created_at)
+              : "?";
+            setSessionNote("saved " + savedId + " at " + savedAt, false);
+            setStatus("HTTP " + result.status + " \u00b7 session saved", false);
+            // Refresh the table but keep the "saved <id>" note that was just
+            // written, which is the confirmation the user asked for.
+            loadSessions(false);
           } else if (action === "info") {
             renderSummary(result.data);
             showView("summary");
@@ -1048,7 +1231,9 @@ _SCRIPT = """
             setStatus(summary, false);
           }
           var resultCard = document.querySelector(".card.result");
-          if (resultCard && resultCard.scrollIntoView) {
+          // A session request reports in its own panel, so the page must not
+          // scroll the main result card into view for it.
+          if (resultCard && resultCard.scrollIntoView && action.indexOf("session") !== 0) {
             resultCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
           }
         } else {
@@ -1056,6 +1241,9 @@ _SCRIPT = """
           setStatus("HTTP " + result.status + " " + detail, true);
           renderTable([]);
           showView("empty");
+          if (action.indexOf("session") === 0) {
+            setSessionNote("HTTP " + result.status + " " + detail, true);
+          }
         }
       })
       .catch(function (error) {
@@ -1081,6 +1269,11 @@ _SCRIPT = """
       }
     });
   }
+
+  // Reload the stored history as soon as the page opens: this is what makes a
+  // session survive a reload. It leaves the "idle" status line and the empty
+  // raw-JSON box alone and reports the restored count in the panel note.
+  loadSessions(true);
 })();
 
 

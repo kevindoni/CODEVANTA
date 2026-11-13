@@ -51,7 +51,7 @@ from typing import Any
 
 from codevanta.analysis.dynamic import MAX_FRIDA_ARGS
 from codevanta.core.functions import FunctionCandidate
-from codevanta.core.loader import BinaryInfo
+from codevanta.core.loader import BinaryInfo, SectionInfo
 from codevanta.core.report import AnalysisError
 from codevanta.evidence.confidence import Confidence
 from codevanta.evidence.models import Evidence
@@ -197,19 +197,35 @@ class TraceReport:
 
 
 class _FunctionIndex:
-    """Bisect-based lookup from an address to the candidate that encloses it."""
+    """Bisect-based lookup from an address to the candidate that encloses it.
 
-    def __init__(self, functions: Sequence[FunctionCandidate]) -> None:
+    A candidate's extent comes from its symbol size when the loader knows it, and
+    otherwise from the executable section that contains it: a function cannot run
+    past the end of its own section. When neither is available the extent is
+    unknown, and an address above the start is reported as unattributed instead of
+    being guessed onto the function.
+    """
+
+    def __init__(
+        self,
+        functions: Sequence[FunctionCandidate],
+        info: BinaryInfo | None = None,
+    ) -> None:
         self._starts: list[int] = []
-        self._sizes: list[int | None] = []
+        self._ends: list[int | None] = []
         self._names: list[str | None] = []
+        sections = (
+            [section for section in getattr(info, "sections", ()) if section.is_executable]
+            if info is not None
+            else []
+        )
         for candidate in sorted(functions, key=lambda item: item.address):
             if candidate.address <= 0:
                 continue
             if self._starts and self._starts[-1] == candidate.address:
                 continue
             self._starts.append(candidate.address)
-            self._sizes.append(candidate.size)
+            self._ends.append(_candidate_end(candidate, sections))
             self._names.append(candidate.name)
 
     def locate(self, address: int) -> tuple[int, str | None] | None:
@@ -218,15 +234,30 @@ class _FunctionIndex:
         if position < 0:
             return None
         start = self._starts[position]
-        size = self._sizes[position]
-        if size is not None and size > 0:
-            inside = address < start + size
+        end = self._ends[position]
+        if end is not None:
+            inside = address < end
+        elif position + 1 < len(self._starts):
+            # No size and no section: the next candidate's start is the boundary.
+            inside = address < self._starts[position + 1]
         else:
-            # No size: the next candidate's start is the only boundary available.
-            inside = position + 1 == len(self._starts) or address < self._starts[position + 1]
+            inside = False
         if not inside:
             return None
         return start, self._names[position]
+
+
+def _candidate_end(candidate: FunctionCandidate, sections: Sequence[SectionInfo]) -> int | None:
+    """Return the last address a candidate can occupy, or ``None`` when unknown."""
+    size = getattr(candidate, "size", None)
+    if isinstance(size, int) and size > 0:
+        return candidate.address + size
+    for section in sections:
+        start = section.virtual_address
+        end = start + section.size
+        if start <= candidate.address < end:
+            return end
+    return None
 
 
 def _snippet(line: str) -> str:
@@ -390,7 +421,7 @@ def parse_gdb_trace(
     """
     line_limit = _require_max_lines(max_lines)
     hit_limit = _require_max_hits(max_hits)
-    index = _FunctionIndex(functions)
+    index = _FunctionIndex(functions, info)
 
     lines = text.splitlines()
     warnings: list[str] = []
@@ -508,7 +539,7 @@ def parse_frida_trace(
     """
     line_limit = _require_max_lines(max_lines)
     hit_limit = _require_max_hits(max_hits)
-    index = _FunctionIndex(functions)
+    index = _FunctionIndex(functions, info)
 
     lines = text.splitlines()
     warnings: list[str] = []

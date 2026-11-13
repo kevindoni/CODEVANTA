@@ -16,6 +16,7 @@ import threading
 from collections.abc import Iterator
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -30,6 +31,8 @@ from codevanta.gui import (
 )
 from codevanta.gui import server as gui_server_module
 from codevanta.gui.server import MAX_RESPONSE_BYTES, _encode_payload, is_allowed_host
+from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
+from codevanta.storage.session import MAX_NOTE_LENGTH as MAX_SESSION_NOTE_LENGTH
 
 TEXT_VA = 0x401000
 DATA_VA = 0x402000
@@ -728,3 +731,269 @@ def test_response_cap_shrinks_a_decompiled_text_field() -> None:
     assert payload["address"] == "0x401000"
 
 
+
+# ---------------------------------------------------------------------------
+# /api/session_save and /api/session_list
+# ---------------------------------------------------------------------------
+
+#: Note used by the session tests: it carries the two characters (``&`` and a
+#: space) that a query string mangles unless the value is encoded on the way out
+#: and decoded on the way in.
+SESSION_NOTES = "reviewed by hand & filed"
+
+
+def _session_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the dashboard at a throw-away session database and return its path.
+
+    ``$CODEVANTA_DB`` is the override the CLI and the MCP tools already read
+    (``tests/test_cli_phase2.py`` uses it the same way), so the routes resolve the
+    temporary file through the production mechanism rather than a test-only hook.
+    """
+    db = tmp_path / "sessions.db"
+    monkeypatch.setenv("CODEVANTA_DB", str(db))
+    return db
+
+
+def _save(
+    server: ThreadingHTTPServer, binary: Path, notes: str | None = None
+) -> tuple[int, dict]:
+    """GET ``/api/session_save`` for ``binary``, optionally with ``notes``."""
+    query = f"path={quote(binary.as_posix())}"
+    if notes is not None:
+        query = f"{query}&notes={quote(notes)}"
+    return _get(server, f"/api/session_save?{query}")
+
+
+def test_session_save_stores_a_record_that_session_list_returns(
+    gui_server: ThreadingHTTPServer,
+    sample_binary: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _session_db(monkeypatch, tmp_path)
+
+    status, saved = _save(gui_server, sample_binary, SESSION_NOTES)
+
+    assert status == 200, saved
+    # Exactly the two identifiers the page needs to confirm the save.
+    assert set(saved) == {"session_id", "created_at"}
+    assert saved["session_id"]
+    assert db.exists()
+
+    list_status, listing = _get(gui_server, "/api/session_list")
+
+    assert list_status == 200
+    assert listing["count"] == 1
+    assert len(listing["sessions"]) == 1
+    record = listing["sessions"][0]
+    assert record["session_id"] == saved["session_id"]
+    assert record["created_at"] == saved["created_at"]
+    assert Path(record["path"]) == sample_binary
+    assert record["format"] == "ELF"
+    assert record["architecture"]
+    assert record["notes"] == SESSION_NOTES
+
+
+
+
+def test_a_saved_session_survives_a_restart(
+    sample_binary: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The point of the panel: a reload (or a restarted dashboard) still sees the
+    # record, because it lives in the database file and not in a browser tab.
+    _session_db(monkeypatch, tmp_path)
+    first = create_server("127.0.0.1", 0)
+    first_thread = _start(first)
+    try:
+        status, saved = _save(first, sample_binary)
+        assert status == 200, saved
+    finally:
+        _stop(first, first_thread)
+
+    second = create_server("127.0.0.1", 0)
+    second_thread = _start(second)
+    try:
+        status, listing = _get(second, "/api/session_list")
+    finally:
+        _stop(second, second_thread)
+
+    assert status == 200
+    assert [row["session_id"] for row in listing["sessions"]] == [saved["session_id"]]
+
+
+def test_session_list_respects_the_limit(
+    gui_server: ThreadingHTTPServer,
+    sample_binary: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _session_db(monkeypatch, tmp_path)
+    for _ in range(3):
+        status, saved = _save(gui_server, sample_binary)
+        assert status == 200, saved
+
+    status, listing = _get(gui_server, "/api/session_list?limit=2")
+
+    assert status == 200
+    assert listing["limit"] == 2
+    assert listing["count"] == 2
+    assert len(listing["sessions"]) == 2
+
+    wide_status, wide = _get(gui_server, f"/api/session_list?limit={MAX_SESSION_LIMIT}")
+
+    assert wide_status == 200
+    assert wide["count"] == 3
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", str(MAX_SESSION_LIMIT + 1), "many", "1.5"])
+def test_session_list_rejects_limits_outside_the_storage_bounds(
+    gui_server: ThreadingHTTPServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit: str,
+) -> None:
+    _session_db(monkeypatch, tmp_path)
+
+    status, payload = _get(gui_server, f"/api/session_list?limit={limit}")
+
+    assert status == 400
+    assert "limit" in payload["error"]
+
+
+def test_session_routes_reject_unknown_query_parameters(
+    gui_server: ThreadingHTTPServer,
+    sample_binary: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _session_db(monkeypatch, tmp_path)
+
+    # No "db" parameter: the database comes from the server's environment, so a
+    # request cannot aim the dashboard at an arbitrary file.
+    list_status, list_payload = _get(gui_server, "/api/session_list?db=elsewhere.db")
+    assert list_status == 400
+    assert "unknown query parameter" in list_payload["error"]
+    assert "db" in list_payload["error"]
+
+    save_status, save_payload = _get(
+        gui_server,
+        f"/api/session_save?path={quote(sample_binary.as_posix())}&notse=typo",
+    )
+    assert save_status == 400
+    assert "notse" in save_payload["error"]
+
+    # A rejected save writes nothing, so the list is still empty.
+    _, listing = _get(gui_server, "/api/session_list")
+    assert listing["count"] == 0
+
+
+def test_foreign_host_is_rejected_before_the_session_routes_run(
+    gui_server: ThreadingHTTPServer,
+    sample_binary: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _session_db(monkeypatch, tmp_path)
+
+    for route in (
+        "/api/session_list",
+        f"/api/session_save?path={quote(sample_binary.as_posix())}",
+    ):
+        status, headers, body = _raw_get(gui_server, route, "attacker.example:8080")
+
+        assert status == 421, route
+        assert headers["X-Frame-Options"] == "DENY"
+        assert json.loads(body.decode("utf-8"))["error"].startswith("refusing Host")
+
+    # 421 is answered before any route runs, so not even the database was made.
+    assert not db.exists()
+
+
+def test_session_list_reply_carries_the_security_headers(
+    gui_server: ThreadingHTTPServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _session_db(monkeypatch, tmp_path)
+    port = gui_server.server_address[1]
+
+    status, headers, body = _raw_get(gui_server, "/api/session_list", f"127.0.0.1:{port}")
+
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert "connect-src 'self'" in headers["Content-Security-Policy"]
+    assert json.loads(body.decode("utf-8"))["count"] == 0
+
+
+
+
+def test_session_list_body_counts_toward_the_response_cap(
+    gui_server: ThreadingHTTPServer,
+    sample_binary: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _session_db(monkeypatch, tmp_path)
+    for _ in range(3):
+        status, saved = _save(gui_server, sample_binary, "n" * 400)
+        assert status == 200, saved
+
+    cap = 700
+    monkeypatch.setattr(gui_server_module, "MAX_RESPONSE_BYTES", cap)
+    port = gui_server.server_address[1]
+
+    status, headers, body = _raw_get(gui_server, "/api/session_list", f"127.0.0.1:{port}")
+
+    assert status == 200
+    assert len(body) <= cap
+    assert int(headers["Content-Length"]) == len(body)
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["response_truncated"] is True
+    assert len(payload["sessions"]) < 3
+
+
+def test_session_save_requires_a_path(
+    gui_server: ThreadingHTTPServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _session_db(monkeypatch, tmp_path)
+
+    status, payload = _get(gui_server, "/api/session_save")
+
+    assert status == 400
+    assert "path" in payload["error"]
+
+
+def test_session_save_rejects_an_oversized_note(
+    gui_server: ThreadingHTTPServer,
+    sample_binary: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _session_db(monkeypatch, tmp_path)
+
+    status, payload = _save(gui_server, sample_binary, "n" * (MAX_SESSION_NOTE_LENGTH + 1))
+
+    assert status == 400
+    assert "notes" in payload["error"]
+    _, listing = _get(gui_server, "/api/session_list")
+    assert listing["count"] == 0
+
+
+def test_dashboard_page_has_a_sessions_panel() -> None:
+    page = render_dashboard_html()
+
+    for element_id in ("session-notes", "session-limit", "session-tbl", "session-wrap"):
+        assert f'id="{element_id}"' in page
+    assert (
+        '<button type="button" id="session-save" class="primary" '
+        'data-action="session_save">Save session</button>' in page
+    )
+    assert 'data-action="session_list">Refresh list</button>' in page
+    # Both controls talk to the same-origin session routes only.
+    assert 'session_save: "/api/session_save"' in page
+    assert 'session_list: "/api/session_list"' in page
+    # The table shows the fields the list route returns, in that order, and every
+    # cell goes through textContent -- a path or a note is never markup.
+    for column in ("session_id", "created_at", "path", "format", "architecture", "notes"):
+        assert f'"{column}"' in page
+    assert "SESSION_COLUMNS" in page
+    assert "innerHTML" not in page
