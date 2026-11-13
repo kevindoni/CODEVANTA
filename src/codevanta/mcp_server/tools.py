@@ -131,6 +131,7 @@ from codevanta.core.unknowns import (
     records_to_payload,
     resolve_unknowns,
 )
+from codevanta.mcp_server.ext_solver import codevanta_symbolic_solve  # noqa: F401 -- one-line registration of the ext solver MCP tool
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore
 
