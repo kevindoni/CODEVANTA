@@ -38,6 +38,21 @@ from codevanta.analysis.callgraph import (
     build_call_graph,
 )
 from codevanta.analysis.cfg import FunctionCFG, build_cfg, build_recursive_cfg
+from codevanta.analysis.compare import (
+    COMPARE_WHATS,
+    compare_bundles,
+    compare_inventories,
+    compare_strings,
+    is_bundle_document,
+    load_document,
+    load_report_payload,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_FUNCTIONS as COMPARE_MAX_FUNCTIONS,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_STRINGS as COMPARE_MAX_STRINGS,
+)
 from codevanta.analysis.dataflow import (
     DEFAULT_MAX_BLOCKS as DATAFLOW_MAX_BLOCKS,
 )
@@ -117,6 +132,14 @@ from codevanta.core.report import (
     resolve_target,
 )
 from codevanta.core.strings import StringExtractor
+from codevanta.core.unknowns import (
+    DEFAULT_UNKNOWN_SEVERITY,
+    UNKNOWN_STATUSES,
+    make_open_unknown,
+    records_from_payload,
+    records_to_payload,
+    resolve_unknowns,
+)
 from codevanta.plugins import AnalysisContext, builtin_plugins, run_plugin
 from codevanta.plugins import load as load_plugin
 from codevanta.storage.session import SessionError, SessionRecord, SessionStore
@@ -3205,6 +3228,329 @@ def session_notes(
             escape(annotation.created_at),
         )
     console.print(table)
+
+
+# ---- phase 8: typed comparators and the residual-unknown ledger --------------
+
+#: ``bundles`` is the documented extra beyond the required ``functions`` and
+#: ``strings``: it reaches :func:`compare_bundles` offline as well.
+CompareWhat = Literal["functions", "strings", "bundles"]
+CompareFormat = Literal["text", "json"]
+
+UnknownsAction = Literal["list", "open", "resolve"]
+UnknownsStatus = Literal["open", "resolved"]
+UnknownsSeverity = Literal["low", "medium", "high"]
+UnknownsFormat = Literal["text", "json"]
+
+
+def _print_inventory_compare(result: Any) -> None:
+    """Render an :class:`InventoryCompare` result as text tables."""
+    if result.matched_by_name:
+        table = Table(title="Matched by name (heuristic)")
+        table.add_column("Name")
+        table.add_column("Left")
+        table.add_column("Right")
+        table.add_column("Address changed", justify="center")
+        for match in result.matched_by_name:
+            table.add_row(
+                escape(match.name),
+                escape(match.left_address or "-"),
+                escape(match.right_address or "-"),
+                "yes" if match.address_changed else "no",
+            )
+        console.print(table)
+    if result.matched_by_fingerprint:
+        table = Table(title="Matched by fingerprint")
+        table.add_column("Digest")
+        table.add_column("Left")
+        table.add_column("Right")
+        for match in result.matched_by_fingerprint:
+            table.add_row(
+                escape(f"{match.digest[:12]}..."),
+                escape(f"{match.left_name or '-'} {match.left_address or ''}".strip()),
+                escape(f"{match.right_name or '-'} {match.right_address or ''}".strip()),
+            )
+        console.print(table)
+    for title, entries in (("Added", result.added), ("Removed", result.removed)):
+        label = f"{title} (right-only)" if title == "Added" else f"{title} (left-only)"
+        table = Table(title=label)
+        table.add_column("Name")
+        table.add_column("Address")
+        for entry in entries:
+            table.add_row(escape(entry.name or "-"), escape(entry.address or "-"))
+        console.print(table)
+    console.print(
+        f"[dim]left functions: {result.left_functions}"
+        f" · right functions: {result.right_functions}"
+        f" · added: {len(result.added)}"
+        f" · removed: {len(result.removed)}"
+        f" · by name: {len(result.matched_by_name)}"
+        f" · by fingerprint: {len(result.matched_by_fingerprint)}[/]"
+    )
+
+
+def _print_strings_compare(result: Any) -> None:
+    """Render a :class:`StringsCompare` result as text tables."""
+    for title, texts in (("Added strings", result.added), ("Removed strings", result.removed)):
+        table = Table(title=title)
+        table.add_column("Text")
+        for text in texts:
+            table.add_row(escape(text))
+        console.print(table)
+    console.print(
+        f"[dim]left strings: {result.left_strings}"
+        f" · right strings: {result.right_strings}"
+        f" · added: {len(result.added)}"
+        f" · removed: {len(result.removed)}"
+        f" · shared: {result.shared_count}[/]"
+    )
+
+
+def _print_bundle_compare(result: Any) -> None:
+    """Render a :class:`BundleCompare` result as text tables."""
+    if result.changed:
+        table = Table(title="Changed entries (digest mismatch)")
+        table.add_column("Entry")
+        table.add_column("Left sha256")
+        table.add_column("Right sha256")
+        for change in result.changed:
+            table.add_row(
+                escape(change.name),
+                escape(change.left_sha256 or "-"),
+                escape(change.right_sha256 or "-"),
+            )
+        console.print(table)
+    console.print(
+        f"[dim]left entries: {result.left_entries}"
+        f" · right entries: {result.right_entries}"
+        f" · added: {len(result.added_names)}"
+        f" · removed: {len(result.removed_names)}"
+        f" · changed: {len(result.changed)}"
+        f" · unchanged: {len(result.unchanged_names)}"
+        f" · shared digests: {result.shared_digest_count}[/]"
+    )
+
+
+def _print_compare_warnings(result: Any) -> None:
+    """Print warnings and the evidence footer shared by compare results."""
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    evidence = result.evidence
+    console.print(
+        f"[dim]evidence: {escape(str(evidence.get('source', '-')))}"
+        f" · {escape(str(evidence.get('method', '-')))}"
+        f" · confidence: {escape(str(evidence.get('confidence', '-')))}[/]"
+    )
+
+
+@app.command("compare")
+def compare(
+    a: Annotated[
+        Path,
+        typer.Argument(help="Left artifact: an analyze report or evidence bundle (JSON)"),
+    ],
+    b: Annotated[
+        Path,
+        typer.Argument(help="Right artifact: an analyze report or evidence bundle (JSON)"),
+    ],
+    what: Annotated[
+        CompareWhat,
+        typer.Option("--what", help="Which sections to compare"),
+    ] = "functions",
+    output_format: Annotated[
+        CompareFormat, typer.Option("--format", "-f", help="Output format")
+    ] = "text",
+    max_functions: Annotated[
+        int,
+        typer.Option("--max-functions", help="Per-side function inventory budget"),
+    ] = COMPARE_MAX_FUNCTIONS,
+    max_strings: Annotated[
+        int,
+        typer.Option("--max-strings", help="Unique string texts kept per delta"),
+    ] = COMPARE_MAX_STRINGS,
+) -> None:
+    """Compare two offline JSON artifacts (never loads a binary).
+
+    The arguments are ``codevanta analyze`` report payloads, e.g.
+    ``samples/report_elf64.json`` and ``samples/report_bundle.json`` (a bundle
+    is unwrapped to its ``report`` entry automatically), so the comparison is
+    reproducible from the documents alone.
+    """
+    if what not in COMPARE_WHATS:
+        _fail(f"invalid --what {what!r}; expected one of {', '.join(COMPARE_WHATS)}", 2)
+    result: Any
+    try:
+        if what == "functions":
+            result = compare_inventories(
+                load_report_payload(a),
+                load_report_payload(b),
+                max_functions=max_functions,
+            )
+        elif what == "strings":
+            result = compare_strings(
+                load_report_payload(a),
+                load_report_payload(b),
+                max_strings=max_strings,
+            )
+        else:
+            result = compare_bundles(load_document(a), load_document(b))
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if output_format == "json":
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    if what == "functions":
+        _print_inventory_compare(result)
+    elif what == "strings":
+        _print_strings_compare(result)
+    else:
+        _print_bundle_compare(result)
+    _print_compare_warnings(result)
+
+
+def _load_unknowns_ledger(path: Path) -> dict[str, Any]:
+    """Load an unknowns ledger payload, unwrapping a bundle document if needed."""
+    document = load_document(path)
+    if is_bundle_document(document):
+        entry = document["entries"].get("unknowns")
+        if not isinstance(entry, dict) or not isinstance(entry.get("payload"), dict):
+            raise AnalysisError(f"{path} is a bundle without an 'unknowns' entry")
+        document = entry["payload"]
+    return document
+
+
+def _write_unknowns_ledger(path: Path, payload: dict[str, Any]) -> None:
+    """Write a ledger payload as canonical JSON (sorted keys, trailing newline)."""
+    try:
+        path.write_text(
+            json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    except OSError as exc:
+        _fail(f"cannot write ledger {path}: {exc}", 2)
+
+
+@app.command("unknowns")
+def unknowns(
+    action: Annotated[
+        UnknownsAction,
+        typer.Argument(help="list: show records · open: add a record · resolve: close one"),
+    ],
+    ledger: Annotated[
+        Path, typer.Argument(help="Ledger JSON file (or a bundle carrying an 'unknowns' entry)")
+    ],
+    unknown_id: Annotated[
+        str | None, typer.Option("--id", help="Record id to resolve (resolve)")
+    ] = None,
+    domain: Annotated[
+        str | None, typer.Option("--domain", help="Domain tag, e.g. cfg (open)")
+    ] = None,
+    summary: Annotated[
+        str | None, typer.Option("--summary", help="One-line description (open)")
+    ] = None,
+    severity: Annotated[
+        UnknownsSeverity, typer.Option("--severity", help="Record severity (open)")
+    ] = DEFAULT_UNKNOWN_SEVERITY,
+    evidence: Annotated[
+        list[str] | None,
+        typer.Option("--evidence", help="Evidence reference; repeatable (open)"),
+    ] = None,
+    note: Annotated[
+        str | None, typer.Option("--note", help="Resolution note (resolve)")
+    ] = None,
+    status: Annotated[
+        UnknownsStatus | None, typer.Option("--status", help="Filter by status (list)")
+    ] = None,
+    output_format: Annotated[
+        UnknownsFormat, typer.Option("--format", "-f", help="Output format")
+    ] = "text",
+) -> None:
+    """Manage the residual-unknown ledger (typed open/resolved records).
+
+    A ledger file is the JSON payload ``{"count": N, "items": [...]}``; ids are
+    deterministic content digests, so opening the same finding twice is
+    reported as a duplicate instead of silently growing the ledger.
+    """
+    if status is not None and status not in UNKNOWN_STATUSES:
+        _fail(f"invalid --status {status!r}; expected one of {', '.join(UNKNOWN_STATUSES)}", 2)
+
+    if action == "list":
+        try:
+            records = records_from_payload(_load_unknowns_ledger(ledger))
+        except AnalysisError as exc:
+            _fail(str(exc), 2)
+        if status is not None:
+            records = tuple(record for record in records if record.status == status)
+        if output_format == "json":
+            console.print_json(json.dumps(records_to_payload(list(records))))
+            return
+        table = Table(title=f"Unknowns ({len(records)} records)")
+        table.add_column("Id")
+        table.add_column("Status")
+        table.add_column("Severity", justify="center")
+        table.add_column("Domain")
+        table.add_column("Summary")
+        table.add_column("Refs", justify="right")
+        for record in records:
+            table.add_row(
+                escape(record.id),
+                escape(record.status),
+                escape(record.severity),
+                escape(record.domain),
+                escape(record.summary),
+                str(len(record.evidence_refs)),
+            )
+        console.print(table)
+        open_count = sum(1 for record in records if record.status == "open")
+        console.print(f"[dim]records: {len(records)} · open: {open_count}[/]")
+        return
+
+    if action == "open":
+        if not domain or not summary:
+            _fail("opening an unknown requires --domain and --summary", 2)
+        existing: list[Any] = []
+        if ledger.exists():
+            try:
+                existing = list(records_from_payload(_load_unknowns_ledger(ledger)))
+            except AnalysisError as exc:
+                _fail(str(exc), 2)
+        try:
+            record = make_open_unknown(
+                domain=domain,
+                summary=summary,
+                severity=severity,
+                evidence_refs=tuple(evidence or ()),
+            )
+            payload = records_to_payload([*existing, record])
+        except AnalysisError as exc:
+            _fail(str(exc), 2)
+        _write_unknowns_ledger(ledger, payload)
+        if output_format == "json":
+            console.print_json(json.dumps({"action": "open", "record": record.to_dict()}))
+        else:
+            console.print(
+                f"[green]unknown opened:[/] {escape(record.id)} · "
+                f"domain: {escape(record.domain)} · severity: {record.severity}"
+            )
+        return
+
+    # action == "resolve"
+    if not unknown_id:
+        _fail("resolving an unknown requires --id", 2)
+    try:
+        payload = resolve_unknowns(
+            _load_unknowns_ledger(ledger),
+            [unknown_id],
+            note=note or "",
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    _write_unknowns_ledger(ledger, payload)
+    if output_format == "json":
+        console.print_json(json.dumps({"action": "resolve", "resolved": unknown_id}))
+    else:
+        console.print(f"[green]unknown resolved:[/] {escape(unknown_id)}")
 
 
 def main() -> None:

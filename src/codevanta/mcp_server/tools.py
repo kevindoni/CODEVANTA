@@ -17,6 +17,24 @@ from codevanta.analysis.binary_diff import (
 from codevanta.analysis.callgraph import MAX_LIMIT as MAX_CALLGRAPH_LIMIT
 from codevanta.analysis.callgraph import build_call_graph
 from codevanta.analysis.cfg import build_cfg
+from codevanta.analysis.compare import (
+    COMPARE_WHATS,
+    BundleCompare,
+    InventoryCompare,
+    StringsCompare,
+    compare_bundles,
+    compare_inventories,
+    compare_strings,
+    is_bundle_document,
+    load_document,
+    load_report_payload,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_FUNCTIONS as COMPARE_MAX_FUNCTIONS,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_STRINGS as COMPARE_MAX_STRINGS,
+)
 from codevanta.analysis.dataflow import (
     DEFAULT_MAX_BLOCKS as DEFAULT_DATAFLOW_MAX_BLOCKS,
 )
@@ -105,6 +123,14 @@ from codevanta.core.report import (
     resolve_target,
 )
 from codevanta.core.strings import StringExtractor
+from codevanta.core.unknowns import (
+    DEFAULT_UNKNOWN_SEVERITY,
+    UNKNOWN_STATUSES,
+    make_open_unknown,
+    records_from_payload,
+    records_to_payload,
+    resolve_unknowns,
+)
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore
 
@@ -1426,3 +1452,145 @@ def dataflow(
         max_blocks=block_budget,
     )
     return summary.to_dict()
+
+
+def _load_ledger_payload(ledger_path: Path) -> dict[str, Any]:
+    """Read a ledger file, unwrapping a bundle's ``unknowns`` entry if present."""
+    document = load_document(ledger_path)
+    if is_bundle_document(document):
+        entry = document["entries"].get("unknowns")
+        if not isinstance(entry, dict) or not isinstance(entry.get("payload"), dict):
+            raise AnalysisError(f"{ledger_path} is a bundle without an 'unknowns' entry")
+        document = entry["payload"]
+    return document
+
+
+def _write_ledger_payload(ledger_path: Path, payload: dict[str, Any]) -> None:
+    """Write a ledger payload as canonical JSON (sorted keys, trailing newline)."""
+    try:
+        ledger_path.write_text(
+            json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    except OSError as exc:
+        raise AnalysisError(f"cannot write ledger {ledger_path}: {exc}") from exc
+
+
+def compare(
+    a: str,
+    b: str,
+    what: str = "functions",
+    max_functions: int = COMPARE_MAX_FUNCTIONS,
+    max_strings: int = COMPARE_MAX_STRINGS,
+) -> dict[str, Any]:
+    """Compare two offline JSON artifacts (reports or evidence bundles).
+
+    ``what="functions"`` and ``what="strings"`` compare analyze report payloads
+    (a bundle document is unwrapped to its ``report`` entry automatically);
+    ``what="bundles"`` diffs two evidence-bundle documents by record kind and
+    digest membership. Nothing is executed or disassembled: the comparison is
+    reproducible from the two documents alone, and every result carries an
+    evidence record stating how far the claim reaches.
+    """
+    if what not in COMPARE_WHATS:
+        raise AnalysisError(f"unknown --what {what!r}; expected one of {', '.join(COMPARE_WHATS)}")
+    left_path = _validate_path(a)
+    right_path = _validate_path(b)
+    result: InventoryCompare | StringsCompare | BundleCompare
+    if what == "functions":
+        result = compare_inventories(
+            load_report_payload(left_path),
+            load_report_payload(right_path),
+            max_functions=max_functions,
+        )
+    elif what == "strings":
+        result = compare_strings(
+            load_report_payload(left_path),
+            load_report_payload(right_path),
+            max_strings=max_strings,
+        )
+    else:
+        left_document = load_document(left_path)
+        right_document = load_document(right_path)
+        if not is_bundle_document(left_document):
+            raise AnalysisError(f"{a} is not an evidence-bundle document")
+        if not is_bundle_document(right_document):
+            raise AnalysisError(f"{b} is not an evidence-bundle document")
+        result = compare_bundles(left_document, right_document)
+    return result.to_dict()
+
+
+def unknowns(
+    action: str,
+    ledger: str,
+    unknown_id: str | None = None,
+    domain: str | None = None,
+    summary: str | None = None,
+    severity: str = DEFAULT_UNKNOWN_SEVERITY,
+    evidence_refs: list[str] | None = None,
+    note: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """Manage the residual-unknown ledger at ``ledger`` (a JSON file).
+
+    ``action="list"`` returns the records (optionally filtered by ``status``);
+    ``action="open"`` appends one typed open record built from ``domain`` /
+    ``summary`` / ``severity`` / ``evidence_refs`` (the ledger file is created
+    when missing); ``action="resolve"`` closes ``unknown_id`` with ``note``.
+    Ids are deterministic content digests, so opening the same finding twice
+    is refused as a duplicate.
+    """
+    if action not in ("list", "open", "resolve"):
+        raise AnalysisError(f"unknown action {action!r}; expected list, open or resolve")
+    if status is not None and status not in UNKNOWN_STATUSES:
+        raise AnalysisError(
+            f"unknown status {status!r}; expected one of {', '.join(UNKNOWN_STATUSES)}"
+        )
+    ledger_path = Path(ledger).expanduser()
+
+    if action == "open":
+        if not domain or not summary:
+            raise AnalysisError("opening an unknown requires domain and summary")
+        existing: list[Any] = []
+        if ledger_path.exists():
+            existing = list(records_from_payload(_load_ledger_payload(ledger_path)))
+        record = make_open_unknown(
+            domain=domain,
+            summary=summary,
+            severity=severity,
+            evidence_refs=tuple(evidence_refs or ()),
+        )
+        payload = records_to_payload([*existing, record])
+        _write_ledger_payload(ledger_path, payload)
+        return {
+            "action": "open",
+            "record": record.to_dict(),
+            "count": int(payload["count"]),
+        }
+
+    if not ledger_path.exists():
+        raise AnalysisError(f"ledger {ledger_path} does not exist")
+    document = _load_ledger_payload(ledger_path)
+
+    if action == "list":
+        records = records_from_payload(document)
+        if status is not None:
+            records = tuple(record for record in records if record.status == status)
+        listing = records_to_payload(list(records))
+        return {
+            "action": "list",
+            "count": int(listing["count"]),
+            "items": listing["items"],
+        }
+
+    # action == "resolve"
+    if not unknown_id:
+        raise AnalysisError("resolving an unknown requires unknown_id")
+    payload = resolve_unknowns(document, [unknown_id], note=note or "")
+    _write_ledger_payload(ledger_path, payload)
+    return {
+        "action": "resolve",
+        "resolved": unknown_id,
+        "count": int(payload["count"]),
+    }
