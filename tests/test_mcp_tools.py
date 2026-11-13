@@ -63,19 +63,25 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
     assert report["disassembly"]["instruction_count"] == 3
 
 
-def test_server_lists_twenty_six_tools() -> None:
+def test_server_lists_thirty_eight_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
+    assert len(names) == 38
     assert names == [
+        "codevanta_adb",
         "codevanta_analyze",
+        "codevanta_asar",
+        "codevanta_binmeta",
         "codevanta_callgraph",
         "codevanta_cfg",
         "codevanta_compare",
+        "codevanta_crash",
         "codevanta_dataflow",
         "codevanta_debug",
         "codevanta_decompile",
         "codevanta_diff",
         "codevanta_disasm",
+        "codevanta_dtb",
         "codevanta_dwarf",
         "codevanta_entropy",
         "codevanta_function_hash",
@@ -83,15 +89,22 @@ def test_server_lists_twenty_six_tools() -> None:
         "codevanta_info",
         "codevanta_jump_table",
         "codevanta_metadata",
+        "codevanta_nav",
+        "codevanta_nav_providers",
         "codevanta_session_list",
         "codevanta_session_save",
+        "codevanta_signal_sr",
         "codevanta_similarity",
+        "codevanta_sqlite",
         "codevanta_strings",
         "codevanta_struct",
         "codevanta_symbolic",
+        "codevanta_symbolic_solve",
         "codevanta_trace",
+        "codevanta_uart_decode",
         "codevanta_unknowns",
         "codevanta_vtable",
+        "codevanta_web_inspect",
         "codevanta_xrefs",
     ]
 
