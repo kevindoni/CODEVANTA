@@ -576,6 +576,70 @@ def build_server() -> MCPServer:
             max_blocks=max_blocks,
         )
 
+    @server.tool(
+        description=(
+            "Compare two offline CODEVANTA JSON artifacts: analyze report "
+            "payloads (an evidence bundle is unwrapped to its 'report' entry "
+            "automatically) or two evidence-bundle documents. what='functions' "
+            "reports added/removed functions plus matches by name and by "
+            "function_hash fingerprint (shapes, not proof of identity, "
+            "medium confidence); what='strings' reports added/removed string "
+            "texts; what='bundles' diffs bundles by record kind and payload "
+            "digest membership (exact, high confidence). Never loads or "
+            "executes a binary: the comparison is reproducible from the two "
+            "documents alone."
+        )
+    )
+    def codevanta_compare(
+        a: str,
+        b: str,
+        what: str = "functions",
+        max_functions: int = tools.COMPARE_MAX_FUNCTIONS,
+        max_strings: int = tools.COMPARE_MAX_STRINGS,
+    ) -> dict:
+        return tools.compare(
+            a,
+            b,
+            what=what,
+            max_functions=max_functions,
+            max_strings=max_strings,
+        )
+
+    @server.tool(
+        description=(
+            "Manage the residual-unknown ledger: typed records for what an "
+            "analysis could not decide, with deterministic content ids, "
+            "severity, open->resolved lifecycle and evidence references. "
+            "action='list' returns records (optionally status-filtered), "
+            "action='open' appends one (domain/summary required, ledger file "
+            "created when missing), action='resolve' closes one id with an "
+            "optional note. The ledger is a JSON payload that can be embedded "
+            "in an evidence bundle as its 'unknowns' entry."
+        )
+    )
+    def codevanta_unknowns(
+        action: str,
+        ledger: str,
+        unknown_id: str | None = None,
+        domain: str | None = None,
+        summary: str | None = None,
+        severity: str = tools.DEFAULT_UNKNOWN_SEVERITY,
+        evidence_refs: list[str] | None = None,
+        note: str | None = None,
+        status: str | None = None,
+    ) -> dict:
+        return tools.unknowns(
+            action,
+            ledger,
+            unknown_id=unknown_id,
+            domain=domain,
+            summary=summary,
+            severity=severity,
+            evidence_refs=evidence_refs,
+            note=note,
+            status=status,
+        )
+
     return server
 
 

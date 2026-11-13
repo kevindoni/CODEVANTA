@@ -85,7 +85,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -93,6 +93,7 @@ from types import MappingProxyType
 from typing import Any
 
 from codevanta.core.report import AnalysisError
+from codevanta.core.unknowns import UNKNOWN_ENTRY_NAME, UnknownRecord, records_to_payload
 
 __all__ = [
     "DEFAULT_ALGORITHM",
@@ -102,6 +103,7 @@ __all__ = [
     "SUBJECT_CHUNK_BYTES",
     "SUPPORTED_ALGORITHMS",
     "TOOL_VERSION",
+    "UNKNOWN_ENTRY_NAME",
     "Bundle",
     "BundleManifest",
     "BundleVerification",
@@ -509,6 +511,7 @@ def build_bundle(
     payloads: Mapping[str, Any],
     *,
     label: str | None = None,
+    unknowns: Sequence[UnknownRecord] | None = None,
 ) -> Bundle:
     """Hash a binary and a set of analysis payloads into one bundle.
 
@@ -519,22 +522,36 @@ def build_bundle(
         subject_path: The analysed binary; it must exist and be readable.
         payloads: Mapping of entry name to any JSON-serialisable payload.
         label: Optional subject label.  Defaults to the binary's file name.
+        unknowns: Optional residual-unknown records; when given (even empty
+            non-``None``), they are serialised through
+            :func:`codevanta.core.unknowns.records_to_payload` and embedded as
+            one extra entry named :data:`UNKNOWN_ENTRY_NAME`, hashed like any
+            other payload. Pass ``None`` to omit the section.
 
     Returns:
         The populated :class:`Bundle`.
 
     Raises:
         AnalysisError: When the subject is missing/unreadable, when ``payloads``
-            is not a mapping, when a name is blank, when there are more than
-            :data:`MAX_ENTRIES` entries, or when a payload is not
-            JSON-serialisable or exceeds :data:`MAX_PAYLOAD_BYTES`.
+            is not a mapping, when a name is blank, when ``payloads`` already
+            reserves the ``unknowns`` entry while ``unknowns`` is given, when
+            there are more than :data:`MAX_ENTRIES` entries, or when a payload
+            is not JSON-serialisable or exceeds :data:`MAX_PAYLOAD_BYTES`.
     """
     subject_sha256 = hash_subject(subject_path)
 
     if not isinstance(payloads, Mapping):
         raise AnalysisError(f"payloads must be a mapping, got {type(payloads).__name__}")
-    if len(payloads) > MAX_ENTRIES:
-        raise AnalysisError(f"too many entries ({len(payloads)} > limit {MAX_ENTRIES})")
+    if UNKNOWN_ENTRY_NAME in payloads and unknowns is not None:
+        raise AnalysisError(
+            f"payloads already contain an {UNKNOWN_ENTRY_NAME!r} entry; pass it in "
+            "payloads or as unknowns records, not both"
+        )
+    merged: dict[str, Any] = dict(payloads)
+    if unknowns is not None:
+        merged[UNKNOWN_ENTRY_NAME] = records_to_payload(list(unknowns))
+    if len(merged) > MAX_ENTRIES:
+        raise AnalysisError(f"too many entries ({len(merged)} > limit {MAX_ENTRIES})")
 
     subject = label if label is not None else Path(subject_path).name
     if not isinstance(subject, str) or not subject.strip():
@@ -542,10 +559,10 @@ def build_bundle(
 
     entries: dict[str, dict[str, Any]] = {}
     payload_texts: dict[str, str] = {}
-    for name in sorted(payloads, key=str):
+    for name in sorted(merged, key=str):
         if not isinstance(name, str) or not name.strip():
             raise AnalysisError(f"entry name must be a non-empty string, got {name!r}")
-        text = canonical_json(payloads[name])
+        text = canonical_json(merged[name])
         data = text.encode("utf-8")
         if len(data) > MAX_PAYLOAD_BYTES:
             raise AnalysisError(
