@@ -59,6 +59,21 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- Dynamic session layer (`codevanta.analysis.dynamic`): gdb and Frida providers
+  with availability detection that never imports the tool, deterministic
+  non-interactive script builders (`build_gdb_script`, `build_frida_script`) that
+  bound hits, validate addresses against executable sections and record a header
+  with the target and image base, plus `attach_command` for the exact argv a user
+  should run. Nothing is launched: the scripts are generated for the user to run.
+- Trace analysis (`codevanta.analysis.trace`): `parse_gdb_trace` and
+  `parse_frida_trace` turn a finished session into a `TraceReport` — hits mapped to
+  function candidates, hits per function, unique addresses, truncation and
+  evidence — so dynamic results feed the same evidence pipeline as static ones.
+- Ghidra provider in CI (`ghidra-parity`, best effort): a pinned Ghidra release and
+  JDK are downloaded, `GHIDRA_INSTALL_DIR` is exported and the parity tests run
+  against the real Ghidra decompiler; when the download cannot happen the job
+  prints a notice instead of pretending it ran. `pyghidra` joined the
+  `decompilers` extra.
 - Type propagation for the pseudo-C decompiler (`codevanta.analysis.type_propagation`):
   per-argument inference from how each register is used (pointer dereference,
   sub-width load, arithmetic, comparison against zero, unused), a return type from

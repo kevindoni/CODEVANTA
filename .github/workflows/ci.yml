@@ -111,3 +111,112 @@ jobs:
         run: python scripts/check_decompiler_backends.py
       - name: Decompiler parity
         run: python -m pytest tests/test_decompiler_parity.py -q
+
+  # SECOND real provider, and deliberately BEST EFFORT. Unlike angr (pure wheels),
+  # the ghidra backend needs two things this repository does not own: a ~570 MB
+  # Ghidra release from GitHub and a JDK. A flaky download or a JVM hiccup must
+  # never block a merge, so `continue-on-error: true` keeps the job informative --
+  # the blocking gate for the provider layer stays `decompile-parity` (angr).
+  # The job is honest in the other direction too: if Ghidra cannot be fetched it
+  # prints a ::notice:: line saying the backend was NOT exercised, because a green
+  # job that silently skipped the work would be worse than a yellow one that says so.
+  ghidra-parity:
+    name: ghidra-parity
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      # Pinned on purpose, and pinned as a *pair*: Ghidra 12.1 requires JDK 21
+      # (Ghidra 12.2 already requires JDK 25) and pyghidra 3.x requires Ghidra
+      # >= 12.0, so 12.1 + Temurin 21 is the newest combination that matches the
+      # JDK pinned below. GHIDRA_SHA256 is the checksum published in the release
+      # notes, so a corrupted cache entry or a truncated download is caught here
+      # instead of surfacing as a confusing decompiler error.
+      GHIDRA_VERSION: "12.1"
+      GHIDRA_ASSET: "ghidra_12.1_PUBLIC_20260513.zip"
+      GHIDRA_SHA256: "aa5cbcbbf48f41ca185fce900e19592f1ade4cd5994eb6e0ede468dac8a6f302"
+      GHIDRA_URL: "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1_build/ghidra_12.1_PUBLIC_20260513.zip"
+      GHIDRA_ZIP_DIR: ${{ github.workspace }}/.ghidra-cache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # 3.12: angr publishes cp312 wheels and Ghidra 12.1 supports Python
+          # 3.9-3.14 for PyGhidra mode, so every dependency installs from a wheel.
+          python-version: "3.12"
+          cache: pip
+      - name: Set up JDK 21 (pyghidra starts Ghidra's JVM inside CPython)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Restore the cached Ghidra release (~570 MB, so caching matters)
+        uses: actions/cache@v4
+        with:
+          path: .ghidra-cache
+          key: ghidra-${{ env.GHIDRA_ASSET }}
+      - name: Download and unpack Ghidra ${{ env.GHIDRA_VERSION }}
+        id: ghidra
+        run: |
+          set -uo pipefail
+          archive="$GHIDRA_ZIP_DIR/$GHIDRA_ASSET"
+          mkdir -p "$GHIDRA_ZIP_DIR"
+          # A cache hit that fails the published checksum is worse than a miss.
+          if [ -f "$archive" ] && ! echo "$GHIDRA_SHA256  $archive" | sha256sum -c - >/dev/null 2>&1; then
+            echo "cached $GHIDRA_ASSET does not match the published SHA-256; re-downloading it"
+            rm -f "$archive"
+          fi
+          if [ ! -f "$archive" ]; then
+            if curl -fSL --retry 3 --retry-delay 5 --connect-timeout 20 -o "$archive.part" "$GHIDRA_URL"; then
+              mv "$archive.part" "$archive"
+            else
+              rm -f "$archive.part"
+              echo "::warning::Ghidra $GHIDRA_VERSION could not be downloaded from $GHIDRA_URL"
+              echo "ok=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          if ! echo "$GHIDRA_SHA256  $archive" | sha256sum -c -; then
+            echo "::warning::$GHIDRA_ASSET does not match the published SHA-256"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          rm -rf .ghidra-install
+          if ! unzip -q "$archive" -d .ghidra-install; then
+            echo "::warning::could not unpack $GHIDRA_ASSET"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          install_dir=$(find .ghidra-install -maxdepth 2 -name ghidraRun -printf '%h\n' | head -n1)
+          if [ -z "$install_dir" ]; then
+            echo "::warning::the $GHIDRA_ASSET archive did not contain a ghidraRun launcher"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "GHIDRA_INSTALL_DIR=$PWD/$install_dir" >> "$GITHUB_ENV"
+          echo "Ghidra $GHIDRA_VERSION unpacked at $PWD/$install_dir"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+      - name: Say out loud that Ghidra was not exercised
+        if: steps.ghidra.outputs.ok != 'true'
+        run: |
+          echo "::notice::Ghidra $GHIDRA_VERSION was not available, so the ghidra backend was NOT exercised in this run; this job is best effort and never blocks a merge."
+      # `decompilers` carries both providers (angr and pyghidra). angr has to be
+      # installed even here because tests/test_decompiler_parity.py skips the whole
+      # module without it -- and a skipped module would let `-k ghidra` pass while
+      # running nothing, which is precisely the kind of lie this job exists to avoid.
+      - name: Install with the decompilers extra (angr + pyghidra)
+        if: steps.ghidra.outputs.ok == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,decompilers]"
+      - name: Assert the probe reports the ghidra backend available
+        if: steps.ghidra.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          python scripts/check_decompiler_backends.py | tee backends.txt
+          if ! grep -Eq '^ghidra[[:space:]]+available' backends.txt; then
+            echo "::error::Ghidra $GHIDRA_VERSION is unpacked but the probe still reports the ghidra backend unavailable"
+            exit 1
+          fi
+      - name: Ghidra decompiler parity
+        if: steps.ghidra.outputs.ok == 'true'
+        run: python -m pytest tests/test_decompiler_parity.py -q -k ghidra

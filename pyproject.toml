@@ -62,8 +62,19 @@ dwarf = [
 # Real decompiler providers. Deliberately NOT part of `dev`: angr is heavy, so only
 # the `decompile-parity` CI job installs it. `pip install -e ".[decompilers]"` is
 # the local equivalent and makes `codevanta.analysis.decompilers` prefer angr.
+#
+# `pyghidra` shares this extra instead of getting one of its own because the bridge
+# installs on its own: `python -m pip install --dry-run pyghidra` resolves to a
+# ~360 kB JPype wheel plus typing_extensions and packaging -- no Ghidra, no JDK,
+# nothing that pip could not fetch. Only *using* the ghidra backend needs a Ghidra
+# installation (~570 MB, pointed at by GHIDRA_INSTALL_DIR), which pip must never
+# download. Keeping both providers in one extra means a machine that already has
+# Ghidra on disk unlocks the backend here rather than having to discover a second
+# extra. Neither provider is ever assumed: `python scripts/check_decompiler_backends.py`
+# probes them, and the best-effort `ghidra-parity` CI job is where Ghidra is real.
 decompilers = [
   "angr>=9.2",
+  "pyghidra>=2.0",
 ]
 
 [project.scripts]

@@ -20,6 +20,7 @@ fixture is never executed.
 from __future__ import annotations
 
 import json
+import os
 import struct
 from pathlib import Path
 
@@ -170,3 +171,92 @@ def test_auto_prefers_angr_over_the_native_fallback(sample: tuple[Path, BinaryIn
     assert result.text.strip()
     # Ghidra may legitimately be reported as skipped here; angr may not.
     assert not any("'angr'" in warning and "unavailable" in warning for warning in result.warnings)
+
+
+# --------------------------------------------------------------------------- #
+# The second real provider: Ghidra, through pyghidra
+#
+# The same fixture, the same provider layer, a different decompiler -- so the
+# parity claim does not rest on a single third party. Two guards, both on
+# purpose:
+#
+# * ``pytest.importorskip("pyghidra")`` is called *inside* the tests rather than
+#   at module scope. A module-level skip would also skip the angr tests above
+#   whenever the bridge is installed but broken, quietly weakening the parity
+#   gate that the blocking ``decompile-parity`` job enforces.
+# * the ``GHIDRA_INSTALL_DIR`` marker mirrors ``GhidraBackend.availability()``:
+#   the Python bridge alone cannot decompile anything, so a machine with
+#   pyghidra but no Ghidra *skips* instead of failing.
+#
+# ``ghidra-parity`` in CI is the only place both halves are present, and it is
+# best effort (``continue-on-error``) because it downloads a ~570 MB Ghidra
+# release and needs a JDK -- outside this repository's control, so it must never
+# block a merge. That is exactly why these tests skip instead of passing
+# vacuously when Ghidra is absent: a skip says "not exercised", green would lie.
+# --------------------------------------------------------------------------- #
+
+#: Where Ghidra is installed; the backend's own probe reads the same variable.
+GHIDRA_INSTALL_DIR = os.environ.get("GHIDRA_INSTALL_DIR", "").strip()
+
+#: Comment the ghidra backend emits instead of C text; never a decompilation.
+GHIDRA_PLACEHOLDER = "ghidra produced no pseudocode"
+
+requires_ghidra = pytest.mark.skipif(
+    not GHIDRA_INSTALL_DIR,
+    reason=(
+        "GHIDRA_INSTALL_DIR is not set, so no Ghidra installation is available; "
+        "the best-effort ghidra-parity CI job sets it after unpacking the pinned release"
+    ),
+)
+
+
+def _pyghidra_or_skip() -> None:
+    """Skip the calling test unless the pyghidra bridge can be imported."""
+    pytest.importorskip(
+        "pyghidra",
+        reason="the ghidra backend needs the pyghidra bridge (shipped by the [decompilers] extra)",
+    )
+
+
+@requires_ghidra
+def test_ghidra_probe_reports_ghidra_available() -> None:
+    """The probe agrees that this machine can really decompile with Ghidra."""
+    _pyghidra_or_skip()
+
+    by_name = {probe.name: probe for probe in available_backends()}
+    ghidra = by_name["ghidra"]
+    assert ghidra.available is True, ghidra.reason
+    assert "pyghidra" in ghidra.requires
+    # An available backend still explains itself.
+    assert ghidra.reason.strip()
+    assert get_backend("ghidra").availability().available is True
+
+
+@requires_ghidra
+def test_ghidra_backend_returns_real_c(sample: tuple[Path, BinaryInfo]) -> None:
+    """Decompile the shared fixture strictly through Ghidra, to non-empty C."""
+    _pyghidra_or_skip()
+
+    path, info = sample
+    result = decompile_function(path, info, TEXT_VA, backend="ghidra")
+
+    # The whole point: the provider layer reports the provider that really ran.
+    assert result.backend == "ghidra", result.warnings
+    assert result.language == "c"
+    assert result.text.strip(), "ghidra returned no text at all"
+    # A placeholder comment is not a decompilation; fail rather than count it.
+    assert GHIDRA_PLACEHOLDER not in result.text, result.text
+    assert "{" in result.text, result.text
+
+    payload = result.to_dict()
+    assert payload["backend"] == "ghidra"
+    assert payload["language"] == "c"
+    evidence = payload["evidence"]
+    assert evidence["source"] == "ghidra.decompiler"
+    assert evidence["method"] == "pyghidra.headless.DecompInterface"
+    assert evidence["address"] == "0x401000"
+    assert evidence["extra"]["backend"] == "ghidra"
+    # Ghidra has no instruction or block budget, so the evidence must record the
+    # timeout the budget was projected onto instead of claiming it was honoured.
+    assert evidence["extra"]["timeout_seconds"] >= 5
+    assert json.loads(json.dumps(payload))["backend"] == "ghidra"
