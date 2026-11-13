@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner, Result
 
-from codevanta.analysis import crash_core
+from codevanta.analysis import apple_ips, crash_core
 from codevanta.analysis.apple_ips import MAX_IMAGES, parse_ips_report
 from codevanta.analysis.crash_core import parse_core_dump
 from codevanta.cli.main import app
@@ -626,3 +626,288 @@ def test_mcp_crash_non_crash_file_is_a_typed_error(tmp_path: Path) -> None:
 
 def test_mcp_tools_module_exports_codevanta_crash() -> None:
     assert callable(tools.codevanta_crash)
+
+
+# ---- .ips parser: bounds, degenerate payloads, alternate generations ----------
+
+
+def test_ips_oversized_report_is_a_typed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A report above the parse budget is refused before any read."""
+    monkeypatch.setattr(apple_ips, "MAX_IPS_BYTES", 16)
+    path = tmp_path / "huge.ips"
+    path.write_text(IPS_HEADER + "\n" + IPS_BODY + "\n", encoding="utf-8")
+    with pytest.raises(AnalysisError, match="parse budget"):
+        parse_ips_report(path)
+
+
+def test_ips_unreadable_report_is_a_typed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``OSError`` while reading the body surfaces as a typed error."""
+    path = tmp_path / "locked.ips"
+    path.write_text(IPS_HEADER + "\n" + IPS_BODY + "\n", encoding="utf-8")
+
+    def _boom(self: Path) -> bytes:
+        raise OSError("simulated read failure")
+
+    monkeypatch.setattr(Path, "read_bytes", _boom)
+    with pytest.raises(AnalysisError, match="cannot read"):
+        parse_ips_report(path)
+
+
+def test_ips_string_termination_reason_is_kept(tmp_path: Path) -> None:
+    """A string-shaped ``termination`` becomes the reason verbatim."""
+    body = json.loads(IPS_BODY)
+    body["termination"] = "process crashed because the needle was empty"
+    path = tmp_path / "strterm.ips"
+    path.write_text(IPS_HEADER + "\n" + json.dumps(body) + "\n", encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert summary.termination_reason == (
+        "process crashed because the needle was empty"
+    )
+
+
+def test_ips_degenerate_images_and_frames_are_skipped(tmp_path: Path) -> None:
+    """Non-array images, junk entries and list-pair frames all degrade cleanly."""
+    body = json.loads(IPS_BODY)
+    body["images"] = [42, {"name": "good.dylib"}, {"path": "/x/noname"}]
+    body["threads"] = [
+        {
+            "triggered": True,
+            "frames": [
+                [0, 4660],  # list-pair frame: imageIndex, imageOffset
+                "junk-frame",  # unsupported shape -> skipped with a warning
+                {"imageIndex": 0, "imageOffset": 88},
+            ],
+        }
+    ]
+    path = tmp_path / "degenerate.ips"
+    path.write_text(IPS_HEADER + "\n" + json.dumps(body) + "\n", encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert [image.name for image in summary.images] == ["good.dylib", "image 2"]
+    assert len(summary.frames) == 2
+    assert summary.frames[0].image == "good.dylib"
+    assert summary.frames[0].offset == 4660
+    assert any("unsupported shape" in w for w in summary.warnings)
+
+
+def test_ips_non_array_images_are_ignored(tmp_path: Path) -> None:
+    """An images payload that is not an array warns and yields no images."""
+    body = json.loads(IPS_BODY)
+    body["images"] = {"name": "not-an-array"}
+    path = tmp_path / "weird_images.ips"
+    path.write_text(IPS_HEADER + "\n" + json.dumps(body) + "\n", encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert summary.images == ()
+    assert any("images list is not an array" in w for w in summary.warnings)
+
+
+def test_ips_frame_ceiling_truncates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Frames beyond the budget are dropped with a warning, not an error."""
+    monkeypatch.setattr(apple_ips, "MAX_FRAMES", 2)
+    body = json.loads(IPS_BODY)
+    body["threads"] = [
+        {
+            "triggered": True,
+            "frames": [
+                {"imageIndex": index, "imageOffset": index * 16}
+                for index in range(6)
+            ],
+        }
+    ]
+    path = tmp_path / "many_frames.ips"
+    path.write_text(IPS_HEADER + "\n" + json.dumps(body) + "\n", encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert len(summary.frames) == 2
+    assert summary.truncated is True
+    assert any("frame limit" in w for w in summary.warnings)
+
+
+def test_ips_non_array_frames_are_ignored(tmp_path: Path) -> None:
+    """A frame payload that is not an array warns and yields no frames."""
+    body = json.loads(IPS_BODY)
+    body["threads"] = [{"triggered": True, "frames": {"0": {}}}]
+    path = tmp_path / "weird_frames.ips"
+    path.write_text(IPS_HEADER + "\n" + json.dumps(body) + "\n", encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert summary.frames == ()
+    assert any("no frame array" in w for w in summary.warnings)
+
+
+def test_ips_non_array_threads_are_ignored(tmp_path: Path) -> None:
+    """A threads payload that is not an array warns and yields no frames."""
+    body = json.loads(IPS_BODY)
+    body["threads"] = "thread zero"
+    path = tmp_path / "weird_threads.ips"
+    path.write_text(IPS_HEADER + "\n" + json.dumps(body) + "\n", encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert summary.frames == ()
+    assert summary.faulting_thread is None
+    assert any("threads list is not an array" in w for w in summary.warnings)
+
+
+def test_ips_out_of_range_faulting_thread_falls_back(tmp_path: Path) -> None:
+    """A bogus declared index falls back to the triggered, then first thread."""
+    body = json.loads(IPS_BODY)
+    body["faultingThread"] = 9
+    body["threads"] = [
+        {"frames": [{"imageIndex": 0, "imageOffset": 1}]},
+        {"triggered": True, "frames": [{"imageIndex": 0, "imageOffset": 2}]},
+    ]
+    path = tmp_path / "badindex.ips"
+    path.write_text(IPS_HEADER + "\n" + json.dumps(body) + "\n", encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert summary.faulting_thread == 1
+    assert summary.frames[0].offset == 2
+    assert any("out of range" in w for w in summary.warnings)
+
+
+def test_ips_non_dict_thread_entry_warns(tmp_path: Path) -> None:
+    """A thread entry that is not a dictionary keeps its index, drops frames."""
+    body = json.loads(IPS_BODY)
+    body["threads"] = ["just a string"]
+    path = tmp_path / "strthread.ips"
+    path.write_text(IPS_HEADER + "\n" + json.dumps(body) + "\n", encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert summary.faulting_thread == 0
+    assert summary.frames == ()
+    assert any("not a dictionary" in w for w in summary.warnings)
+
+
+def test_ips_exception_signal_parsed_from_type(tmp_path: Path) -> None:
+    """Signal-less JSON bodies recover the signal from the exception type."""
+    body = {
+        "exception": {"type": "EXC_BAD_ACCESS (SIGSEGV)"},
+        "images": [],
+        "threads": [],
+    }
+    path = tmp_path / "signal_only.ips"
+    path.write_text(IPS_HEADER + "\n" + json.dumps(body) + "\n", encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert summary.exception_signal == "SIGSEGV"
+    assert summary.frames == ()
+    assert summary.evidence.confidence.value == "medium"
+
+
+def test_ips_two_line_marker_body_is_merged(tmp_path: Path) -> None:
+    """Marker reports with the header and body on separate JSON lines merge."""
+    dump_header = '{"bug_type":"309","product":"Mac15,7"}'
+    crash_body = json.dumps(json.loads(IPS_BODY))
+    path = tmp_path / "twolines.ips"
+    path.write_text(
+        "JSON dump header\n" + dump_header + "\nlog noise line\n" + crash_body + "\n",
+        encoding="utf-8",
+    )
+    summary = parse_ips_report(path)
+    assert summary.product == "Mac15,7"
+    assert summary.frames[0].symbol == "_main"
+
+
+def test_ips_header_line_with_two_json_lines_merges(tmp_path: Path) -> None:
+    """Marker generation keeps merging even when the dump header is absent."""
+    first = json.dumps(
+        {
+            "uptime": 100,
+            "faultingThread": 0,
+            "threads": [{"frames": [{"imageIndex": 0, "imageOffset": 7}]}],
+        }
+    )
+    second = json.dumps({"exception": {"type": "EXC_BREAKPOINT (SIGTRAP)"}})
+    path = tmp_path / "merged.ips"
+    path.write_text(
+        "JSON dump header\n" + first + "\n" + second + "\n", encoding="utf-8"
+    )
+    summary = parse_ips_report(path)
+    assert summary.format == "json"
+    assert summary.exception_signal == "SIGTRAP"
+    assert summary.faulting_thread == 0
+
+
+def test_ips_bplist_body_malformed_is_a_typed_error(tmp_path: Path) -> None:
+    """A binary-plist-looking body that fails to parse is a typed error."""
+    path = tmp_path / "bplist.ips"
+    path.write_text(
+        IPS_HEADER + "\nbplist00" + bytes(range(32)).decode("latin-1"),
+        encoding="utf-8",
+        errors="replace",
+    )
+    with pytest.raises(AnalysisError, match="plist body"):
+        parse_ips_report(path)
+
+
+def test_ips_plist_array_body_degrades_to_metadata(tmp_path: Path) -> None:
+    """A plist body whose root is an array warns and yields metadata only."""
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<plist version="1.0"><array><string>x</string></array></plist>\n'
+    )
+    path = tmp_path / "arraybody.ips"
+    path.write_text(IPS_HEADER + "\n" + plist, encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert summary.format == "plist"
+    assert summary.frames == ()
+    assert summary.evidence.confidence.value == "low"
+    assert any("not a dictionary" in w for w in summary.warnings)
+
+
+def test_ips_plist_triggered_by_thread_fallback(tmp_path: Path) -> None:
+    """Legacy reports fall back to ``Triggered by Thread`` for the index."""
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<plist version="1.0"><dict>\n'
+        "<key>Product</key><string>TriggeredApp</string>\n"
+        "<key>Triggered by Thread</key><integer>0</integer>\n"
+        '<key>Threads</key><array><dict><key>frames</key><array/>\n'
+        "</dict></array>\n"
+        "</dict></plist>\n"
+    )
+    header = '{"app_name":"TriggeredApp","timestamp":"2024-01-01 00:00:00 +0000"}'
+    path = tmp_path / "triggered.ips"
+    path.write_text(header + "\n" + plist, encoding="utf-8")
+    summary = parse_ips_report(path)
+    assert summary.product == "TriggeredApp"
+    assert summary.faulting_thread == 0
+    assert summary.crash_time == "2024-01-01 00:00:00 +0000"
+
+
+def test_ips_header_scanner_and_marker_helpers() -> None:
+    """The tolerant header scanner and marker prober handle degenerate text."""
+    assert apple_ips._first_key({"a": "", "b": "x"}, "a", "b") == "x"
+    assert apple_ips._first_key({"a": None}, "a") is None
+    assert apple_ips._json_object_after_marker("\n\n") is None
+    assert apple_ips._json_object_after_marker("\nnot json") is None
+    assert apple_ips._json_object_after_marker('\n{"a": 1}') == {"a": 1}
+
+
+# ---- MCP tool (`codevanta_crash`): argument validation ------------------------
+
+
+def test_mcp_crash_rejects_bad_path_arguments(tmp_path: Path) -> None:
+    """Non-string, empty and non-file paths are typed errors."""
+    with pytest.raises(AnalysisError, match="must be a string"):
+        tools.codevanta_crash(42)  # type: ignore[arg-type]
+    with pytest.raises(AnalysisError, match="must not be empty"):
+        tools.codevanta_crash("   ")
+    with pytest.raises(AnalysisError, match="not a regular file"):
+        tools.codevanta_crash(str(tmp_path))
+
+
+def test_mcp_crash_unreadable_file_is_a_typed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``OSError`` during the magic peek surfaces as a typed error."""
+    path = core64_path(tmp_path)
+
+    def _boom(self: Path, mode: str) -> object:
+        raise OSError("simulated open failure")
+
+    monkeypatch.setattr(Path, "open", _boom)
+    with pytest.raises(AnalysisError, match="cannot read"):
+        tools.codevanta_crash(str(path))
+
+
+

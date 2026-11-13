@@ -864,4 +864,620 @@ def test_mcp_server_lists_and_calls_metadata(tmp_path: Path) -> None:
     assert payload["kind"] == "python-pyc"
 
 
+# ---- binmeta: low-level I/O guards -------------------------------------------
+
+
+def test_checked_size_refuses_tiny_pyc_files(tmp_path: Path) -> None:
+    """A file too small to hold a pyc magic reports ``None`` honestly."""
+    p = tmp_path / "tiny.pyc"
+    p.write_bytes(b"ab")
+    assert detect_pyc(p) is None
+
+
+def test_detectors_refuse_directories(tmp_path: Path) -> None:
+    """Every path-taking detector reports ``None`` for a directory."""
+    assert detect_go_buildinfo(tmp_path) is None
+    assert detect_cargo_auditable(tmp_path) is None
+    assert detect_electron_fuses(tmp_path) is None
+    assert detect_elf_notes(tmp_path) is None
+    assert detect_kernel_module(tmp_path) is None
+    assert detect_apk_signing(tmp_path) is None
+    assert detect_desktop_app(tmp_path / "nope.bin") is None
+
+
+def test_desktop_app_rejects_plain_files(tmp_path: Path) -> None:
+    """``detect_desktop_app`` only classifies directories."""
+    p = tmp_path / "app.exe"
+    p.write_bytes(b"whatever")
+    assert detect_desktop_app(p) is None
+
+
+# ---- binmeta: synthetic ELF32 / PE containers ---------------------------------
+
+
+def _elf32(path: Path, *, phdrs: list[tuple[int, bytes]], shnum: int = 0) -> Path:
+    """Minimal little-endian ELF32 with 32-bit program headers."""
+    data_off = 52 + 32 * len(phdrs)
+    blob = bytearray()
+    ph_entries: list[bytes] = []
+    for p_type, content in phdrs:
+        offset = data_off + len(blob)
+        blob += content
+        ph_entries.append(
+            struct.pack("<IIIIIIII", p_type, offset, offset, offset,
+                        len(content), len(content), 6, 4)
+        )
+    ident = b"\x7fELF" + bytes([1, 1, 1, 0]) + bytes(8)
+    ehdr = ident + struct.pack(
+        "<HHIIIIIHHHHHH",
+        1, 3, 1, 0, 52, 0xFFFF00 if shnum else 0, 0,
+        52, 32, len(phdrs), 40, shnum, 0,
+    )
+    out = bytearray(ehdr)
+    out += b"".join(ph_entries)
+    out += blob
+    path.write_bytes(bytes(out))
+    return path
+
+
+def _note_blob(name: bytes, desc: bytes) -> bytes:
+    return struct.pack("<III", len(name), len(desc), 1) + name + b"\x00" * (
+        -len(name) % 4
+    ) + desc + b"\x00" * (-len(desc) % 4)
+
+
+def test_elf32_notes_parse_via_32_bit_layouts(tmp_path: Path) -> None:
+    """ELF32 program headers and the bogus-section-table break both parse."""
+    notes = (
+        _note_blob(b"GNU\x00", struct.pack("<II", 3, 0x401000))
+        + struct.pack("<III", 4, 64, 1)[:12]  # truncated note: entry_end > blob
+        + b"\x00" * 4
+    )
+    path = _elf32(tmp_path / "note32.elf", phdrs=[(4, notes)], shnum=3)
+    info = detect_elf_notes(path)
+    assert info is not None
+    assert info.note_segments == 1
+    assert info.notes[0].name == "GNU"
+
+
+def test_iter_notes_refuses_oversized_and_truncated_notes(tmp_path: Path) -> None:
+    """Oversized name sizes and chopped descriptors break the bounded walk."""
+    bad_size = struct.pack("<III", 0x7F_FF_FF, 4, 1)  # namesz way over cap
+    chopped = struct.pack("<III", 4, 2000, 1) + b"\x00" * 8  # descriptor cut
+    path = _elf64(
+        tmp_path / "badnotes.elf",
+        e_type=2,
+        phdrs=[(4, 0, bad_size + chopped)],
+    )
+    assert detect_elf_notes(path) is None
+
+
+def test_pe_containers_parse_sections_and_go_buildinfo(tmp_path: Path) -> None:
+    """A synthetic PE32+ parses its section table and inline Go build info."""
+    buildinf = _go_blob(
+        8, 0x2, b"go1.22.1\x00mod\texample.com/mod\tv1.2.3\n\x00"
+    )
+    e_lfanew = 0x80
+    dos = bytearray(e_lfanew)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, e_lfanew)
+    coff = struct.pack("<4sHHIIIHH", b"PE\x00\x00", 0x8664, 1, 0, 0, 0, 240, 0x0022)
+    opt = bytearray(240)
+    struct.pack_into("<H", opt, 0, 0x20B)
+    struct.pack_into("<Q", opt, 24, 0x140000000)
+    sections = struct.pack("<8sIIIIIIHHI", b".text\x00\x00\x00", 1, 0, 0x10, 0x200,
+                           0x10, 0, 0, 0, 0)
+    image = bytes(dos) + coff + bytes(opt) + sections + buildinf
+    path = tmp_path / "go.exe"
+    path.write_bytes(image)
+    info = detect_go_buildinfo(path)
+    assert info is not None
+    assert info.go_version == "go1.22.1"
+    assert info.module_path == "example.com/mod"
+    assert info.layout == "inline-strings"
+    assert info.evidence.source == "meta.gobuildinfo"
+
+
+# ---- binmeta: Go buildinfo degenerate layouts ---------------------------------
+
+
+def _go_blob(ptr_size: int, flags: int, payload: bytes) -> bytes:
+    """Go buildinf blob: 14-byte magic, ptr-size/flags byte pair, payload."""
+    return b"\xff Go buildinf:" + bytes([ptr_size, flags]) + payload
+
+
+def test_go_buildinfo_header32_inline_strings(tmp_path: Path) -> None:
+    """Go 1.24+ pads the header to 32 bytes before the inline strings."""
+    blob = (
+        _go_blob(8, 0x2, b"\x00" * 16)  # padding: near probe misses, far hits
+        + b"go1.24.0\x00example.com/pad\x00"
+    )
+    path = tmp_path / "go24.bin"
+    path.write_bytes(blob)
+    info = detect_go_buildinfo(path)
+    assert info is not None
+    assert info.go_version == "go1.24.0"
+    assert info.layout == "inline-strings-header32"
+
+
+def test_go_buildinfo_module_info_blank_and_path_lines(tmp_path: Path) -> None:
+    """Blank lines and a leading ``path`` line still fill the module fields."""
+    mod = "\npath\texample.com/alt\ndep\tfoolib\tv1.0.0\n"
+    blob = _go_blob(8, 0x2, b"go1.22.0\x00" + mod.encode("utf-8") + b"\x00")
+    path = tmp_path / "gomod.bin"
+    path.write_bytes(blob)
+    info = detect_go_buildinfo(path)
+    assert info is not None
+    assert info.go_version == "go1.22.0"
+    assert info.module_path == "example.com/alt"
+    assert info.dependencies == ("foolib@v1.0.0",)
+    assert info.dependency_count == 1
+
+
+def test_go_buildinfo_truncated_pointer_fields_raise(tmp_path: Path) -> None:
+    """A pointer-layout header cut short is a typed error."""
+    path = tmp_path / "shortgo.bin"
+    path.write_bytes(_go_blob(8, 0x0, b""))
+    with pytest.raises(AnalysisError, match="truncated Go build info"):
+        detect_go_buildinfo(path)
+
+
+def test_go_buildinfo_unresolvable_pointers_raise(tmp_path: Path) -> None:
+    """Pointer layout without a container cannot resolve addresses."""
+    blob = _go_blob(8, 0x0, struct.pack("<QQ", 0x400000, 0x400100))
+    path = tmp_path / "flatgo.bin"
+    path.write_bytes(blob)
+    with pytest.raises(AnalysisError, match="cannot be resolved"):
+        detect_go_buildinfo(path)
+
+
+def test_go_buildinfo_non_go_version_string_raises(tmp_path: Path) -> None:
+    """A resolved version that is not ``go...`` is a typed error."""
+    base = 120  # _elf64 identity mapping: content lands at vaddr 120
+    head = _go_blob(8, 0x0, struct.pack("<QQ", base + 48, base + 53))
+    load = head + b"\x00" * 16 + b"nope\x00" + b"also-nope\x00"
+    path = _elf64(tmp_path / "nongo.elf", e_type=2, phdrs=[(1, 6, load)])
+    with pytest.raises(AnalysisError, match="malformed Go build info"):
+        detect_go_buildinfo(path)
+
+
+# ---- binmeta: cargo-auditable payload guards ----------------------------------
+
+
+def _audit_elf(path: Path, note_name: bytes, desc: bytes) -> Path:
+    """ELF64 carrying one ``AUDITABLE``-style note."""
+    return _elf64(
+        path,
+        e_type=2,
+        phdrs=[(4, 0, _note_blob(note_name, desc))],
+    )
+
+
+def test_cargo_auditable_empty_payload_raises(tmp_path: Path) -> None:
+    """An empty audit-note descriptor is a typed error, not a summary."""
+    path = _audit_elf(tmp_path / "empty_audit.elf", b"AUDITABLE\x00", b"")
+    with pytest.raises(AnalysisError, match="empty cargo-auditable payload"):
+        detect_cargo_auditable(path)
+
+
+@pytest.mark.parametrize(
+    "desc",
+    [
+        b'{"name": "crate"}',  # JSON object, not an array
+        b"[42]",  # array entry that is not an object
+        b'[{"version": "1.0"}]',  # entry without a name
+    ],
+)
+def test_cargo_auditable_malformed_payloads_raise(tmp_path: Path, desc: bytes) -> None:
+    """Malformed audit JSON payloads surface as typed errors."""
+    path = _audit_elf(tmp_path / "bad_audit.elf", b"rust-audit\x00", desc)
+    with pytest.raises(AnalysisError, match="cargo-auditable"):
+        detect_cargo_auditable(path)
+
+
+def test_cargo_audit_note_walk_breaks_on_bad_notes(tmp_path: Path) -> None:
+    """Oversized and truncated audit notes end the walk without a payload."""
+    good = _note_blob(b"GNU\x00", b"")  # not an audit owner: walk continues
+    chopped = struct.pack("<III", 4, 999, 1) + b"\x00" * 8
+    path = _elf64(tmp_path / "walk.elf", e_type=2, phdrs=[(4, 0, good + chopped)])
+    assert detect_cargo_auditable(path) is None
+
+
+# ---- binmeta: electron fuse wire guards ---------------------------------------
+
+
+def test_fuse_wire_truncated_header_is_a_typed_error(tmp_path: Path) -> None:
+    """A sentinel with fewer than two wire bytes is a typed error."""
+    path = tmp_path / "stub.fuse"
+    path.write_bytes(ELECTRON_FUSE_SENTINEL + b"\x01")
+    with pytest.raises(AnalysisError, match="truncated Electron fuse wire"):
+        detect_electron_fuses(path)
+
+
+# ---- binmeta: kernel module (.modinfo) ----------------------------------------
+
+
+def test_kernel_module_modinfo_degenerate_chunks(tmp_path: Path) -> None:
+    """Chunks without '=' and empty keys are skipped; long values truncate."""
+    modinfo = (
+        b"vermagic=5.15.0-gentoo SMP mod_unload\0"
+        b"no-equals-in-this-chunk\0"
+        b"=value-without-key\0"
+        b"license=GPL\0"
+        b"long=" + b"v" * 250 + b"\0"
+    )
+    path = _elf64(
+        tmp_path / "mod.ko", e_type=1, sections=[(".modinfo", 1, modinfo)]
+    )
+    info = detect_kernel_module(path)
+    assert info is not None
+    assert info.key_count == 3
+    assert info.modinfo["vermagic"].startswith("5.15.0")
+    assert info.modinfo["license"] == "GPL"
+    assert info.modinfo["long"].endswith("...")
+    assert len(info.modinfo["long"]) == 203
+    assert info.evidence.source == "meta.modinfo"
+
+
+def test_kernel_module_modinfo_without_pairs_returns_none(tmp_path: Path) -> None:
+    """A ``.modinfo`` section holding no ``key=value`` pairs reports None."""
+    path = _elf64(
+        tmp_path / "bare.ko", e_type=1, sections=[(".modinfo", 1, b"justchunk\0")]
+    )
+    assert detect_kernel_module(path) is None
+
+
+def test_kernel_module_bad_and_truncated_headers(tmp_path: Path) -> None:
+    """Bad ELF identification and a cut header are typed errors."""
+    bad_ident = tmp_path / "ident.ko"
+    bad_ident.write_bytes(b"\x7fELF" + bytes([9, 1, 1, 0]) + bytes(8) + bytes(48))
+    with pytest.raises(AnalysisError, match="malformed ELF identification"):
+        detect_kernel_module(bad_ident)
+    truncated = tmp_path / "cut.ko"
+    truncated.write_bytes(b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8) + bytes(4))
+    with pytest.raises(AnalysisError, match="truncated ELF header"):
+        detect_kernel_module(truncated)
+
+
+def test_kernel_module_without_section_table(tmp_path: Path) -> None:
+    """An ET_REL image with no section header table reports None."""
+    ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
+    header = ident + struct.pack(
+        "<HHIQQQIHHHHHH", 1, 62, 1, 0, 0, 0, 0, 64, 56, 0, 64, 0, 0
+    )
+    path = tmp_path / "nosect.ko"
+    path.write_bytes(header + bytes(64))
+    assert detect_kernel_module(path) is None
+
+
+def test_kernel_module_short_section_table_breaks(tmp_path: Path) -> None:
+    """A declared section count with no data behind it reports None."""
+    ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
+    header = ident + struct.pack(
+        "<HHIQQQIHHHHHH", 1, 62, 1, 0, 0, 128, 0, 64, 56, 0, 64, 3, 0
+    )
+    path = tmp_path / "stubsh.ko"
+    path.write_bytes(header)  # ends exactly where e_shoff points
+    assert detect_kernel_module(path) is None
+
+
+# ---- binmeta: desktop-app classification (PE CLR probes) -----------------------
+
+
+def _pe_image(
+    *,
+    magic: int = 0x20B,
+    rva_count: int = 16,
+    clr_rva: int = 0,
+    opt_size: int | None = None,
+    sig: bytes = b"PE\x00\x00",
+) -> bytes:
+    """Synthetic PE: DOS header, COFF, optional header, one section."""
+    e_lfanew = 0x80
+    dos = bytearray(e_lfanew)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, e_lfanew)
+    opt_len = 240 if opt_size is None else opt_size
+    coff = struct.pack("<4sHHIIIHH", sig, 0x8664, 1, 0, 0, 0, opt_len, 0x0022)
+    opt = bytearray(max(opt_len, 240))
+    struct.pack_into("<H", opt, 0, magic)
+    struct.pack_into("<Q", opt, 24, 0x140000000)
+    dirs_off, entry = (112, 108) if magic == 0x20B else (96, 92)
+    struct.pack_into("<I", opt, entry, rva_count)
+    struct.pack_into("<I", opt, dirs_off + 14 * 8, clr_rva)
+    sections = struct.pack(
+        "<8sIIIIIIHHI", b".text\x00\x00\x00", 1, 0, 0x10, 0x200, 0x10, 0, 0, 0, 0
+    )
+    return bytes(dos) + coff + bytes(opt[:opt_len]) + sections
+
+
+def test_desktop_app_dotnet_via_pe32_clr_directory(tmp_path: Path) -> None:
+    """A PE32 image with a non-zero CLR data directory classifies as dotnet."""
+    root = tmp_path / "DotNetApp"
+    root.mkdir()
+    (root / "app.exe").write_bytes(_pe_image(magic=0x10B, clr_rva=0x2000))
+    info = detect_desktop_app(root)
+    assert info is not None
+    assert info.frameworks == ("dotnet",)
+
+
+@pytest.mark.parametrize(
+    "image_kwargs",
+    [
+        {"sig": b"NOPE"},  # PE signature missing
+        {"opt_size": 1},  # optional header too short for a magic
+        {"magic": 0x30B},  # unknown optional-header magic
+        {"magic": 0x10B, "opt_size": 94},  # cut before the CLR directory entry
+        {"rva_count": 14},  # data directory count too small for CLR (14)
+    ],
+)
+def test_desktop_app_clr_probes_degrade_to_none(
+    tmp_path: Path, image_kwargs: dict
+) -> None:
+    """Exes whose PE header cannot prove a CLR directory yield no dotnet."""
+    root = tmp_path / "PlainApp"
+    root.mkdir()
+    (root / "app.exe").write_bytes(_pe_image(**image_kwargs))
+    assert detect_desktop_app(root) is None
+
+
+def test_desktop_app_unity_flag_and_walk_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk truncates at the file cap while Unity markers classify."""
+    monkeypatch.setattr(binmeta, "MAX_DESKTOP_FILES", 2)
+    root = tmp_path / "UnityGame"
+    (root / "Game_Data").mkdir(parents=True)
+    (root / "Game_Data" / "level0").write_bytes(b"assets")
+    (root / "Game_Data" / "pad1.txt").write_bytes(b"pad")
+    (root / "Game_Data" / "pad2.txt").write_bytes(b"pad")
+    info = detect_desktop_app(root)
+    assert info is not None
+    assert "unity" in info.frameworks
+
+
+def test_desktop_app_pe_probe_errors_are_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing PE probe is skipped; classification continues without it."""
+
+    def _boom(path: Path) -> object:
+        raise OSError("simulated open failure")
+
+    monkeypatch.setattr(binmeta, "_open_file", _boom)
+    root = tmp_path / "BrokenApp"
+    root.mkdir()
+    (root / "app.exe").write_bytes(_pe_image(clr_rva=0x2000))
+    assert detect_desktop_app(root) is None
+
+
+# ---- binmeta: APK signing block error matrix -----------------------------------
+
+
+def _u32(value: int) -> bytes:
+    return struct.pack("<I", value)
+
+
+def _u64(value: int) -> bytes:
+    return struct.pack("<Q", value)
+
+
+def _signer_record(sd: bytes) -> bytes:
+    """One length-prefixed signer whose signed data is ``sd``."""
+    return _u32(len(sd)) + sd
+
+
+def _signed_data(digests: bytes, *, v3: bool = False, dg_len: int | None = None) -> bytes:
+    """Signed data: length wrapper, digest list, cert/attr spans, v3 SDK tail."""
+    rest = _u32(len(digests) if dg_len is None else dg_len) + digests + _u32(0) + _u32(0)
+    if v3:
+        rest += _u32(21) + _u32(33)
+    return _u32(len(rest)) + rest
+
+
+def _digest_record(alg: int = 1) -> bytes:
+    return _u32(4) + _u32(alg)
+
+
+def _v2_pair(value: bytes, pair_id: int = 0x7109871A) -> bytes:
+    return _u64(4 + len(value)) + _u32(pair_id) + value
+
+
+def _apk_block_bytes(pairs: bytes, *, declared: int | None = None,
+                     trailer_size: int | None = None,
+                     magic: bytes = APK_SIG_BLOCK_MAGIC) -> bytes:
+    """A physically consistent signing block (declared defaults to true size)."""
+    size = len(pairs) + 24 if declared is None else declared
+    trailing = size if trailer_size is None else trailer_size
+    return _u64(size) + pairs + _u64(trailing) + magic
+
+
+def _apk_file(tmp_path: Path, block: bytes, *, chop: int = 0) -> Path:
+    """Write zip stub + block + CD stub + EOCD (optionally chopped) to disk."""
+    cd_offset = 30 + len(block)
+    eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 0, 0, 16, cd_offset, 0)
+    stub = b"PK\x03\x04" + b"\x00" * 26
+    path = tmp_path / "signed.apk"
+    path.write_bytes(stub + block + b"\x00" * 16 + eocd[: len(eocd) - chop])
+    return path
+
+
+def _plain_apk(
+    tmp_path: Path,
+    cd_offset: int,
+    *,
+    cd_size: int = 16,
+    entries: int = 0,
+    name: str = "bare.apk",
+) -> Path:
+    """A minimal EOCD (optionally lying) without a signing block."""
+    path = tmp_path / name
+    path.write_bytes(
+        b"PK\x03\x04" + b"\x00" * 16
+        + struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, entries, entries,
+                      cd_size, cd_offset, 0)
+    )
+    return path
+
+
+def _signer_seq(sd: bytes) -> bytes:
+    """Length-prefixed signer sequence holding exactly one signer."""
+    rec = _signer_record(sd)
+    return _u32(len(rec)) + rec
+
+
+def test_apk_signer_sequence_length_lies(tmp_path: Path) -> None:
+    """A declared signer sequence longer than the value is a typed error."""
+    sd = _signed_data(_digest_record(1))
+    value = _u32(9999) + _signer_record(sd)
+    path = _apk_file(tmp_path, _apk_block_bytes(_v2_pair(value)))
+    with pytest.raises(AnalysisError, match="malformed APK signer sequence"):
+        detect_apk_signing(path)
+
+
+def test_apk_signer_record_too_short(tmp_path: Path) -> None:
+    """A signer length below the minimum is a typed error."""
+    sd = _signed_data(_digest_record(1))
+    value = _u32(len(sd) + 4) + _u32(0) + sd  # slen = 0
+    path = _apk_file(tmp_path, _apk_block_bytes(_v2_pair(value)))
+    with pytest.raises(AnalysisError, match="truncated APK signer record"):
+        detect_apk_signing(path)
+
+
+def test_apk_too_many_signers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Signers beyond the budget are refused."""
+    monkeypatch.setattr(binmeta, "MAX_APK_SIGNERS", 1)
+    sd = _signed_data(_digest_record(1))
+    seq = _signer_record(sd) + _signer_record(sd)
+    value = _u32(len(seq)) + seq
+    path = _apk_file(tmp_path, _apk_block_bytes(_v2_pair(value)))
+    with pytest.raises(AnalysisError, match="more than 1 APK signers"):
+        detect_apk_signing(path)
+
+
+def test_apk_truncated_digest_record(tmp_path: Path) -> None:
+    """A digest record length that overruns its list is a typed error."""
+    digests = _digest_record(1) + _u32(8)  # next record announces, never lands
+    value = _v2_pair(_signer_seq(_signed_data(digests)))
+    path = _apk_file(tmp_path, _apk_block_bytes(value))
+    with pytest.raises(AnalysisError, match="truncated APK digest record"):
+        detect_apk_signing(path)
+
+
+def test_apk_truncated_signed_data(tmp_path: Path) -> None:
+    """A signed-data length that overruns the signer is a typed error."""
+    sd = _signed_data(_digest_record(1))
+    bad = _u32(len(sd) + 100) + sd
+    value = _v2_pair(_signer_seq(bad))
+    path = _apk_file(tmp_path, _apk_block_bytes(value))
+    with pytest.raises(AnalysisError, match="truncated APK signed-data"):
+        detect_apk_signing(path)
+
+
+def test_apk_truncated_digest_list(tmp_path: Path) -> None:
+    """A digest-list length that overruns the signed data is a typed error."""
+    sd = _signed_data(_digest_record(1), dg_len=999)
+    value = _v2_pair(_signer_seq(sd))
+    path = _apk_file(tmp_path, _apk_block_bytes(value))
+    with pytest.raises(AnalysisError, match="truncated APK digest list"):
+        detect_apk_signing(path)
+
+
+def test_apk_v3_missing_sdk_fields(tmp_path: Path) -> None:
+    """A v3 signed-data block without the min/max SDK tail is a typed error."""
+    value = _v2_pair(_signer_seq(_signed_data(_digest_record(1))), 0xF05368C0)
+    path = _apk_file(tmp_path, _apk_block_bytes(value))
+    with pytest.raises(AnalysisError, match="min/max SDK"):
+        detect_apk_signing(path)
+
+
+def test_apk_block_declared_size_under_minimum(tmp_path: Path) -> None:
+    """A declared size under 24 bytes is a typed error."""
+    block = _u64(8) + b"\x00" * 8 + _u64(8) + APK_SIG_BLOCK_MAGIC
+    path = _apk_file(tmp_path, block)
+    with pytest.raises(AnalysisError, match="size < 24"):
+        detect_apk_signing(path)
+
+
+def test_apk_block_declared_size_overreach(tmp_path: Path) -> None:
+    """A declared block reaching before the zip start is a typed error."""
+    pairs = _v2_pair(_signer_seq(_signed_data(_digest_record(1))))
+    declared = len(pairs) + 240
+    block = _u64(declared) + pairs + _u64(declared) + APK_SIG_BLOCK_MAGIC
+    path = _apk_file(tmp_path, block)
+    with pytest.raises(AnalysisError, match="before zip start"):
+        detect_apk_signing(path)
+
+
+def test_apk_block_leading_size_mismatch(tmp_path: Path) -> None:
+    """Leading size field disagreeing with the footer is a typed error."""
+    pairs = _v2_pair(_signer_seq(_signed_data(_digest_record(1))))
+    size = len(pairs) + 24
+    block = _u64(size + 3) + pairs + _u64(size) + APK_SIG_BLOCK_MAGIC
+    path = _apk_file(tmp_path, block)
+    with pytest.raises(AnalysisError, match="size field mismatch"):
+        detect_apk_signing(path)
+
+
+def test_apk_block_malformed_pair_length(tmp_path: Path) -> None:
+    """A pair length that overruns the block is a typed error."""
+    pairs = _u64(9999) + _u32(0x7109871A) + b"\x00" * 4
+    path = _apk_file(tmp_path, _apk_block_bytes(pairs))
+    with pytest.raises(AnalysisError, match="malformed APK Signing Block pair"):
+        detect_apk_signing(path)
+
+
+def test_apk_too_many_pairs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pairs beyond the budget are refused."""
+    monkeypatch.setattr(binmeta, "MAX_APK_PAIRS", 1)
+    sd = _signed_data(_digest_record(1))
+    sd_v3 = _signed_data(_digest_record(1), v3=True)
+    pairs = _v2_pair(_signer_seq(sd)) + _v2_pair(_signer_seq(sd_v3), 0x1B93AD61)
+    path = _apk_file(tmp_path, _apk_block_bytes(pairs))
+    with pytest.raises(AnalysisError, match="more than 1 signing-block pairs"):
+        detect_apk_signing(path)
+
+
+def test_apk_eocd_short_tail(tmp_path: Path) -> None:
+    """An EOCD record cut below 22 bytes is a typed error."""
+    path = tmp_path / "chopped.apk"
+    path.write_bytes(b"PK\x03\x04junk\x00\x00\x00PK\x05\x06" + b"\x00" * 8)
+    with pytest.raises(AnalysisError, match="End Of Central Directory"):
+        detect_apk_signing(path)
+
+
+def test_apk_zip64_rejected(tmp_path: Path) -> None:
+    """A zip64 central-directory offset is refused with a typed message."""
+    path = _plain_apk(tmp_path, 0xFFFFFFFF)
+    with pytest.raises(AnalysisError, match="zip64"):
+        detect_apk_signing(path)
+
+
+def test_apk_eocd_offset_outside_file(tmp_path: Path) -> None:
+    """A central-directory offset past EOF is a typed error."""
+    path = _plain_apk(tmp_path, 9_999_999)
+    with pytest.raises(AnalysisError, match="points outside the file"):
+        detect_apk_signing(path)
+
+
+def test_apk_corrupt_zip_surfaces_as_typed_error(tmp_path: Path) -> None:
+    """An EOCD whose central directory is garbage becomes a typed error."""
+    path = _plain_apk(tmp_path, 2, entries=1)
+    with pytest.raises(AnalysisError, match="malformed zip archive"):
+        detect_apk_signing(path)
+
+
+def test_apk_plain_zip_without_signing_returns_none(tmp_path: Path) -> None:
+    """A valid zip with no signing block and no v1 manifest reports None."""
+    import zipfile
+
+    path = tmp_path / "plain.apk"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("assets/data.txt", "payload")
+    assert detect_apk_signing(path) is None
+
+
+
+
+
 

@@ -15,6 +15,7 @@ import json
 import socket
 import struct
 import threading
+import time
 import zlib
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from codevanta.analysis import cdp_client
 from codevanta.analysis.asar import (
     MAX_FILES,
     extract_file,
@@ -40,7 +42,9 @@ from codevanta.analysis.cdp_client import (
     inspect_page,
     list_targets,
     mask_payload,
+    normalise_endpoint,
     parse_message,
+    parse_ws_url,
     webmcp_get_tools,
 )
 from codevanta.cli.main import app as cli_app
@@ -439,6 +443,30 @@ _FRAGMENTED_EVENT = json.dumps(
         },
     }
 ).encode("utf-8")
+_LATE_EVENT = {
+    "method": "Runtime.consoleAPICalled",
+    "params": {
+        "type": "info",
+        "args": [{"type": "string", "value": "late console traffic"}],
+    },
+}
+_WEIRD_EVENTS = (
+    {"method": "Log.entryAdded", "params": {"entry": 42}},
+    {
+        "method": "Runtime.consoleAPICalled",
+        "params": {
+            "type": "error",
+            "args": [
+                42,
+                {"description": "desc only"},
+                {"value": "str value"},
+                {"value": {"k": 1}},
+                {"value": None},
+            ],
+        },
+    },
+    {"method": "Page.frameNavigated", "params": {}},
+)
 
 
 class _FakeDevtools:
@@ -451,8 +479,24 @@ class _FakeDevtools:
     ``WebMCP.getAllTools`` probe fail with the standard unknown-domain error.
     """
 
-    def __init__(self, *, webmcp: str = "absent") -> None:
+    def __init__(
+        self,
+        *,
+        webmcp: str = "absent",
+        nav: str | None = None,
+        tree: str | None = None,
+        events: str = "standard",
+        late_event: bool = False,
+        extra_targets: tuple[dict[str, Any], ...] = (),
+        shot: str | None = None,
+    ) -> None:
         self.webmcp = webmcp
+        self.nav = nav
+        self.tree = tree
+        self.events = events
+        self.late_event = late_event
+        self.extra_targets = list(extra_targets)
+        self.shot = shot
         self.methods_received: list[str] = []
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
@@ -464,6 +508,15 @@ class _FakeDevtools:
 
     def start(self) -> None:
         self._thread.start()
+
+    def _push_late(self, conn: socket.socket) -> None:
+        """Push one console event well after setup (exercise observe loop)."""
+        if self._stop.is_set():
+            return
+        try:
+            conn.sendall(_server_frame(json.dumps(_LATE_EVENT).encode()))
+        except OSError:
+            pass
 
     def stop(self) -> None:
         self._stop.set()
@@ -514,19 +567,19 @@ class _FakeDevtools:
         if headers.get("upgrade", "").lower() == "websocket":
             self._handle_ws(conn, headers)
         elif first_line.startswith("GET /json"):
-            body = json.dumps(
-                [
-                    {
-                        "id": "PAGE1",
-                        "type": "page",
-                        "title": "CODEVANTA Test Page",
-                        "url": "https://example.test/app",
-                        "webSocketDebuggerUrl": (
-                            f"ws://127.0.0.1:{self.port}/devtools/page/PAGE1"
-                        ),
-                    }
-                ]
-            ).encode("utf-8")
+            entries: list[dict[str, Any]] = [
+                {
+                    "id": "PAGE1",
+                    "type": "page",
+                    "title": "CODEVANTA Test Page",
+                    "url": "https://example.test/app",
+                    "webSocketDebuggerUrl": (
+                        f"ws://127.0.0.1:{self.port}/devtools/page/PAGE1"
+                    ),
+                }
+            ]
+            entries.extend(self.extra_targets)
+            body = json.dumps(entries).encode("utf-8")
             conn.sendall(
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: application/json\r\n"
@@ -584,55 +637,94 @@ class _FakeDevtools:
                 replies.append(self._result(message_id, {}))
                 if not events_pushed and method == "Runtime.enable":
                     events_pushed = True
-                    replies.append(_server_frame(json.dumps(_LOG_EVENT).encode()))
-                    replies.append(_server_frame(json.dumps(_CONSOLE_EVENT).encode()))
-                    # One event arrives as two fragments (fin=0, then opcode 0).
-                    head, tail = _FRAGMENTED_EVENT[:40], _FRAGMENTED_EVENT[40:]
-                    replies.append(_server_frame(head, fin=False))
-                    replies.append(_server_frame(tail, opcode=0x0))
+                    if self.events == "standard":
+                        replies.append(_server_frame(json.dumps(_LOG_EVENT).encode()))
+                        replies.append(
+                            _server_frame(json.dumps(_CONSOLE_EVENT).encode())
+                        )
+                        # One event arrives as two fragments (fin=0, then opcode 0).
+                        head, tail = _FRAGMENTED_EVENT[:40], _FRAGMENTED_EVENT[40:]
+                        replies.append(_server_frame(head, fin=False))
+                        replies.append(_server_frame(tail, opcode=0x0))
+                    elif self.events == "weird":
+                        for event in _WEIRD_EVENTS:
+                            replies.append(_server_frame(json.dumps(event).encode()))
             elif method == "Page.getNavigationHistory":
-                replies.append(
-                    self._result(
-                        message_id,
-                        {
-                            "index": 0,
-                            "entries": [
-                                {
-                                    "url": "https://example.test/app",
-                                    "title": "CODEVANTA Test Page",
-                                }
-                            ],
-                        },
-                    )
-                )
-            elif method == "Page.getResourceTree":
-                replies.append(
-                    self._result(
-                        message_id,
-                        {
-                            "frameTree": {
-                                "frame": {"url": "https://example.test/app"},
-                                "resources": [
-                                    {
-                                        "url": "https://example.test/main.js",
-                                        "type": "Script",
-                                    },
-                                    {
-                                        "url": "https://example.test/app.css",
-                                        "type": "Stylesheet",
-                                    },
-                                ],
+                if self.nav == "weird":
+                    payload: dict[str, Any] = {"index": 5, "entries": [42]}
+                elif self.nav == "empty":
+                    payload = {"index": 0, "entries": []}
+                else:
+                    payload = {
+                        "index": 0,
+                        "entries": [
+                            {
+                                "url": "https://example.test/app",
+                                "title": "CODEVANTA Test Page",
                             }
-                        },
+                        ],
+                    }
+                replies.append(self._result(message_id, payload))
+            elif method == "Page.getResourceTree":
+                if self.tree == "flat":
+                    payload = {"frameTree": 42}
+                elif self.tree == "weird":
+                    payload = {
+                        "frameTree": {
+                            "resources": [
+                                42,
+                                {"url": 5},
+                                {"url": "https://example.test/ok.js", "type": "Script"},
+                            ],
+                            "childFrames": [
+                                {
+                                    "resources": [
+                                        {
+                                            "url": "https://example.test/child.js",
+                                            "type": "Script",
+                                        }
+                                    ]
+                                },
+                                "not-a-frame",
+                            ],
+                        }
+                }
+                else:
+                    payload = {
+                        "frameTree": {
+                            "frame": {"url": "https://example.test/app"},
+                            "resources": [
+                                {
+                                    "url": "https://example.test/main.js",
+                                    "type": "Script",
+                                },
+                                {
+                                    "url": "https://example.test/app.css",
+                                    "type": "Stylesheet",
+                                },
+                            ],
+                        }
+                    }
+                replies.append(self._result(message_id, payload))
+                if self.late_event and not self._stop.is_set():
+                    timer = threading.Timer(
+                        0.15,
+                        lambda: self._push_late(conn),
                     )
-                )
+                    timer.daemon = True
+                    timer.start()
             elif method == "Page.captureScreenshot":
-                replies.append(
-                    self._result(
-                        message_id,
-                        {"data": base64.b64encode(_png_1x1()).decode()},
+                if self.shot == "nodata":
+                    replies.append(self._result(message_id, {}))
+                elif self.shot == "badb64":
+                    replies.append(self._result(message_id, {"data": "!!not-b64!!"}))
+                else:
+                    replies.append(
+                        self._result(
+                            message_id,
+                            {"data": base64.b64encode(_png_1x1()).decode()},
+                        )
                     )
-                )
             elif method == "WebMCP.getAllTools" and self.webmcp == "absent":
                 replies.append(
                     self._result(
@@ -645,16 +737,24 @@ class _FakeDevtools:
                     )
                 )
             elif method == "WebMCP.getAllTools":
-                replies.append(
-                    self._result(
-                        message_id,
-                        {
-                            "tools": [
-                                {"name": "codevanta_echo", "description": "echo a value"}
-                            ]
-                        },
-                    )
-                )
+                if self.webmcp == "notlist":
+                    payload = {"tools": "not-a-list"}
+                elif self.webmcp == "mixed":
+                    payload = {
+                        "tools": [
+                            "not-a-dict",
+                            {"description": "no name"},
+                            {"name": ""},
+                            {"name": "codevanta_echo", "description": "echo a value"},
+                        ]
+                    }
+                else:
+                    payload = {
+                        "tools": [
+                            {"name": "codevanta_echo", "description": "echo a value"}
+                        ]
+                    }
+                replies.append(self._result(message_id, payload))
             else:
                 replies.append(
                     self._result(
@@ -907,3 +1007,862 @@ def test_cli_asar_missing_archive_exits_two(tmp_path: Path) -> None:
     result = runner.invoke(cli_app, ["asar", str(tmp_path / "nope.asar")])
     assert result.exit_code == 2
     assert "error:" in result.output
+
+
+# ---- pure-function gaps: frame codec and envelope edges -----------------------
+
+
+def test_mask_key_must_be_four_bytes() -> None:
+    """Masking with a wrong-length key is a typed protocol error."""
+    with pytest.raises(CdpError, match="must be 4 bytes"):
+        mask_payload(b"payload", b"abc")
+
+
+def test_encode_frame_rejects_overlong_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Payloads above the message cap are refused before any frame is built."""
+    monkeypatch.setattr(cdp_client, "MAX_MESSAGE_BYTES", 8)
+    with pytest.raises(CdpError, match="exceeds"):
+        encode_frame(OPCODE_TEXT, b"123456789")
+
+
+def test_encode_frame_rejects_bad_mask_key() -> None:
+    """A wrong-length pinned mask key is a typed error."""
+    with pytest.raises(CdpError, match="must be 4 bytes"):
+        encode_frame(OPCODE_TEXT, b"x", mask_key=b"no")
+
+
+def test_frame_needs_more_prefix_variants() -> None:
+    """16-bit and 64-bit length prefixes report hunger correctly."""
+    assert frame_needs_more(bytes([0x81, 126]))  # length announced, bytes missing
+    assert frame_needs_more(bytes([0x81, 127]) + b"\x00" * 7)
+    assert frame_needs_more(b"")
+    assert not frame_needs_more(bytes([0x81, 0]))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"\x81",  # header truncated
+        bytes([0x81, 126]) + b"\x00",  # 16-bit length truncated
+        bytes([0x81, 127]) + b"\x00" * 7,  # 64-bit length truncated
+        bytes([0x81, 0x80 | 4]) + b"\x01\x02",  # mask key truncated
+    ],
+)
+def test_decode_frame_truncation_variants_raise(data: bytes) -> None:
+    """Every truncated frame shape raises the typed error."""
+    with pytest.raises(CdpError, match="truncated"):
+        decode_frame(data)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"id": 1, "error": 5}',  # error payload not an object
+        '{"method": "X.y", "params": 5}',  # params not an object
+    ],
+)
+def test_parse_message_object_shape_violations(text: str) -> None:
+    """Non-object result/error/params payloads are typed errors."""
+    with pytest.raises(CdpError):
+        parse_message(text)
+
+
+def test_endpoint_normalisation_variants() -> None:
+    """Bare host:port is upgraded; bad schemes and hosts are typed errors."""
+    assert normalise_endpoint("127.0.0.1:9222") == "http://127.0.0.1:9222"
+    assert normalise_endpoint("http://h:9/json") == "http://h:9"
+    with pytest.raises(CdpError, match="must be http"):
+        normalise_endpoint("ftp://h:9")
+    with pytest.raises(CdpError, match="no host"):
+        normalise_endpoint("http://")
+
+
+def test_ws_url_parsing_variants() -> None:
+    """Only plain ws:// with a host parses; everything else is a typed error."""
+    assert parse_ws_url("ws://h:9/devtools/page") == ("h", 9, "/devtools/page")
+    with pytest.raises(CdpError, match="only ws://"):
+        parse_ws_url("wss://h:9/devtools/page")
+    with pytest.raises(CdpError, match="no host"):
+        parse_ws_url("ws:///devtools/page")
+
+
+def test_png_dimensions_rejects_non_png() -> None:
+    """Non-PNG payloads report unknown dimensions instead of raising."""
+    from codevanta.analysis.cdp_client import _png_dimensions
+
+    assert _png_dimensions(b"\x89PNG\r\n\x1a\n-short") == (None, None)
+    assert _png_dimensions(b"not a png at all") == (None, None)
+
+
+# ---- misbehaving debugger: scripted handshake and frame faults -----------------
+
+
+class _RawWsServer:
+    """A one-shot TCP stand-in that answers the WS handshake then scripts bytes.
+
+    ``handshake`` replaces the computed 101 response (bad status, wrong
+    accept key, header flood); ``script`` frames are pushed after it; the
+    connection is held open so the client's deadlines decide when to stop.
+    """
+
+    def __init__(
+        self,
+        *,
+        handshake: bytes | None = None,
+        script: bytes = b"",
+        hold_s: float = 1.0,
+        bad_accept: bool = False,
+    ) -> None:
+        self.handshake = handshake
+        self.script = script
+        self.hold_s = hold_s
+        self.bad_accept = bad_accept
+        self._listener = socket.socket()
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(2)
+        self.port = int(self._listener.getsockname()[1])
+        self.ws_url = f"ws://127.0.0.1:{self.port}/devtools/page/X"
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=3)
+
+    def _serve(self) -> None:
+        self._listener.settimeout(0.2)
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            try:
+                self._handle(conn)
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def _handle(self, conn: socket.socket) -> None:
+        conn.settimeout(2)
+        buffer = bytearray()
+        while b"\r\n\r\n" not in buffer:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buffer += chunk
+        if self.handshake is not None:
+            conn.sendall(self.handshake)
+            return
+        accept = self._accept_for(bytes(buffer))
+        conn.sendall(
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n\r\n"
+        )
+        if self.script:
+            conn.sendall(self.script)
+        deadline = time.monotonic() + self.hold_s
+        while time.monotonic() < deadline and not self._stop.is_set():
+            try:
+                if not conn.recv(4096):
+                    return
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+
+    def _accept_for(self, request: bytes) -> str:
+        """The RFC 6455 accept value (or a deliberately wrong one)."""
+        key = b"ignored"
+        for line in request.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"sec-websocket-key":
+                key = value.strip()
+                break
+        digest = hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest()
+        if not self.bad_accept:
+            return base64.b64encode(digest).decode()
+        return base64.b64encode(hashlib.sha1(b"wrong-key").digest()).decode()
+
+
+def _run_ws_scenario(monkeypatch: pytest.MonkeyPatch, server: _RawWsServer) -> str:
+    """Start a scripted server, probe it, and return the typed reason."""
+    monkeypatch.setattr(cdp_client, "CONNECT_TIMEOUT_S", 0.5)
+    server.start()
+    try:
+        probe = webmcp_get_tools(server.ws_url, timeout_s=0.5)
+    finally:
+        server.stop()
+    assert not probe.available
+    assert probe.tools == ()
+    return probe.reason or ""
+
+
+def test_ws_handshake_refused_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-101 handshake status is a typed refusal, never a traceback."""
+    server = _RawWsServer(handshake=b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "refused" in reason
+
+
+def test_ws_handshake_accept_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wrong Sec-WebSocket-Accept value is a typed mismatch error."""
+    server = _RawWsServer(bad_accept=True)
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "Sec-WebSocket-Accept mismatch" in reason
+
+
+def test_ws_handshake_closed_mid_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connection closed before the handshake completes is a typed error."""
+    server = _RawWsServer(handshake=b"")
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "closed mid-header" in reason
+
+
+def test_ws_handshake_header_flood(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A handshake header stream without a terminator hits the 64 KiB cap."""
+    flood = (b"X-Noise: " + b"a" * 512 + b"\r\n") * 130
+    server = _RawWsServer(handshake=flood, hold_s=0.3)
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "64 KiB" in reason
+
+
+def test_ws_close_frame_ends_message_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A peer CLOSE frame echoes back and ends the wait as a typed miss."""
+    server = _RawWsServer(script=_server_frame(b"", opcode=0x8), hold_s=0.5)
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "no response to WebMCP.getAllTools" in reason
+
+
+def test_ws_ping_is_answered_with_pong(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A control-frame PING is answered and the wait still ends typed."""
+    server = _RawWsServer(script=_server_frame(b"ping", opcode=0x9), hold_s=0.4)
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "no response to WebMCP.getAllTools" in reason
+
+
+def test_ws_double_close_hits_closed_control_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second CLOSE after the socket shut down is silently ignored."""
+    script = _server_frame(b"", opcode=0x8) + _server_frame(b"", opcode=0x8)
+    server = _RawWsServer(script=script, hold_s=0.5)
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "no response to WebMCP.getAllTools" in reason
+
+
+def test_ws_continuation_without_start_is_typed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lone CONTINUATION frame is a protocol error, reported typed."""
+    server = _RawWsServer(script=_server_frame(b"orphan", opcode=0x0), hold_s=0.4)
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "continuation without a started message" in reason
+
+
+def test_ws_unknown_opcode_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unassigned opcode is a typed protocol error."""
+    server = _RawWsServer(script=_server_frame(b"?", opcode=0x3), hold_s=0.4)
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "unexpected WebSocket opcode" in reason
+
+
+def test_ws_oversized_message_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reassembly above the message cap is refused before parsing."""
+    monkeypatch.setattr(cdp_client, "MAX_MESSAGE_BYTES", 10)
+    server = _RawWsServer(script=_server_frame(b"x" * 40), hold_s=0.4)
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "exceeds" in reason
+
+
+def test_ws_response_without_result_is_typed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A response envelope without a result object is a typed error."""
+    server = _RawWsServer(script=_server_frame(b'{"id": 1}'), hold_s=0.4)
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "returned no result object" in reason
+
+
+def test_ws_silence_past_deadline_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A channel that never answers ends the request at the deadline."""
+    server = _RawWsServer(hold_s=0.6)
+    reason = _run_ws_scenario(monkeypatch, server)
+    assert "no response to WebMCP.getAllTools" in reason
+
+
+def test_channel_send_after_close_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sending on a closed channel raises the typed error, not an OSError."""
+    from codevanta.analysis.cdp_client import _open_channel
+
+    monkeypatch.setattr(cdp_client, "CONNECT_TIMEOUT_S", 0.5)
+    server = _RawWsServer(hold_s=1.0)
+    server.start()
+    try:
+        channel = _open_channel(server.ws_url, 0.5)
+    finally:
+        server.stop()
+    try:
+        channel.close()
+        with pytest.raises(CdpError, match="channel is closed"):
+            channel.send_text("late")
+    finally:
+        channel.close()
+
+
+# ---- inspect-page guards, degenerate payloads, observation loop -----------------
+
+
+def test_inspect_page_rejects_out_of_range_options(
+    fake_devtools: _FakeDevtools,
+) -> None:
+    """observe_ms and max_console_entries bounds are guarded up front."""
+    ws = f"ws://127.0.0.1:{fake_devtools.port}/devtools/page/PAGE1"
+    with pytest.raises(CdpError, match="observe_ms"):
+        inspect_page(ws, observe_ms=-1)
+    with pytest.raises(CdpError, match="max_console_entries"):
+        inspect_page(ws, max_console_entries=0)
+
+
+def test_inspect_page_drops_console_beyond_cap(fake_devtools: _FakeDevtools) -> None:
+    """Console entries beyond the cap are counted as dropped, not kept."""
+    ws = f"ws://127.0.0.1:{fake_devtools.port}/devtools/page/PAGE1"
+    result = inspect_page(ws, observe_ms=200, max_console_entries=1)
+    assert len(result.console) == 1
+    assert result.console_truncated is True
+
+
+def test_inspect_page_observes_late_events() -> None:
+    """Events arriving during the observation window are still captured."""
+    server = _FakeDevtools(late_event=True)
+    server.start()
+    try:
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        result = inspect_page(ws, observe_ms=600)
+    finally:
+        server.stop()
+    texts = [entry.text for entry in result.console]
+    assert "late console traffic" in texts
+
+
+def test_inspect_page_tolerates_weird_navigation_payload() -> None:
+    """An index/entries mismatch degrades to empty identity strings."""
+    server = _FakeDevtools(nav="weird")
+    server.start()
+    try:
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        result = inspect_page(ws, observe_ms=100)
+    finally:
+        server.stop()
+    assert result.title == ""
+    assert result.url == ""
+
+
+def test_inspect_page_tolerates_empty_navigation_payload() -> None:
+    """An empty navigation history degrades to empty identity strings."""
+    server = _FakeDevtools(nav="empty")
+    server.start()
+    try:
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        result = inspect_page(ws, observe_ms=100)
+    finally:
+        server.stop()
+    assert (result.title, result.url) == ("", "")
+
+
+def test_inspect_page_skips_non_dict_frame_tree() -> None:
+    """A frame tree that is not an object yields no resources."""
+    server = _FakeDevtools(tree="flat")
+    server.start()
+    try:
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        result = inspect_page(ws, observe_ms=100)
+    finally:
+        server.stop()
+    assert result.resources == ()
+    assert not result.resources_truncated
+
+
+def test_inspect_page_flattens_weird_resource_trees() -> None:
+    """Junk resource entries are skipped; childFrames are still flattened."""
+    server = _FakeDevtools(tree="weird")
+    server.start()
+    try:
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        result = inspect_page(ws, observe_ms=100)
+    finally:
+        server.stop()
+    urls = [resource.url for resource in result.resources]
+    assert urls == [
+        "https://example.test/ok.js",
+        "https://example.test/child.js",
+    ]
+
+
+def test_inspect_page_skips_degenerate_console_events() -> None:
+    """Non-dict entries, junk args and unrelated events degrade cleanly."""
+    server = _FakeDevtools(events="weird")
+    server.start()
+    try:
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        result = inspect_page(ws, observe_ms=150)
+    finally:
+        server.stop()
+    assert len(result.console) == 1
+    entry = result.console[0]
+    assert entry.level == "error"
+    assert entry.origin == "Runtime"
+    assert 'desc only str value {"k": 1}' in entry.text
+
+
+def test_resource_cap_truncates_listing(
+    fake_devtools: _FakeDevtools, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resources above the cap stop the flatten walk with a truncation flag."""
+    monkeypatch.setattr(cdp_client, "MAX_RESOURCES", 1)
+    ws = f"ws://127.0.0.1:{fake_devtools.port}/devtools/page/PAGE1"
+    result = inspect_page(ws, observe_ms=100)
+    assert result.resources_truncated is True
+    assert len(result.resources) == 1
+
+
+# ---- screenshot guards and payload JSON records --------------------------------
+
+
+def test_screenshot_result_record_is_json_safe(
+    fake_devtools: _FakeDevtools, tmp_path: Path
+) -> None:
+    """The screenshot record round-trips through to_dict() as JSON."""
+    out = tmp_path / "shot.jsonsafe.png"
+    ws = f"ws://127.0.0.1:{fake_devtools.port}/devtools/page/PAGE1"
+    record = capture_screenshot(ws, out)
+    payload = record.to_dict()
+    json.dumps(payload)
+    assert payload["bytes"] == len(_png_1x1())
+    assert payload["width"] == 1 and payload["height"] == 1
+
+
+def test_screenshot_without_data_is_typed() -> None:
+    """A capture reply without a data string is a typed error."""
+    server = _FakeDevtools(shot="nodata")
+    server.start()
+    try:
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        with pytest.raises(CdpError, match="no data"):
+            capture_screenshot(ws, Path("unused.png"))
+    finally:
+        server.stop()
+
+
+def test_screenshot_bad_base64_is_typed() -> None:
+    """A capture payload that is not base64 is a typed error."""
+    server = _FakeDevtools(shot="badb64")
+    server.start()
+    try:
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        with pytest.raises(CdpError, match="not base64"):
+            capture_screenshot(ws, Path("unused.png"))
+    finally:
+        server.stop()
+
+
+def test_screenshot_above_cap_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A payload above the screenshot cap is refused before any write."""
+    monkeypatch.setattr(cdp_client, "MAX_SCREENSHOT_BYTES", 8)
+    server = _FakeDevtools()
+    server.start()
+    try:
+        out = tmp_path / "never.png"
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        with pytest.raises(CdpError, match="screenshot payload"):
+            capture_screenshot(ws, out)
+        assert not out.exists()
+    finally:
+        server.stop()
+
+
+def test_screenshot_unwritable_target_is_typed(
+    fake_devtools: _FakeDevtools, tmp_path: Path
+) -> None:
+    """An unwritable output path surfaces as a typed error."""
+    out = tmp_path / "occupied"  # a directory: write_bytes must fail
+    out.mkdir()
+    ws = f"ws://127.0.0.1:{fake_devtools.port}/devtools/page/PAGE1"
+    with pytest.raises(CdpError, match="cannot write screenshot"):
+        capture_screenshot(ws, out)
+
+
+# ---- /json list decoding guards -------------------------------------------------
+
+
+class _JsonServer:
+    """A minimal HTTP stand-in returning one fixed body for every GET."""
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self._listener = socket.socket()
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(4)
+        self.port = int(self._listener.getsockname()[1])
+        self.endpoint = f"http://127.0.0.1:{self.port}"
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=3)
+
+    def _serve(self) -> None:
+        self._listener.settimeout(0.2)
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            try:
+                conn.recv(4096)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: " + str(len(self.body)).encode() + b"\r\n"
+                    b"Connection: close\r\n\r\n" + self.body
+                )
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+
+def test_list_targets_rejects_invalid_json() -> None:
+    """A /json body that is not JSON is a typed error."""
+    server = _JsonServer(b"definitely not json")
+    server.start()
+    try:
+        with pytest.raises(CdpError, match="not valid JSON"):
+            list_targets(server.endpoint)
+    finally:
+        server.stop()
+
+
+def test_list_targets_rejects_non_array_json() -> None:
+    """A /json body that is not an array is a typed error."""
+    server = _JsonServer(b'{"nope": true}')
+    server.start()
+    try:
+        with pytest.raises(CdpError, match="not a JSON array"):
+            list_targets(server.endpoint)
+    finally:
+        server.stop()
+
+
+def test_list_targets_skips_unusable_entries() -> None:
+    """Non-object entries and entries without ids are skipped silently."""
+    body = json.dumps(
+        [
+            42,
+            {"type": "page"},  # no id
+            {"id": "OK1", "type": "page", "title": "kept"},
+        ]
+    ).encode()
+    server = _JsonServer(body)
+    server.start()
+    try:
+        listing = list_targets(server.endpoint)
+    finally:
+        server.stop()
+    assert [t.target_id for t in listing.targets] == ["OK1"]
+    assert listing.targets[0].ws_url is None
+
+
+def test_list_targets_enforces_body_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Target lists above the read cap are refused before parsing."""
+    monkeypatch.setattr(cdp_client, "_MAX_TARGETS_BODY_BYTES", 32)
+    server = _JsonServer(json.dumps([{"id": "BIG"}] * 20).encode())
+    server.start()
+    try:
+        with pytest.raises(CdpError, match="read cap"):
+            list_targets(server.endpoint)
+    finally:
+        server.stop()
+
+
+# ---- WebMCP tool payload shapes --------------------------------------------------
+
+
+def test_webmcp_tools_not_a_list_is_available_but_empty() -> None:
+    """A tools field that is not a list yields an empty, available probe."""
+    server = _FakeDevtools(webmcp="notlist")
+    server.start()
+    try:
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        probe = webmcp_get_tools(ws)
+    finally:
+        server.stop()
+    assert probe.available
+    assert probe.tools == ()
+    assert probe.to_dict()["tool_count"] == 0
+
+
+def test_webmcp_tool_entries_without_names_are_skipped() -> None:
+    """Non-object and name-less tool entries are skipped from the list."""
+    server = _FakeDevtools(webmcp="mixed")
+    server.start()
+    try:
+        ws = f"ws://127.0.0.1:{server.port}/devtools/page/PAGE1"
+        probe = webmcp_get_tools(ws)
+    finally:
+        server.stop()
+    assert probe.available
+    assert [tool.name for tool in probe.tools] == ["codevanta_echo"]
+    record = probe.tools[0].to_dict()
+    assert record == {"name": "codevanta_echo", "description": "echo a value"}
+
+
+# ---- CLI render paths (text + --json) ------------------------------------------
+
+
+def test_cli_web_targets_json(fake_devtools: _FakeDevtools) -> None:
+    """``web targets --json`` emits the unchanged target payload."""
+    result = runner.invoke(
+        cli_app, ["web", "targets", "--endpoint", fake_devtools.endpoint, "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["targets"][0]["id"] == "PAGE1"
+
+
+def test_cli_web_inspect_text_render(fake_devtools: _FakeDevtools) -> None:
+    """``web inspect`` without --json renders tables and a totals footer."""
+    result = runner.invoke(
+        cli_app,
+        [
+            "web",
+            "inspect",
+            "PAGE1",
+            "--endpoint",
+            fake_devtools.endpoint,
+            "--observe-ms",
+            "200",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "title:" in result.output
+    assert "CODEVANTA Test Page" in result.output
+    assert "Resources" in result.output
+    assert "resources: 2 (truncated: no)" in result.output
+    assert "console: 3 entries" in result.output
+
+
+def test_cli_web_inspect_unknown_target_exits_two(fake_devtools: _FakeDevtools) -> None:
+    """Inspecting an unknown target id is a typed exit 2."""
+    result = runner.invoke(
+        cli_app, ["web", "inspect", "GONE", "--endpoint", fake_devtools.endpoint]
+    )
+    assert result.exit_code == 2
+    assert "error:" in result.output
+
+
+def test_cli_web_inspect_target_without_ws_url() -> None:
+    """A page target without a debugger URL is a typed exit 2."""
+    server = _FakeDevtools(
+        extra_targets=({"id": "NOWS", "type": "page", "title": "bare"},)
+    )
+    server.start()
+    try:
+        result = runner.invoke(
+            cli_app, ["web", "inspect", "NOWS", "--endpoint", server.endpoint]
+        )
+    finally:
+        server.stop()
+    assert result.exit_code == 2
+    assert "error:" in result.output
+
+
+def test_cli_web_webmcp_text_unavailable(fake_devtools: _FakeDevtools) -> None:
+    """The webmcp probe prints a yellow absence line without --json."""
+    result = runner.invoke(
+        cli_app,
+        ["web", "webmcp", "PAGE1", "--endpoint", fake_devtools.endpoint],
+    )
+    assert result.exit_code == 0, result.output
+    assert "WebMCP unavailable" in result.output
+    assert "available: no" in result.output
+
+
+def test_cli_web_webmcp_text_available() -> None:
+    """A present WebMCP domain lists tools in text mode."""
+    server = _FakeDevtools(webmcp="present")
+    server.start()
+    try:
+        result = runner.invoke(
+            cli_app, ["web", "webmcp", "PAGE1", "--endpoint", server.endpoint]
+        )
+        as_json = runner.invoke(
+            cli_app, ["web", "webmcp", "PAGE1", "--endpoint", server.endpoint, "--json"]
+        )
+    finally:
+        server.stop()
+    assert result.exit_code == 0, result.output
+    assert "WebMCP tools:" in result.output
+    assert "codevanta_echo" in result.output
+    assert "available: yes" in result.output
+    assert as_json.exit_code == 0, as_json.output
+    payload = json.loads(as_json.output)
+    assert payload["tool_count"] == 1
+
+
+def test_cli_web_shot_failure_exits_two() -> None:
+    """A failed capture is a one-line typed error with exit code 2."""
+    server = _FakeDevtools(shot="nodata")
+    server.start()
+    try:
+        result = runner.invoke(
+            cli_app, ["web", "shot", "PAGE1", "out.png", "--endpoint", server.endpoint]
+        )
+    finally:
+        server.stop()
+    assert result.exit_code == 2
+    assert "error:" in result.output
+
+
+def test_cli_web_asar_truncation_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``asar`` text mode warns when the listing hit the file cap."""
+    from codevanta.analysis import asar as asar_module
+
+    monkeypatch.setattr(asar_module, "MAX_FILES", 2)
+    files = {f"m{index}.js": b"// script" for index in range(4)}
+    archive, _ = _build_asar(tmp_path, files)
+    result = runner.invoke(cli_app, ["asar", str(archive)])
+    assert result.exit_code == 0, result.output
+    assert "truncated: yes" in result.output
+    assert "warning:" in result.output
+
+
+# ---- MCP tool layer (`codevanta_web_inspect` / `codevanta_asar`) -----------------
+
+
+def test_mcp_web_inspect_payload_fields(fake_devtools: _FakeDevtools) -> None:
+    """The skip-gated inspect returns an available payload with identity."""
+    payload = mcp_tools.codevanta_web_inspect(endpoint=fake_devtools.endpoint)
+    assert payload["available"] is True
+    assert payload["title"] == "CODEVANTA Test Page"
+    assert payload["target_id"] == "PAGE1"
+    assert payload["endpoint"] == fake_devtools.endpoint
+
+
+def test_mcp_web_inspect_unknown_target_is_unavailable(
+    fake_devtools: _FakeDevtools,
+) -> None:
+    """An unknown target id degrades to the typed unavailable payload."""
+    payload = mcp_tools.codevanta_web_inspect(
+        endpoint=fake_devtools.endpoint, target_id="GONE"
+    )
+    assert payload["available"] is False
+    assert "not found" in payload["reason"]
+    assert payload["evidence"]["confidence"] == "low"
+
+
+def test_mcp_web_inspect_rejects_bad_endpoint() -> None:
+    """An empty endpoint is a typed AnalysisError, not a skip result."""
+    with pytest.raises(AnalysisError, match="endpoint must be"):
+        mcp_tools.codevanta_web_inspect(endpoint="   ")
+
+
+def test_mcp_web_inspect_without_page_target_is_unavailable() -> None:
+    """An endpoint with no page targets degrades to unavailable."""
+    body = json.dumps([{"id": "S1", "type": "service"}]).encode()
+    server = _JsonServer(body)
+    server.start()
+    try:
+        payload = mcp_tools.codevanta_web_inspect(endpoint=server.endpoint)
+    finally:
+        server.stop()
+    assert payload["available"] is False
+    assert "no inspectable page target" in payload["reason"]
+
+
+def test_mcp_web_inspect_without_ws_url_is_unavailable() -> None:
+    """A page target without a debugger URL degrades to unavailable."""
+    body = json.dumps([{"id": "P1", "type": "page", "title": "bare"}]).encode()
+    server = _JsonServer(body)
+    server.start()
+    try:
+        payload = mcp_tools.codevanta_web_inspect(
+            endpoint=server.endpoint, target_id="P1"
+        )
+    finally:
+        server.stop()
+    assert payload["available"] is False
+    assert "no debugger websocket" in payload["reason"]
+
+
+def test_mcp_web_inspect_dead_ws_is_unavailable() -> None:
+    """A debugger socket that refuses connections degrades to unavailable."""
+    body = json.dumps(
+        [
+            {
+                "id": "P1",
+                "type": "page",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/page/P1",
+            }
+        ]
+    ).encode()
+    server = _JsonServer(body)
+    server.start()
+    try:
+        payload = mcp_tools.codevanta_web_inspect(endpoint=server.endpoint)
+    finally:
+        server.stop()
+    assert payload["available"] is False
+    assert "cannot connect" in payload["reason"]
+
+
+def test_mcp_asar_path_argument_validation(tmp_path: Path) -> None:
+    """Non-string, empty and non-file paths are typed errors."""
+    with pytest.raises(AnalysisError, match="must be a string"):
+        mcp_tools.codevanta_asar(42)  # type: ignore[arg-type]
+    with pytest.raises(AnalysisError, match="must not be empty"):
+        mcp_tools.codevanta_asar("   ")
+    with pytest.raises(AnalysisError, match="not a regular file"):
+        mcp_tools.codevanta_asar(str(tmp_path))
+
+
+def test_mcp_asar_rejects_non_string_extract(tmp_path: Path) -> None:
+    """A non-string extract argument is a typed error."""
+    archive, _ = _build_asar(tmp_path, _MINIMAL_FILES)
+    with pytest.raises(AnalysisError, match="extract must be a string"):
+        mcp_tools.codevanta_asar(str(archive), extract=3)  # type: ignore[arg-type]
+
+

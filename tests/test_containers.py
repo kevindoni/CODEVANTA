@@ -639,3 +639,138 @@ def test_mcp_binmeta_typed_error(tmp_path: Path) -> None:
 def test_mcp_tools_module_exports_bin_tools() -> None:
     assert callable(tools.codevanta_binmeta)
     assert callable(tools.codevanta_sqlite)
+
+
+# ---- CLI render paths: every container family through `codevanta binmeta` -------
+
+
+def test_cli_binmeta_gguf_render(tmp_path: Path) -> None:
+    """Text mode renders the GGUF footer with tensors, kv and data offset."""
+    target = tmp_path / "model.gguf"
+    target.write_bytes(gguf_bytes())
+    result = runner.invoke(app, ["binmeta", str(target)])
+    assert result.exit_code == 0, _output(result)
+    out = _output(result)
+    assert "gguf: v2" in out
+    assert "tensors: 1" in out
+    assert "kv: 2" in out
+    assert "data offset: 0x" in out
+    as_json = runner.invoke(app, ["binmeta", str(target), "--json"])
+    assert as_json.exit_code == 0, _output(as_json)
+    assert '"gguf"' in _output(as_json)
+
+
+def test_cli_binmeta_safetensors_render(tmp_path: Path) -> None:
+    """Text mode renders the safetensors summary footer."""
+    target = tmp_path / "weights.safetensors"
+    target.write_bytes(safetensors_bytes())
+    result = runner.invoke(app, ["binmeta", str(target)])
+    assert result.exit_code == 0, _output(result)
+    out = _output(result)
+    assert "safetensors: 1 tensors" in out
+    assert "payload: 16 B" in out
+
+
+def test_cli_binmeta_pcap_render(tmp_path: Path) -> None:
+    """Text mode renders format, record count, linktype and first timestamp."""
+    target = tmp_path / "capture.pcap"
+    target.write_bytes(pcap_bytes())
+    result = runner.invoke(app, ["binmeta", str(target)])
+    assert result.exit_code == 0, _output(result)
+    out = _output(result)
+    assert "pcap" in out
+    assert "records: 1" in out
+    assert "linktype: EN10MB" in out
+    assert "1700000000.500000" in out
+
+
+def test_cli_binmeta_pcapng_render(tmp_path: Path) -> None:
+    """pcapng is detected and rendered through the same footer."""
+    target = tmp_path / "capture.pcapng"
+    target.write_bytes(pcapng_bytes())
+    result = runner.invoke(app, ["binmeta", str(target)])
+    assert result.exit_code == 0, _output(result)
+    assert "pcapng" in _output(result)
+
+
+def test_cli_binmeta_evm_and_firmware_render(tmp_path: Path) -> None:
+    """EVM heuristic and the firmware magic sweep render inside binmeta."""
+    evm = tmp_path / "code.evm"
+    evm.write_bytes(VALID_EVM)
+    result = runner.invoke(app, ["binmeta", str(evm)])
+    assert result.exit_code == 0, _output(result)
+    out = _output(result)
+    assert "evm: 4 ops" in out
+    assert "evm_like: yes" in out
+    firmware = tmp_path / "image.bin"
+    firmware.write_bytes(firmware_bytes())
+    result = runner.invoke(app, ["binmeta", str(firmware)])
+    assert result.exit_code == 0, _output(result)
+    out = _output(result)
+    assert "Firmware magic scan" in out
+    assert "gzip" in out
+    assert "squashfs" in out
+
+
+# ---- CLI render paths: `codevanta evm` warnings and `codevanta sqlite` ----------
+
+
+def test_cli_evm_text_renders_warning_footer(tmp_path: Path) -> None:
+    """A truncated op sweep renders with its warning line in text mode."""
+    target = tmp_path / "long.evm"
+    target.write_bytes(b"\x00" * 300)
+    result = runner.invoke(app, ["evm", str(target)])
+    assert result.exit_code == 0, _output(result)
+    out = _output(result)
+    assert "truncated: yes" in out
+    assert "warning:" in out
+
+
+def test_cli_sqlite_text_renders_schema_and_rows(tmp_path: Path) -> None:
+    """Text mode renders the listing, then schema and samples for --table."""
+    db = sqlite_db_path(tmp_path)
+    result = runner.invoke(app, ["sqlite", str(db)])
+    assert result.exit_code == 0, _output(result)
+    out = _output(result)
+    assert "wal: none" in out
+    assert "items" in out
+    assert "evidence: bin.sqlite" in out
+    result = runner.invoke(app, ["sqlite", str(db), "--table", "items"])
+    assert result.exit_code == 0, _output(result)
+    out = _output(result)
+    assert "Schema: items" in out
+    assert "Sample rows: items" in out
+    assert "alpha" in out
+    wal_db = tmp_path / "wal.db"
+    wal_db.write_bytes(db.read_bytes())
+    (tmp_path / "wal.db-wal").write_bytes(b"junk")
+    result = runner.invoke(app, ["sqlite", str(wal_db)])
+    assert result.exit_code == 0, _output(result)
+    assert "wal: present (ignored)" in _output(result)
+
+
+# ---- MCP tool layer (`codevanta_binmeta` / `codevanta_sqlite`) arguments ----------
+
+
+def test_mcp_binmeta_rejects_bad_path_arguments(tmp_path: Path) -> None:
+    """Non-string, empty and non-file paths are typed errors."""
+    with pytest.raises(AnalysisError, match="must be a string"):
+        tools.codevanta_binmeta(42)  # type: ignore[arg-type]
+    with pytest.raises(AnalysisError, match="must not be empty"):
+        tools.codevanta_binmeta("   ")
+    with pytest.raises(AnalysisError, match="not a regular file"):
+        tools.codevanta_binmeta(str(tmp_path))
+
+
+def test_mcp_sqlite_rejects_non_string_table(tmp_path: Path) -> None:
+    """A non-string table argument is a typed error."""
+    db = sqlite_db_path(tmp_path)
+    with pytest.raises(AnalysisError, match="table must be a string"):
+        tools.codevanta_sqlite(str(db), table=7)  # type: ignore[arg-type]
+
+
+def test_mcp_sqlite_blank_table_is_ignored(tmp_path: Path) -> None:
+    """A whitespace-only table name behaves like no table argument."""
+    db = sqlite_db_path(tmp_path)
+    payload = tools.codevanta_sqlite(str(db), table="   ")
+    assert payload["requested_table"] is None
