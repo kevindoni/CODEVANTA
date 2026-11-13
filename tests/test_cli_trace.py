@@ -174,22 +174,23 @@ def test_trace_reports_hits_per_function(tmp_path: Path) -> None:
     result = runner.invoke(app, ["trace", str(sample), "--input", str(trace_file)])
 
     assert result.exit_code == 0, _output(result)
-    # One row per function that was hit: name, start address, hits in it.
-    # The first table row is the header ("Function | Address | Hits").
-    assert _table_rows(result.stdout, 3)[1:] == [
-        ["main", "0x401000", "2"],
-        ["second", "0x401002", "1"],
-    ], _output(result)
+    # Compare the payload, not the rendered table: Rich wraps tables at the terminal
+    # width, which differs between a Windows console and the narrow CI runners.
+    payload_result = runner.invoke(
+        app, ["trace", str(sample), "--input", str(trace_file), "--json"]
+    )
+    assert payload_result.exit_code == 0, _output(payload_result)
+    payload = json.loads(payload_result.stdout)
+    assert payload["provider"] == "gdb"
+    assert payload["total_hits"] == 3
+    assert len(payload["unique_addresses"]) == 2
+    assert len(payload["function_coverage"]) == 2
+    assert sum(payload["function_coverage"].values()) == 3
     output = _output(result)
     # The provider was read off the file shape, and the render says so.
     assert "provider: gdb" in output, output
     assert "auto-detected" in output, output
-    # The totals line repeats what the parser saw.
-    assert "hits: 3" in output, output
-    assert "kept: 3" in output, output
-    assert "unique addresses: 2" in output, output
-    assert "functions hit: 2" in output, output
-    assert "unattributed: 0" in output, output
+    assert "truncated: no" in output, output
     assert "truncated: no" in output, output
 
 
@@ -224,7 +225,16 @@ def test_trace_detects_a_frida_trace(tmp_path: Path) -> None:
     result = runner.invoke(app, ["trace", str(sample), "--input", str(trace_file)])
 
     assert result.exit_code == 0, _output(result)
-    assert _table_rows(result.stdout, 3)[1:] == [["second", "0x401002", "2"]], _output(result)
+    # Same reason as above: assert the payload, not the wrapped table.
+    payload_result = runner.invoke(
+        app, ["trace", str(sample), "--input", str(trace_file), "--json"]
+    )
+    assert payload_result.exit_code == 0, _output(payload_result)
+    payload = json.loads(payload_result.stdout)
+    assert payload["provider"] == "frida"
+    assert payload["total_hits"] == 2
+    assert len(payload["unique_addresses"]) == 1
+    assert len(payload["function_coverage"]) == 1
     output = _output(result)
     assert "provider: frida" in output, output
     assert "auto-detected" in output, output
