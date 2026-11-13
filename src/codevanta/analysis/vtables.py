@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from codevanta.core.disassembler import Disassembler, DisassemblyError
 from codevanta.core.loader import BinaryInfo
@@ -142,7 +142,7 @@ class VtableScanResult:
         }
 
 
-def _byteorder(info: BinaryInfo) -> str:
+def _byteorder(info: BinaryInfo) -> Literal["little", "big"]:
     text = str(getattr(info, "endianness", "") or "").strip().lower()
     return "big" if text.startswith(("big", "msb", "be")) else "little"
 
