@@ -286,7 +286,18 @@ def _decompile_in_program(
         raise AnalysisError(
             f"ghidra found no function at 0x{address:x}; decompilation needs a defined function"
         )
-    block_count = len(list(function.getBasicBlocks() or ()))
+    # Ghidra's Function API has no ``getBasicBlocks``; the body of a function is a
+    # set of address ranges, and one range is the closest portable stand-in for a
+    # block count. ``getBody`` is present across the versions pyghidra ships, and
+    # any failure here must not sink the decompilation itself, so it degrades to 0
+    # (reported as "unknown") instead of raising.
+    block_count = 0
+    try:
+        body = function.getBody()
+        ranges = body.getAddressRanges() if body is not None else None
+        block_count = len(list(ranges)) if ranges is not None else 0
+    except Exception:  # pragma: no cover - defensive across Ghidra versions
+        block_count = 0
     decompiler = DecompInterface()
     try:
         decompiler.setOptions(DecompileOptions())
