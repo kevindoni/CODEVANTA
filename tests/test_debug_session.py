@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import shutil
 import struct
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +62,7 @@ CODE = bytes.fromhex("b82a000000") + b"\xc3"
 
 #: Whether this environment can run a real gdb at all.
 needs_gdb = pytest.mark.skipif(
-    shutil.which("gdb") is None, reason="gdb is not on PATH"
+    shutil.which("gdb") is None or sys.platform == "win32", reason="gdb is not on PATH (or MinGW gdb MI quirks on Windows)"
 )
 
 
