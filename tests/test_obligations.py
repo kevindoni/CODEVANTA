@@ -633,7 +633,7 @@ def test_cli_load_and_write_error_branches(
         app, ["obligations", "add", str(tmp_path / "fresh.json"), "--question", "q"]
     )
     assert failed_write.exit_code == 2
-    assert "disk gone" in failed_write.output
+    assert "disk gone" in " ".join(failed_write.output.split())
 
 
 # ---- MCP error and unwrap branches --------------------------------------------
