@@ -852,6 +852,100 @@ def build_server() -> MCPServer:
     def codevanta_nav_providers() -> dict:
         return tools.codevanta_nav_providers()
 
+    @server.tool(
+        description=(
+            "Report which external analysis tool bridges could run on this "
+            "machine: binwalk, unblob, tshark, wabt (wasm-validate + "
+            "wasm-objdump), objdump, sigrok-cli, adb, gdb and z3. One "
+            "capability record per bridge with available/version/reason; "
+            "every probe is bounded (5s version call, import probe for z3) "
+            "and never raises for a missing tool. Offline."
+        )
+    )
+    def codevanta_bridges() -> dict:
+        return tools.codevanta_bridges()
+
+    @server.tool(
+        description=(
+            "Extract a firmware image with binwalk (default) or unblob into "
+            "out_dir: bounded 120s run, bounded transcript parse (max 64 "
+            "reported entries) plus a shallow scan of the extraction tree "
+            "(max 64 paths). Requires the tool on PATH - its absence "
+            "surfaces as a typed error with the install hint and the "
+            "offline `codevanta binmeta` magic-scan fallback."
+        )
+    )
+    def codevanta_firmware_extract(
+        path: str,
+        out_dir: str,
+        tool: Literal["binwalk", "unblob"] = "binwalk",
+    ) -> dict:
+        return tools.codevanta_firmware_extract(path, out_dir, tool)
+
+    @server.tool(
+        description=(
+            "Extract protocol fields from a pcap/pcapng capture with tshark "
+            "-T fields: comma-separated field names (max 16), optional -Y "
+            "display filter, packet cap -c (1..100, default 50) and a "
+            "bounded 100-row parse. Requires tshark on PATH - its absence "
+            "surfaces as a typed error with the install hint and the "
+            "offline `codevanta binmeta` structural pcap fallback."
+        )
+    )
+    def codevanta_pcap_fields(
+        path: str,
+        fields: str,
+        display_filter: str | None = None,
+        packet_limit: int = tools.DEFAULT_TSHARK_PACKET_LIMIT,
+    ) -> dict:
+        return tools.codevanta_pcap_fields(
+            path, fields, display_filter=display_filter, packet_limit=packet_limit
+        )
+
+    # lane-bridge-b: depth bridges (apktool / Wakaru / pure-Python PE certs).
+    @server.tool(
+        description=(
+            "Decode an APK with apktool (--no-src, bounded 120s): decoded "
+            "AndroidManifest.xml, apktool.yml, bounded res/ file count, smali "
+            "absence (expected with --no-src) and a bounded shallow walk of "
+            "the output tree. Requires apktool on PATH; its absence surfaces "
+            "as a typed error with the install hint and a pointer to the "
+            "offline 'codevanta metadata' fallback, never a traceback."
+        )
+    )
+    def codevanta_apk_decode(apk_path: str, out_dir: str) -> dict:
+        return tools.codevanta_apk_decode(apk_path, out_dir)
+
+    @server.tool(
+        description=(
+            "Recover readable JavaScript from a bundled/minified file with "
+            "Wakaru: mode='minify' (unminify, readable identifiers) or "
+            "mode='unpack' (split webpack-style modules). Requires Node.js - "
+            "install with `npm i -g @wakaru/cli`; unavailability surfaces as "
+            "a typed error naming that hint. Bounded recovered-entry list; "
+            "the console transcript is preserved under out_dir."
+        )
+    )
+    def codevanta_js_recover(
+        bundle_path: str, out_dir: str, mode: Literal["minify", "unpack"] = "minify"
+    ) -> dict:
+        return tools.codevanta_js_recover(bundle_path, out_dir, mode)
+
+    @server.tool(
+        description=(
+            "Parse a PE file's certificate table offline with pure Python: "
+            "WIN_CERTIFICATE entries and the PKCS#7 SignedData structure via "
+            "a minimal hand-rolled DER walk - signer count, serial numbers "
+            "(hex), digest/signature algorithm OID names (common SHA-1/256/"
+            "384/512 RSA/ECDSA map) and signingTime when present in the "
+            "authenticated attributes. Structural analysis only: no "
+            "trust-chain verification; issuer names are honestly reported "
+            "as not decoded. Always available."
+        )
+    )
+    def codevanta_certs(path: str) -> dict:
+        return tools.codevanta_certs(path)
+
     return server
 
 
