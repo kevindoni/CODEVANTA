@@ -8,7 +8,7 @@ read-only counterpart for *artifacts*: two ``codevanta analyze`` report payloads
 JSON. Nothing here reads a target binary, executes anything or touches the
 network, so a comparison is reproducible from the two documents alone.
 
-Ten comparators, one per question:
+Twelve comparators, one per question:
 
 * :func:`compare_inventories` -- two function inventories: which functions were
   added, removed, matched by name, and matched by fingerprint (a
@@ -39,6 +39,13 @@ Ten comparators, one per question:
 * :func:`compare_firmware` -- two firmware images through
   :func:`codevanta.analysis.containers.scan_magics`: signature hits that
   appeared or disappeared, keyed by offset and container kind.
+* :func:`compare_screenshots` -- two captured PNG screenshots through
+  :func:`codevanta.analysis.png_diff.pixel_diff`: exact local pixel
+  metrics (changed-pixel ratio, per-channel mean deltas) with an
+  ``identical``/``minor``/``major`` verdict, no OCR involved.
+* :func:`compare_har` -- two HAR capture files through
+  :mod:`codevanta.analysis.har_capture`: entry-count delta, new/removed
+  URL paths, status-code changes and method histogram deltas.
 
 Evidence discipline
 -------------------
@@ -67,7 +74,9 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import urllib.parse
 import urllib.request
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,6 +90,7 @@ from codevanta.analysis.containers import (
 )
 from codevanta.analysis.crash_core import CoreDumpSummary, parse_core_dump
 from codevanta.analysis.nav import NavStore
+from codevanta.analysis.png_diff import ScreenshotDiff, pixel_diff
 from codevanta.analysis.sqlite_view import inspect_sqlite
 from codevanta.core.report import AnalysisError
 from codevanta.evidence.confidence import Confidence
@@ -109,6 +119,9 @@ __all__ = [
     "CrashCompare",
     "DigestMatch",
     "FirmwareCompare",
+    "HarCompare",
+    "HarMethodDelta",
+    "HarStatusChange",
     "InventoryCompare",
     "InventoryEntry",
     "MetadataCompare",
@@ -118,6 +131,7 @@ __all__ = [
     "RegisterDelta",
     "ReportsCompare",
     "ReportsSectionChange",
+    "ScreenshotCompare",
     "SectionCount",
     "SessionsCompare",
     "StringsCompare",
@@ -127,10 +141,12 @@ __all__ = [
     "compare_bundles",
     "compare_crash",
     "compare_firmware",
+    "compare_har",
     "compare_inventories",
     "compare_metadata",
     "compare_nav",
     "compare_reports",
+    "compare_screenshots",
     "compare_sessions",
     "compare_strings",
     "compare_wasm",
@@ -174,6 +190,8 @@ COMPARE_WHATS: tuple[str, ...] = (
     "sessions",
     "nav",
     "firmware",
+    "screenshots",
+    "har",
 )
 
 #: The members of :data:`COMPARE_WHATS` whose inputs are JSON documents.
@@ -186,8 +204,17 @@ JSON_COMPARE_WHATS: tuple[str, ...] = (
 )
 
 #: The members of :data:`COMPARE_WHATS` whose inputs are file paths
-#: (WASM modules, core dumps, session databases, firmware images).
-PATH_COMPARE_WHATS: tuple[str, ...] = ("wasm", "crash", "sessions", "nav", "firmware")
+#: (WASM modules, core dumps, session databases, firmware images,
+#: screenshots, HAR captures).
+PATH_COMPARE_WHATS: tuple[str, ...] = (
+    "wasm",
+    "crash",
+    "sessions",
+    "nav",
+    "firmware",
+    "screenshots",
+    "har",
+)
 
 #: Default number of changed report sections kept as detail rows by
 #: :func:`compare_reports`.
@@ -206,6 +233,11 @@ MAX_COMPARE_DETAIL_KEYS = 320
 DEFAULT_MAX_ROWS = 64
 #: Hard ceiling for that budget.
 MAX_COMPARE_ROWS = 640
+
+#: Default number of URL paths kept per delta by :func:`compare_har`.
+DEFAULT_MAX_HAR_PATHS = 64
+#: Hard ceiling for that budget.
+MAX_COMPARE_HAR_PATHS = 640
 
 #: Fixed width of the register-delta table in :func:`compare_crash` (the
 #: x86_64 general-purpose register file); excess registers are summarised
@@ -232,6 +264,8 @@ _EVIDENCE_CRASH_SOURCE = "compare.crash"
 _EVIDENCE_SESSIONS_SOURCE = "compare.sessions"
 _EVIDENCE_NAV_SOURCE = "compare.nav"
 _EVIDENCE_FIRMWARE_SOURCE = "compare.firmware"
+_EVIDENCE_SCREENSHOT_SOURCE = "compare.screenshots"
+_EVIDENCE_HAR_SOURCE = "compare.har"
 
 
 @dataclass(frozen=True)
@@ -2184,8 +2218,325 @@ def compare_firmware(left_path: str | Path, right_path: str | Path) -> FirmwareC
 
 
 # ---------------------------------------------------------------------------
-# dispatch registry: what -> comparator
+# compare_screenshots -- two captured PNG screenshots via pixel_diff
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ScreenshotCompare:
+    """Outcome of :func:`compare_screenshots`; frozen and JSON-safe.
+
+    Reuses the :class:`~codevanta.analysis.png_diff.ScreenshotDiff` pixel
+    metrics verbatim and adds the registry-level evidence record.
+    """
+
+    diff: ScreenshotDiff
+    warnings: tuple[str, ...] = ()
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise as ``what: screenshots`` plus the embedded pixel diff."""
+        return {
+            "what": "screenshots",
+            **self.diff.to_dict(),
+            "evidence": dict(self.evidence),
+        }
+
+
+def compare_screenshots(
+    left_path: str | Path, right_path: str | Path
+) -> ScreenshotCompare:
+    """Diff two captured screenshots through :func:`png_diff.pixel_diff`.
+
+    Both PNG files are decoded locally (8-bit grayscale/RGB/RGBA,
+    non-interlaced) and compared pixel by pixel: the changed-pixel ratio
+    drives the ``identical`` (ratio ``0.0``) / ``minor`` (``< 0.01``) /
+    ``major`` verdict, per-channel mean deltas say *where* the pixels
+    moved, and images with different dimensions are ``major`` with a note.
+    Exact local pixel metrics, no OCR, no rendering -- hence ``HIGH``
+    confidence.
+
+    Raises:
+        AnalysisError: When either file cannot be read or decoded.
+    """
+    diff = pixel_diff(left_path, right_path)
+    evidence = Evidence(
+        source=_EVIDENCE_SCREENSHOT_SOURCE,
+        method="screenshot_file_diff",
+        confidence=Confidence.HIGH,
+        detail=(
+            "both PNGs decoded with the local minimal decoder and compared "
+            "pixel-by-pixel; exact metrics, no OCR or rendering involved"
+        ),
+    )
+    return ScreenshotCompare(
+        diff=diff,
+        warnings=diff.warnings,
+        evidence=evidence.to_dict(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# compare_har -- two HAR capture files via analysis.har_capture
+# ---------------------------------------------------------------------------
+
+
+def _load_har(path: str | Path) -> Any:
+    """Load one HAR summary through the sibling ``har_capture`` module.
+
+    The import is deliberately inside the function and typed: the capture
+    module ships in its own lane, and this comparator must fail with a
+    clear :class:`AnalysisError` -- never an ``ImportError`` traceback --
+    when it is absent.
+    """
+    try:
+        from codevanta.analysis.har_capture import load_har
+    except ImportError as exc:  # pragma: no cover - depends on lane merge order
+        raise AnalysisError(
+            "HAR comparison needs codevanta.analysis.har_capture, which is "
+            "not available in this build"
+        ) from exc
+    return load_har(Path(path))
+
+
+def _url_path(url: str) -> str:
+    """Path portion of a request URL (scheme/host and query dropped).
+
+    A URL without a path resolves to ``/`` so membership diffs stay stable;
+    anything ``urlsplit`` cannot treat as a URL keeps its pathless form.
+    """
+    split = urllib.parse.urlsplit(url)
+    return split.path or "/"
+
+
+@dataclass(frozen=True)
+class HarMethodDelta:
+    """One HTTP method's request count, per side, with the delta in ``to_dict``."""
+
+    method: str
+    left: int
+    right: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe projection."""
+        return {
+            "method": self.method,
+            "left": self.left,
+            "right": self.right,
+            "delta": self.right - self.left,
+        }
+
+
+@dataclass(frozen=True)
+class HarStatusChange:
+    """One (method, path) request whose status-code set differs."""
+
+    method: str
+    path: str
+    left_statuses: tuple[int, ...]
+    right_statuses: tuple[int, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe projection."""
+        return {
+            "method": self.method,
+            "path": self.path,
+            "left_statuses": list(self.left_statuses),
+            "right_statuses": list(self.right_statuses),
+        }
+
+
+@dataclass(frozen=True)
+class HarCompare:
+    """Outcome of :func:`compare_har`; frozen and JSON-safe.
+
+    ``left_entries``/``right_entries`` are the walked entry counts of both
+    captures; the path/status/method deltas are computed over the rows the
+    capture module lists per side (``left_listed``/``right_listed`` state
+    how many that was, so a truncated capture is never mistaken for an
+    empty one). ``verdict`` is ``identical`` only when no entry delta, no
+    one-sided path, no status change and no method delta exists -- timing
+    deltas never affect it.
+    """
+
+    left_entries: int
+    right_entries: int
+    paths_added: tuple[str, ...] = ()
+    paths_removed: tuple[str, ...] = ()
+    status_changes: tuple[HarStatusChange, ...] = ()
+    status_change_count: int = 0
+    method_deltas: tuple[HarMethodDelta, ...] = ()
+    left_listed: int = 0
+    right_listed: int = 0
+    time_delta_ms: float = 0.0
+    verdict: str = "identical"
+    identical: bool = False
+    warnings: tuple[str, ...] = ()
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise as a JSON-safe dict with per-list counts."""
+        return {
+            "what": "har",
+            "left_entries": self.left_entries,
+            "right_entries": self.right_entries,
+            "entry_delta": self.right_entries - self.left_entries,
+            "paths_added": list(self.paths_added),
+            "paths_added_count": len(self.paths_added),
+            "paths_removed": list(self.paths_removed),
+            "paths_removed_count": len(self.paths_removed),
+            "status_changes": [change.to_dict() for change in self.status_changes],
+            "status_change_count": self.status_change_count,
+            "method_deltas": [delta.to_dict() for delta in self.method_deltas],
+            "left_listed": self.left_listed,
+            "right_listed": self.right_listed,
+            "time_delta_ms": self.time_delta_ms,
+            "verdict": self.verdict,
+            "identical": self.identical,
+            "warnings": list(self.warnings),
+            "evidence": dict(self.evidence),
+        }
+
+
+def _har_side_index(summary: Any, side: str, warnings: list[str]) -> Any:
+    """Side-labelled sanity view of one ``HarCaptureSummary``.
+
+    Returns the summary after checking it has the documented ``rows`` and
+    ``entry_count`` fields, and records a warning when the capture module
+    truncated its entry walk (rows listed < entries walked).
+    """
+    rows = getattr(summary, "rows", None)
+    entry_count = getattr(summary, "entry_count", None)
+    if not isinstance(rows, tuple) or not isinstance(entry_count, int):
+        raise AnalysisError(f"{side}: har_capture returned no HarCaptureSummary shape")
+    truncated = bool(getattr(summary, "truncated", False))
+    if truncated or len(rows) < entry_count:
+        warnings.append(
+            f"{side}: capture lists {len(rows)} of {entry_count} walked "
+            "entries; path/status/method diffs cover listed rows only"
+        )
+    return summary
+
+
+def _har_statuses_by_request(
+    summary: Any,
+) -> tuple[set[str], dict[tuple[str, str], tuple[int, ...]]]:
+    """``(method, path)`` request keys and their sorted status codes.
+
+    The path set drives the added/removed diff; the per-request status
+    tuples drive the status-change diff. Request keys are uppercase method
+    plus queryless URL path.
+    """
+    paths: set[str] = set()
+    statuses: dict[tuple[str, str], set[int]] = {}
+    for row in summary.rows:
+        method = str(getattr(row, "method", "")).upper()
+        path = _url_path(str(getattr(row, "url", "")))
+        paths.add(path)
+        statuses.setdefault((method, path), set()).add(int(getattr(row, "status", 0)))
+    return paths, {key: tuple(sorted(codes)) for key, codes in statuses.items()}
+
+
+def compare_har(
+    left_path: str | Path,
+    right_path: str | Path,
+    *,
+    max_paths: int = DEFAULT_MAX_HAR_PATHS,
+) -> HarCompare:
+    """Diff two HAR capture files through :mod:`codevanta.analysis.har_capture`.
+
+    Both files are summarised by the capture module, then compared exactly
+    over those summaries: the entry-count delta, the queryless URL paths
+    that appear on only one side (bounded by ``max_paths``, ``1`` ..
+    :data:`MAX_COMPARE_HAR_PATHS`, truncation warned), the ``(method,
+    path)`` requests whose status-code set changed, and the per-method
+    request-count histogram deltas. Total-time deltas are reported but
+    never affect ``identical`` -- timing differs between captures by
+    nature. The membership diff is exact over parsed entries, so the
+    evidence record is ``HIGH``.
+
+    Raises:
+        AnalysisError: When the budget is out of range, a file cannot be
+            read, or either HAR is malformed (typed errors from the
+            capture module pass through).
+    """
+    if max_paths < 1 or max_paths > MAX_COMPARE_HAR_PATHS:
+        raise AnalysisError(f"max_paths must be between 1 and {MAX_COMPARE_HAR_PATHS}")
+    warnings: list[str] = []
+    left = _har_side_index(_load_har(left_path), "left", warnings)
+    right = _har_side_index(_load_har(right_path), "right", warnings)
+    left_paths, left_statuses = _har_statuses_by_request(left)
+    right_paths, right_statuses = _har_statuses_by_request(right)
+
+    added = _bounded(
+        "paths (right-only)", sorted(right_paths - left_paths), max_paths, warnings
+    )
+    removed = _bounded(
+        "paths (left-only)", sorted(left_paths - right_paths), max_paths, warnings
+    )
+    changed_rows = [
+        HarStatusChange(
+            method=method,
+            path=path,
+            left_statuses=left_statuses[(method, path)],
+            right_statuses=right_statuses[(method, path)],
+        )
+        for method, path in sorted(set(left_statuses) & set(right_statuses))
+        if left_statuses[(method, path)] != right_statuses[(method, path)]
+    ]
+    changed_kept = _bounded("status changes", changed_rows, max_paths, warnings)
+
+    left_methods = Counter(str(getattr(row, "method", "")).upper() for row in left.rows)
+    right_methods = Counter(str(getattr(row, "method", "")).upper() for row in right.rows)
+    method_deltas = [
+        HarMethodDelta(
+            method=method, left=left_methods[method], right=right_methods[method]
+        )
+        for method in sorted(set(left_methods) | set(right_methods))
+        if left_methods[method] != right_methods[method]
+    ]
+
+    identical = (
+        left.entry_count == right.entry_count
+        and not added
+        and not removed
+        and not changed_rows
+        and not method_deltas
+    )
+    evidence = Evidence(
+        source=_EVIDENCE_HAR_SOURCE,
+        method="har_summary_diff",
+        confidence=Confidence.HIGH,
+        detail=(
+            f"{right.entry_count - left.entry_count:+d} entry delta, "
+            f"{len(added)} paths added, {len(removed)} removed, "
+            f"{len(changed_rows)} status changes, {len(method_deltas)} "
+            "method count deltas; exact diff over parsed HAR entries"
+        ),
+    )
+    return HarCompare(
+        left_entries=left.entry_count,
+        right_entries=right.entry_count,
+        paths_added=tuple(added),
+        paths_removed=tuple(removed),
+        status_changes=tuple(changed_kept),
+        status_change_count=len(changed_rows),
+        method_deltas=tuple(method_deltas),
+        left_listed=len(left.rows),
+        right_listed=len(right.rows),
+        time_delta_ms=round(
+            float(getattr(right, "total_time_ms", 0.0))
+            - float(getattr(left, "total_time_ms", 0.0)),
+            3,
+        ),
+        verdict="identical" if identical else "changed",
+        identical=identical,
+        warnings=_dedupe_warnings(warnings),
+        evidence=evidence.to_dict(),
+    )
+
+
+# --- compare_har appended below ---
 
 
 def compare_artifacts(
@@ -2205,7 +2556,8 @@ def compare_artifacts(
     the JSON-backed kinds (``functions``, ``strings``, ``bundles``,
     ``reports``, ``metadata``) load their documents from the two paths, the
     path-backed kinds (``wasm``, ``crash``, ``sessions``, ``nav``,
-    ``firmware``) hand the paths straight to their typed loaders. Bundles
+    ``firmware``, ``screenshots``, ``har``) hand the paths straight to
+    their typed loaders. Bundles
     must be evidence-bundle documents; reports unwrap an evidence bundle to
     its ``report`` entry automatically.
 
@@ -2261,4 +2613,8 @@ def compare_artifacts(
         return compare_sessions(left, right, max_addresses=max_rows)
     if what == "nav":
         return compare_nav(left, right, max_rows=max_rows)
+    if what == "screenshots":
+        return compare_screenshots(left, right)
+    if what == "har":
+        return compare_har(left, right)
     return compare_firmware(left, right)

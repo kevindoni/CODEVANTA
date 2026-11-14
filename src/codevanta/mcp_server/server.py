@@ -608,7 +608,12 @@ def build_server() -> MCPServer:
             "what='sessions' (two session DBs: annotation count deltas, "
             "addresses only on one side), what='nav' (bookmark/comment/"
             "cursor diffs via NavStore), what='firmware' (magic-scan hits "
-            "appeared/disappeared, heuristic provenance). Never loads or "
+            "appeared/disappeared, heuristic provenance), what="
+            "'screenshots' (two captured 8-bit PNG screenshots: exact "
+            "pixel diff with changed-pixel ratio, per-channel mean deltas "
+            "and an identical/minor/major verdict), what='har' (two HAR "
+            "captures: entry-count delta, new/removed URL paths, "
+            "status-code and method histogram diffs). Never loads or "
             "executes a binary for comparison."
         )
     )
@@ -871,6 +876,33 @@ def build_server() -> MCPServer:
     )
     def codevanta_asar(path: str, extract: str | None = None) -> dict:
         return tools.codevanta_asar(path, extract)
+
+    @server.tool(
+        description=(
+            "Summarise a HAR (HTTP Archive) capture offline: entry count, "
+            "total request time, started-time span, a content-type histogram "
+            "(max 16 keys), unique hosts (max 32), the first 200 rows "
+            "(method/url/status/time/content-type/grpc) and per-entry gRPC "
+            "flags (content-type match or valid 5-byte frame prefix). Pure "
+            "byte parsing; nothing is executed."
+        )
+    )
+    def codevanta_web_capture(path: str) -> dict:
+        return tools.codevanta_web_capture(path)
+
+    @server.tool(
+        description=(
+            "Decode a protobuf wire-format body file into a structure-only "
+            "field tree (field numbers, wire types, values: varint int, "
+            "IEEE-754 float, nested fields or bounded hex). With grpc=true a "
+            "leading 5-byte gRPC frame prefix is stripped first and "
+            "reported. MEDIUM confidence: field numbers are semantic-free "
+            "without the .proto schema. Warnings cover unknown wire types "
+            "and truncated fields; never raises for message content."
+        )
+    )
+    def codevanta_proto_decode(path: str, grpc: bool = False) -> dict:
+        return tools.codevanta_proto_decode(path, grpc=grpc)
 
     @server.tool(description=SYMBOLIC_SOLVE_DESCRIPTION)
     def codevanta_symbolic_solve(
@@ -1135,6 +1167,26 @@ def build_server() -> MCPServer:
     )
     def codevanta_providers() -> dict:
         return tools.codevanta_providers()
+
+    @server.tool(
+        description=(
+            "Parse an IL2CPP global-metadata.dat header: version family, header "
+            "tables with offset/size, and approximate row counts. Structure only; "
+            "no readable-name decoding."
+        )
+    )
+    def codevanta_il2cpp(path: str) -> dict:
+        return tools.codevanta_il2cpp(path)
+
+    @server.tool(
+        description=(
+            "Inspect a GPU code container: CUDA fatbin entries with sm_XX arch "
+            "detection, CUBIN ELF section walk with PTX marker detection, or "
+            "Clang offload bundle (COB) host/device lines."
+        )
+    )
+    def codevanta_gpu(path: str) -> dict:
+        return tools.codevanta_gpu(path)
 
     return server
 

@@ -171,6 +171,10 @@ from codevanta.mcp_server.ext_depth import (
 from codevanta.mcp_server.ext_format2 import (  # lane-format2: ONE MCP registration import line
     codevanta_codesign,  # noqa: F401
 )
+from codevanta.mcp_server.ext_il2gpu import (  # lane-il2gpu: ONE MCP registration line
+    codevanta_gpu,  # noqa: F401
+    codevanta_il2cpp,  # noqa: F401
+)
 from codevanta.mcp_server.ext_ledger2 import (  # lane-ledger2: ONE MCP registration import line
     codevanta_coverage,  # noqa: F401
     codevanta_obligations,  # noqa: F401
@@ -193,6 +197,10 @@ from codevanta.mcp_server.ext_signal import (  # lane-signal: ONE MCP registrati
 )
 from codevanta.mcp_server.ext_solver import codevanta_symbolic_solve  # noqa: F401 -- one-line registration of the ext solver MCP tool
 from codevanta.mcp_server.ext_web import codevanta_asar, codevanta_web_inspect  # noqa: F401 - registration of the ext_web MCP tools
+from codevanta.mcp_server.ext_webcap import (  # lane-webcap: ONE MCP registration line
+    codevanta_proto_decode,  # noqa: F401
+    codevanta_web_capture,  # noqa: F401
+)
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore
 

@@ -146,6 +146,7 @@ from codevanta.cli.crash import app as crash_app
 from codevanta.cli.depth import apk_app as apk_app
 from codevanta.cli.depth import certs_app as certs_app
 from codevanta.cli.depth import js_app as js_app
+from codevanta.cli.il2gpu import app as il2gpu_app
 from codevanta.cli.live import frida_app as frida_app  # lane-live2: ONE import block
 from codevanta.cli.live import lldb_app as lldb_app
 from codevanta.cli.live import rizin_app as rizin_app
@@ -2834,6 +2835,7 @@ app.add_typer(apk_app, name="apk")
 app.add_typer(js_app, name="js")
 app.add_typer(certs_app, name="certs")
 app.add_typer(web_app, name="web")
+app.add_typer(il2gpu_app, name="il2gpu")
 # lane-live2: ONE registration block for the live-bridges lane
 # (frida devices/ps/script, lldb batch run, rizin functions/info).
 app.add_typer(frida_app, name="frida")
@@ -3433,8 +3435,9 @@ def session_notes(
 # ---- phase 8: typed comparators and the residual-unknown ledger --------------
 
 #: ``bundles`` is the documented extra beyond the required ``functions`` and
-#: ``strings``: the registry grew to ten offline comparators (JSON document
-#: kinds and file-path kinds) reached through :func:`compare_artifacts`.
+#: ``strings``: the registry grew to twelve offline comparators (JSON
+#: document kinds and file-path kinds) reached through
+#: :func:`compare_artifacts`.
 CompareWhat = Literal[
     "functions",
     "strings",
@@ -3446,6 +3449,8 @@ CompareWhat = Literal[
     "sessions",
     "nav",
     "firmware",
+    "screenshots",
+    "har",
 ]
 CompareFormat = Literal["text", "json"]
 
@@ -3812,6 +3817,73 @@ def _print_firmware_compare(result: Any) -> None:
     )
 
 
+def _print_screenshot_compare(result: Any) -> None:
+    """Render a :class:`ScreenshotCompare` result as text tables."""
+    diff = result.diff
+    channels = " ".join(f"{delta.name}={delta.mean}" for delta in diff.channel_deltas)
+    console.print(
+        f"[dim]screenshots: {diff.left_width}x{diff.left_height} vs "
+        f"{diff.right_width}x{diff.right_height}"
+        f" · changed: {diff.changed_pixels}/{diff.total_pixels}"
+        f" ({diff.changed_ratio})"
+        f" · verdict: {diff.verdict}"
+        + (f" · channels: {channels}" if channels else "")
+        + f" · identical: {diff.identical}[/]"
+    )
+
+
+def _print_har_compare(result: Any) -> None:
+    """Render a :class:`HarCompare` result as text tables."""
+    if result.paths_added or result.paths_removed:
+        table = Table(title="URL path diff")
+        table.add_column("Added (right-only)")
+        table.add_column("Removed (left-only)")
+        for index in range(max(len(result.paths_added), len(result.paths_removed))):
+            added = result.paths_added[index] if index < len(result.paths_added) else "-"
+            removed = (
+                result.paths_removed[index] if index < len(result.paths_removed) else "-"
+            )
+            table.add_row(escape(added), escape(removed))
+        console.print(table)
+    if result.status_changes:
+        table = Table(title="Changed status codes (method path)")
+        table.add_column("Left")
+        table.add_column("Right")
+        for change in result.status_changes:
+            table.add_row(
+                escape(
+                    f"{change.method} {change.path}: "
+                    f"{','.join(str(code) for code in change.left_statuses)}"
+                ),
+                escape(
+                    f"{change.method} {change.path}: "
+                    f"{','.join(str(code) for code in change.right_statuses)}"
+                ),
+            )
+        console.print(table)
+    if result.method_deltas:
+        table = Table(title="Method histogram deltas")
+        table.add_column("Method")
+        table.add_column("Left")
+        table.add_column("Right")
+        table.add_column("Delta")
+        for delta in result.method_deltas:
+            table.add_row(
+                escape(delta.method),
+                str(delta.left),
+                str(delta.right),
+                str(delta.right - delta.left),
+            )
+        console.print(table)
+    console.print(
+        f"[dim]entries: {result.left_entries} vs {result.right_entries}"
+        f" · status changes: {result.status_change_count}"
+        f" · time delta: {result.time_delta_ms} ms"
+        f" · verdict: {result.verdict}"
+        f" · identical: {result.identical}[/]"
+    )
+
+
 def _print_compare_warnings(result: Any) -> None:
     """Print warnings and the evidence footer shared by compare results."""
     for warning in result.warnings:
@@ -3836,6 +3908,8 @@ _COMPARE_RENDERERS: dict[str, Callable[[Any], None]] = {
     "sessions": _print_sessions_compare,
     "nav": _print_nav_compare,
     "firmware": _print_firmware_compare,
+    "screenshots": _print_screenshot_compare,
+    "har": _print_har_compare,
 }
 
 
@@ -3847,7 +3921,7 @@ def compare(
             help=(
                 "Left artifact: a JSON document (analyze report, evidence "
                 "bundle, MetadataReport) or, for wasm/crash/sessions/nav/"
-                "firmware, the file itself"
+                "firmware/screenshots/har, the file itself"
             )
         ),
     ],
@@ -3857,7 +3931,7 @@ def compare(
             help=(
                 "Right artifact: a JSON document (analyze report, evidence "
                 "bundle, MetadataReport) or, for wasm/crash/sessions/nav/"
-                "firmware, the file itself"
+                "firmware/screenshots/har, the file itself"
             )
         ),
     ],
@@ -3905,7 +3979,10 @@ def compare(
     ``metadata`` diffs two binmeta MetadataReport documents. Path kinds
     take non-JSON files directly: ``wasm`` (WASM modules), ``crash`` (ELF
     core dumps with a same_crash_site verdict), ``sessions``/``nav``
-    (CODEVANTA session databases) and ``firmware`` (raw firmware images).
+    (CODEVANTA session databases), ``firmware`` (raw firmware images),
+    ``screenshots`` (8-bit PNG pixel diff with an identical/minor/major
+    verdict) and ``har`` (two HAR captures: entry delta, URL paths,
+    status-code and method histogram diffs).
     """
     if what not in COMPARE_WHATS:
         _fail(f"invalid --what {what!r}; expected one of {', '.join(COMPARE_WHATS)}", 2)

@@ -28,6 +28,8 @@ from codevanta.analysis.asar import (
     extract_file,
     list_archive,
 )
+from codevanta.analysis.har_capture import load_har
+from codevanta.analysis.proto_wire import decode_message, load_proto_bytes
 from codevanta.core.report import AnalysisError
 
 web_app = typer.Typer(help="Passive CDP inspection of a live Electron/Chromium")
@@ -257,3 +259,110 @@ def asar(
             f"[yellow]warning:[/] listing truncated; extract cap is "
             f"{MAX_EXTRACT_BYTES} bytes per entry"
         )
+@web_app.command("capture")
+def capture(
+    har: Annotated[Path, typer.Argument(help="Path to a HAR (HTTP Archive) file")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the capture summary as JSON")
+    ] = False,
+) -> None:
+    """Summarise a HAR capture offline: entries, times, types, hosts, gRPC."""
+    try:
+        summary = load_har(har)
+    except AnalysisError as exc:
+        _fail(str(exc))
+    if json_output:
+        _print_json(summary.to_dict())
+        return
+    table = Table(title=f"HAR {escape(str(har))}")
+    table.add_column("Method")
+    table.add_column("Status", justify="right")
+    table.add_column("ms", justify="right")
+    table.add_column("Type")
+    table.add_column("gRPC")
+    table.add_column("Url")
+    for row in summary.rows:
+        table.add_row(
+            escape(row.method),
+            str(row.status),
+            f"{row.time_ms:g}",
+            escape(row.content_type or "-"),
+            "yes" if row.grpc else "-",
+            escape(row.url),
+        )
+    console.print(table)
+    console.print(
+        f"[dim]entries: {summary.entry_count}"
+        f" - total ms: {summary.total_time_ms:g}"
+        f" - grpc: {summary.grpc_count}"
+        f" - hosts: {', '.join(summary.hosts) or '-'}"
+        f" - truncated: {'yes' if summary.truncated else 'no'}"
+        f" - evidence: {summary.evidence.source}/{summary.evidence.method}[/]"
+    )
+    if summary.truncated:
+        console.print(
+            "[yellow]warning:[/] capture truncated by listing bounds "
+            "(rows/types/hosts caps)"
+        )
+
+
+@web_app.command("proto")
+def proto(
+    body: Annotated[Path, typer.Argument(help="Path to a protobuf message body")],
+    grpc: Annotated[
+        bool,
+        typer.Option("--grpc", help="Strip a leading 5-byte gRPC frame prefix first"),
+    ] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the field tree as JSON")
+    ] = False,
+) -> None:
+    """Decode a protobuf wire-format body into a structure-only field tree."""
+    try:
+        data = load_proto_bytes(body)
+        result = decode_message(data, strip_grpc=grpc)
+    except AnalysisError as exc:
+        _fail(str(exc))
+    if json_output:
+        _print_json(result.to_dict())
+        return
+    table = Table(title=f"protobuf wire {escape(str(body))}")
+    table.add_column("Field", justify="right")
+    table.add_column("Wire")
+    table.add_column("Kind")
+    table.add_column("Depth", justify="right")
+    table.add_column("Value")
+    for item in result.fields:
+        table.add_row(
+            str(item.field_number),
+            str(item.wire_type),
+            escape(item.kind),
+            str(item.depth),
+            escape(_proto_value_text(item.value)),
+        )
+    console.print(table)
+    if result.grpc_frame is not None:
+        console.print(
+            f"[dim]grpc frame: stripped ({result.grpc_frame.message_length} "
+            "byte message)[/]"
+        )
+    for warning in result.warnings:
+        _err_console.print(f"[yellow]warning:[/] {escape(warning)}")
+    evidence = result.evidence
+    if evidence is None:
+        console.print("[dim]fields: no evidence record attached[/]")
+        return
+    console.print(
+        f"[dim]fields: {result.field_count}"
+        f" - depth: {result.depth_reached}"
+        f" - evidence: {evidence.source}/{evidence.method}"
+        f"/{evidence.confidence.value} (structure only, no .proto schema)[/]"
+    )
+
+
+def _proto_value_text(value: object) -> str:
+    """Render one decoded field value for the table (bounded, flat)."""
+    if isinstance(value, tuple):
+        return f"<{len(value)} nested field(s)>"
+    return str(value)
+
