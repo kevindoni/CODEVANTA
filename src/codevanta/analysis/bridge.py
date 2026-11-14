@@ -12,6 +12,13 @@ Every probe is the same two-step skip-gate the adb/sigrok lanes established:
 2. one bounded ``--version`` call (5 second timeout) whose first semantic
    version-looking token becomes :attr:`BridgeCapability.version`.
 
+Two probes delegate to the lane that owns the tool's real probe, so the report
+can never drift from the wrapper: ``jeb`` asks
+:func:`codevanta.analysis.jeb_bridge.probe_jeb` (commercial tool, ``JEB_HOME``
+aware, tolerant of JEB's missing ``--version`` banner) and ``hopper`` asks
+:func:`codevanta.analysis.hopper_bridge.probe_hopper` (macOS-only GUI bundle
+probe -- available means "installed", never "headless-capable").
+
 Nothing here ever raises for a missing or broken tool: absence comes back as
 ``available=False`` with a human-readable ``reason``. Only an unknown bridge
 *name* raises the typed :class:`~codevanta.core.report.AnalysisError`, because
@@ -28,6 +35,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from codevanta.analysis.hopper_bridge import probe_hopper as _probe_hopper_lane
+from codevanta.analysis.jeb_bridge import probe_jeb as _probe_jeb_lane
 from codevanta.core.report import AnalysisError
 
 __all__ = [
@@ -44,7 +53,8 @@ PROBE_TIMEOUT = 5.0
 #: Evidence ``source`` id shared by every probe report in this lane.
 EVIDENCE_SOURCE = "bridge.probe"
 
-#: Deterministic report order; ``z3`` last because it is the only import probe.
+#: Deterministic report order; ``jeb``/``hopper`` are delegated probes and ``z3``
+#: is last because it is the only import probe.
 KNOWN_BRIDGES: tuple[str, ...] = (
     "binwalk",
     "unblob",
@@ -54,6 +64,8 @@ KNOWN_BRIDGES: tuple[str, ...] = (
     "sigrok-cli",
     "adb",
     "gdb",
+    "jeb",
+    "hopper",
     "z3",
 )
 
@@ -67,6 +79,8 @@ _INSTALL_HINTS: dict[str, str] = {
     "sigrok-cli": "install sigrok-cli (https://sigrok.org/wiki/Downloads)",
     "adb": "install Android platform-tools (https://developer.android.com/tools/releases/platform-tools)",
     "gdb": "install gdb (https://www.gnu.org/software/gdb/)",
+    "jeb": "JEB is commercial; install it and set JEB_HOME",
+    "hopper": "install the Hopper GUI on macOS (https://www.hopperapp.com)",
     "z3": "pip install z3-solver",
 }
 
@@ -172,6 +186,28 @@ def _probe_z3() -> BridgeCapability:
     return BridgeCapability(tool="z3", available=True, version=version)
 
 
+def _probe_jeb(which: Any, runner: VersionRunner | None) -> BridgeCapability:
+    """Delegate to the JEB lane (commercial tool, ``JEB_HOME`` aware)."""
+    capability = _probe_jeb_lane(which=which, runner=runner)
+    return BridgeCapability(
+        tool="jeb",
+        available=capability.available,
+        version=capability.version,
+        reason=capability.reason,
+    )
+
+
+def _probe_hopper() -> BridgeCapability:
+    """Delegate to the Hopper lane (macOS GUI bundle probe; no version exists)."""
+    capability = _probe_hopper_lane()
+    return BridgeCapability(
+        tool="hopper",
+        available=capability.available,
+        version=None,
+        reason=capability.reason,
+    )
+
+
 def _run_version_probe(
     spec: _ProbeSpec,
     paths: list[str],
@@ -236,6 +272,10 @@ def probe_bridge(
         raise AnalysisError(f"bridge name {name!r} must not have surrounding whitespace")
     if key == "z3":
         return _probe_z3()
+    if key == "hopper":
+        return _probe_hopper()
+    if key == "jeb":
+        return _probe_jeb(which, runner)
     spec = _PROBE_SPECS.get(key)
     if spec is None:
         raise AnalysisError(

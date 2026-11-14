@@ -185,6 +185,7 @@ from codevanta.mcp_server.ext_meta import (
 )
 from codevanta.mcp_server.ext_mobile import codevanta_adb as codevanta_adb
 from codevanta.mcp_server.ext_nav import codevanta_nav, codevanta_nav_providers  # noqa: F401 -- registration of the ext_nav MCP tools
+from codevanta.mcp_server.ext_providers import codevanta_providers as codevanta_providers
 from codevanta.mcp_server.ext_signal import (  # lane-signal: ONE MCP registration line
     codevanta_dtb,  # noqa: F401
     codevanta_signal_sr,  # noqa: F401
