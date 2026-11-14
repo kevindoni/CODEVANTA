@@ -23,6 +23,18 @@ reimplemented here:
 * ``/api/symbolic`` -- :func:`codevanta.analysis.symbolic.explore_paths`
 * ``/api/session_save`` -- :meth:`codevanta.storage.session.SessionStore.save`
 * ``/api/session_list`` -- :meth:`codevanta.storage.session.SessionStore.list`
+* ``/bridges`` -- :func:`codevanta.analysis.bridge.bridges_report`
+* ``/unknowns`` -- :func:`codevanta.core.unknowns.records_from_payload` over a
+  ledger JSON file named by ``?ledger=``
+* ``/obligations`` -- :func:`codevanta.core.obligations.list_obligations` over a
+  ledger JSON file named by ``?ledger=`` (a typed "not available" payload when
+  the module is not part of this build)
+* ``/compare`` -- :func:`codevanta.analysis.compare.compare_inventories`,
+  :func:`~codevanta.analysis.compare.compare_strings` or
+  :func:`~codevanta.analysis.compare.compare_bundles`, selected by ``?what=``
+* ``/nav`` -- the :class:`codevanta.analysis.nav.NavStore` read APIs
+  (bookmarks, comments, cursor) for one session of one database
+* ``/metadata`` -- :func:`codevanta.analysis.binmeta.inspect_metadata`
 
 Contract:
 
@@ -80,6 +92,8 @@ from codevanta.analysis.binary_diff import (
     MIN_SEMANTIC_THRESHOLD,
     diff_binaries,
 )
+from codevanta.analysis.binmeta import inspect_metadata
+from codevanta.analysis.bridge import bridges_report
 from codevanta.analysis.callgraph import (
     DEFAULT_MAX_EDGES,
     DEFAULT_MAX_FUNCTIONS,
@@ -87,6 +101,22 @@ from codevanta.analysis.callgraph import (
     build_call_graph,
 )
 from codevanta.analysis.cfg import build_cfg, build_recursive_cfg
+from codevanta.analysis.compare import (
+    COMPARE_WHATS,
+    MAX_COMPARE_FUNCTIONS,
+    MAX_COMPARE_STRINGS,
+    compare_bundles,
+    compare_inventories,
+    compare_strings,
+    load_document,
+    load_report_payload,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_FUNCTIONS as DEFAULT_COMPARE_FUNCTIONS,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_STRINGS as DEFAULT_COMPARE_STRINGS,
+)
 from codevanta.analysis.decompile import (
     DEFAULT_MAX_BLOCKS as DEFAULT_DECOMPILE_MAX_BLOCKS,
 )
@@ -112,6 +142,7 @@ from codevanta.analysis.emulate import (
 from codevanta.analysis.emulate import (
     MAX_MAX_INSTRUCTIONS as MAX_EMULATE_MAX_INSTRUCTIONS,
 )
+from codevanta.analysis.nav import NavStore
 from codevanta.analysis.symbolic import (
     DEFAULT_MAX_PATHS as DEFAULT_SYMBOLIC_MAX_PATHS,
 )
@@ -145,6 +176,16 @@ from codevanta.core.report import (
     build_report,
 )
 from codevanta.core.strings import StringExtractor
+from codevanta.core.unknowns import MAX_UNKNOWN_RECORDS, records_from_payload
+
+# ``/obligations`` is implemented against the ledger module that lands with the
+# phase-9 merge; on branches that predate it the import fails and the route
+# answers the typed "not available" payload instead of crashing at import time.
+try:
+    from codevanta.core import obligations as _obligations_module
+except ImportError:  # pragma: no cover - absent before the phase-9 merge
+    _obligations_module = None  # type: ignore[assignment]
+
 from codevanta.storage.session import DEFAULT_LIMIT as DEFAULT_SESSION_LIMIT
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import MAX_NOTE_LENGTH as MAX_SESSION_NOTE_LENGTH
@@ -181,6 +222,20 @@ DEFAULT_STRINGS_LIMIT = 200
 DEFAULT_MIN_STRING_LENGTH = 4
 DEFAULT_CFG_INSTRUCTIONS = 2_000
 DEFAULT_CFG_BLOCKS = 500
+
+#: Default ``/unknowns`` ``limit``: the engine's own record ceiling, so the
+#: route never asks the parser for a window it would refuse anyway.
+DEFAULT_UNKNOWN_LIMIT = MAX_UNKNOWN_RECORDS
+
+#: Ceiling of the ``/obligations`` listing. Mirrors the ledger engine's own
+#: record bound and stays a literal here, so the route keeps its response bound
+#: even on a build where :mod:`codevanta.core.obligations` is absent.
+MAX_OBLIGATION_RECORDS = 256
+
+#: Read budget for one ledger JSON file served by ``/unknowns`` or
+#: ``/obligations``: a request cannot stream an unbounded file through the
+#: parser (the same discipline the response cap applies on the way out).
+MAX_LEDGER_BYTES = 4 * 1024 * 1024
 
 #: Backend ``/api/decompile`` uses when the query parameter is absent.
 DEFAULT_DECOMPILE_BACKEND = "auto"
@@ -517,6 +572,45 @@ def _query_path(params: dict[str, str], name: str, allow_paths: bool) -> Path:
 def _load(path: Path) -> BinaryInfo:
     """Load ``path`` through the production loader (failures become HTTP 400)."""
     return BinaryLoader().load(path)
+
+
+def _require_file(path: Path, name: str) -> None:
+    """Reject a ``400`` unless ``path`` names an existing regular file.
+
+    The engine loaders have their own error mapping, but the routes that take
+    several path parameters (``/compare``, ``/nav``) validate every one of them
+    up front so the error always names the parameter that was wrong.
+    """
+    if not path.is_file():
+        raise _RouteError(f"{name} does not exist or is not a file: {path}")
+
+
+def _read_json_document(path: Path, *, limit_bytes: int) -> dict[str, Any]:
+    """Read one bounded JSON object document from ``path``.
+
+    Read failures, invalid JSON and non-object documents become the typed
+    ``AnalysisError`` the engines already raise, so ``_dispatch`` maps them onto
+    HTTP ``400`` without any route-specific handling. The ``limit_bytes`` budget
+    is checked before the file is opened: a huge ledger is refused, not parsed.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as exc:  # pragma: no cover - _require_file just checked it
+        raise AnalysisError(f"cannot read {path}: {exc}") from None
+    if size > limit_bytes:
+        raise _RouteError(f"{path} exceeds the {limit_bytes} byte read budget ({size})")
+    try:
+        with path.open(encoding="utf-8") as handle:
+            document = json.load(handle)
+    except UnicodeDecodeError as exc:
+        raise AnalysisError(f"{path} is not UTF-8 text: {exc}") from None
+    except OSError as exc:  # pragma: no cover - _require_file just checked it
+        raise AnalysisError(f"cannot read {path}: {exc}") from None
+    except json.JSONDecodeError as exc:
+        raise AnalysisError(f"{path} is not valid JSON: {exc}") from None
+    if not isinstance(document, dict):
+        raise AnalysisError(f"{path} is not a JSON object")
+    return document
 
 
 def _api_health(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
@@ -925,6 +1019,170 @@ def _api_session_list(params: dict[str, str], allow_paths: bool) -> dict[str, An
     }
 
 
+def _api_bridges(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return the bridge capability report for this machine.
+
+    The engine probes every known external tool in ``KNOWN_BRIDGES`` order with
+    its own bounded ``--version`` budget; unavailability is a record with
+    ``available=False`` and an install hint, never an error, so the route
+    always answers ``200`` with the honest list.
+    """
+    capabilities = bridges_report()
+    tools = [capability.to_dict() for capability in capabilities]
+    return {
+        "count": len(tools),
+        "available": sum(1 for tool in tools if tool["available"]),
+        "tools": tools,
+    }
+
+
+def _api_unknowns(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return the unknown records of one ledger JSON file, bounded.
+
+    The ledger named by ``?ledger=`` is parsed by the same engine the CLI and
+    the MCP tools use (:func:`~codevanta.core.unknowns.records_from_payload`),
+    so its validation rules (deterministic ids, known severities and statuses,
+    bounded text) apply unchanged and its ``AnalysisError`` becomes HTTP ``400``.
+    ``limit`` bounds the returned window the way ``/api/functions`` does; the
+    full count and the truncation flag are always reported.
+    """
+    ledger = _query_path(params, "ledger", allow_paths)
+    limit = _query_int(params, "limit", DEFAULT_UNKNOWN_LIMIT, 0, MAX_UNKNOWN_RECORDS)
+    _require_file(ledger, "ledger")
+    payload = _read_json_document(ledger, limit_bytes=MAX_LEDGER_BYTES)
+    records = records_from_payload(payload)
+    kept = records[:limit] if limit else ()
+    return {
+        "path": str(ledger),
+        "count": len(records),
+        "limit": limit,
+        "returned": len(kept),
+        "truncated": len(kept) < len(records),
+        "items": [record.to_dict() for record in kept],
+    }
+
+
+def _api_obligations(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return the obligation records of one ledger JSON file, bounded.
+
+    Implemented against :mod:`codevanta.core.obligations` when that module is
+    part of this build; otherwise the route answers the typed "not available"
+    payload (HTTP ``400``, the same convention ``/api/emulate`` uses for a
+    missing optional dependency) instead of failing at import time. An optional
+    ``status`` filter is validated by the engine itself, so a typo such as
+    ``status=opne`` is reported rather than silently read as an empty ledger.
+    """
+    if _obligations_module is None:
+        raise _RouteError(
+            "obligations are not available: codevanta.core.obligations "
+            "is not part of this build"
+        )
+    ledger = _query_path(params, "ledger", allow_paths)
+    limit = _query_int(params, "limit", MAX_OBLIGATION_RECORDS, 0, MAX_OBLIGATION_RECORDS)
+    status = _first(params, "status")
+    _require_file(ledger, "ledger")
+    payload = _read_json_document(ledger, limit_bytes=MAX_LEDGER_BYTES)
+    records = _obligations_module.list_obligations(payload, status=status)
+    kept = records[:limit] if limit else ()
+    return {
+        "path": str(ledger),
+        "count": len(records),
+        "limit": limit,
+        "returned": len(kept),
+        "truncated": len(kept) < len(records),
+        "items": [record.to_dict() for record in kept],
+    }
+
+
+def _api_compare(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return the comparator result for two JSON artifacts.
+
+    ``what`` selects the engine the CLI already dispatches to: ``functions``
+    and ``strings`` compare analyze-report payloads (evidence bundles are
+    unwrapped to their report entry), ``bundles`` diffs two evidence-bundle
+    documents by record kind and digest membership. Both paths are validated
+    to exist before any engine runs, and the bounded ``max_functions`` /
+    ``max_strings`` windows keep the comparison as cheap as the CLI's flags.
+    """
+    left = _query_path(params, "left", allow_paths)
+    right = _query_path(params, "right", allow_paths)
+    what = (_first(params, "what") or "functions").lower()
+    if what not in COMPARE_WHATS:
+        raise _RouteError(f"what must be one of {', '.join(COMPARE_WHATS)}, got {what!r}")
+    _require_file(left, "left")
+    _require_file(right, "right")
+    if what == "functions":
+        max_functions = _query_int(
+            params, "max_functions", DEFAULT_COMPARE_FUNCTIONS, 1, MAX_COMPARE_FUNCTIONS
+        )
+        result: Any = compare_inventories(
+            load_report_payload(left),
+            load_report_payload(right),
+            max_functions=max_functions,
+        )
+        payload = result.to_dict()
+        payload["max_functions"] = max_functions
+    elif what == "strings":
+        max_strings = _query_int(
+            params, "max_strings", DEFAULT_COMPARE_STRINGS, 1, MAX_COMPARE_STRINGS
+        )
+        result = compare_strings(
+            load_report_payload(left),
+            load_report_payload(right),
+            max_strings=max_strings,
+        )
+        payload = result.to_dict()
+        payload["max_strings"] = max_strings
+    else:
+        result = compare_bundles(load_document(left), load_document(right))
+        payload = result.to_dict()
+    payload["what"] = what
+    return payload
+
+
+def _api_nav(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return bookmarks, comments and the cursor for one session.
+
+    All three read APIs of :class:`~codevanta.analysis.nav.NavStore` are served
+    in one request so the navigation panel needs no follow-ups. The database
+    named by ``?db=`` must exist already -- a dashboard request can read a
+    session database but never create one -- and the engine's own validation
+    (usable session id, session row present) applies unchanged, so an unknown
+    session is the engine's typed ``AnalysisError`` (HTTP ``400``) including
+    its "save a session first" hint.
+    """
+    db = _query_path(params, "db", allow_paths)
+    session_id = _first(params, "session")
+    if session_id is None:
+        raise _RouteError("session is required")
+    _require_file(db, "db")
+    with NavStore(db) as store:
+        bookmarks = store.bookmarks(session_id)
+        comments = store.comments(session_id)
+        cursor = store.cursor(session_id)
+    return {
+        "db": str(db),
+        "session_id": session_id,
+        "bookmarks": [bookmark.to_dict() for bookmark in bookmarks],
+        "comments": [comment.to_dict() for comment in comments],
+        "cursor": cursor.to_dict() if cursor is not None else None,
+    }
+
+
+def _api_metadata(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return the auto-detected format metadata for one path.
+
+    :func:`~codevanta.analysis.binmeta.inspect_metadata` classifies files
+    through every typed detector (pyc, APK signing, Go build info, cargo
+    audit, Electron fuses, kernel modules, ELF notes) and directories as
+    desktop-app layouts; unknown or malformed inputs are the engine's typed
+    ``AnalysisError`` (HTTP ``400``), never a guess.
+    """
+    target = _query_path(params, "path", allow_paths)
+    report = inspect_metadata(target)
+    return report.to_dict()
+
+
 #: Route table: request path -> payload builder. Builders take the query
 #: parameters and the handler's ``paths_allowed`` flag.
 ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
@@ -942,6 +1200,12 @@ ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
     "/api/symbolic": _api_symbolic,
     "/api/session_save": _api_session_save,
     "/api/session_list": _api_session_list,
+    "/bridges": _api_bridges,
+    "/unknowns": _api_unknowns,
+    "/obligations": _api_obligations,
+    "/compare": _api_compare,
+    "/nav": _api_nav,
+    "/metadata": _api_metadata,
 }
 
 def _json_default(value: Any) -> Any:

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -17,14 +19,44 @@ import pytest
 from typer.testing import CliRunner
 
 from codevanta.analysis.compare import (
+    COMPARE_WHATS,
+    DEFAULT_MAX_CHANGED_SECTIONS,
+    DEFAULT_MAX_DETAIL_KEYS,
+    DEFAULT_MAX_ROWS,
+    JSON_COMPARE_WHATS,
     MAX_COMPARE_FUNCTIONS,
+    MAX_COMPARE_REGISTERS,
+    PATH_COMPARE_WHATS,
+    compare_artifacts,
     compare_bundles,
+    compare_crash,
+    compare_firmware,
     compare_inventories,
+    compare_metadata,
+    compare_nav,
+    compare_reports,
+    compare_sessions,
     compare_strings,
+    compare_wasm,
     load_report_payload,
 )
+from codevanta.analysis.nav import NavStore
 from codevanta.cli.main import app
+from codevanta.core.loader import BinaryInfo
 from codevanta.core.report import AnalysisError
+from codevanta.storage.session import SessionStore
+from test_crash import (
+    _CORE_NAME,
+    FAULT_ADDR,
+    RIP,
+    RSP,
+    TID,
+    _note,
+    _nt_file64,
+    _prpsinfo64,
+    _siginfo64,
+    make_core64,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "samples"
@@ -382,3 +414,670 @@ def test_mcp_compare_bundles_rejects_non_bundle(tmp_path: Path) -> None:
         tools.compare(str(plain), str(plain), what="bundles")
     with pytest.raises(AnalysisError):
         tools.compare(str(REPORT_ELF64), str(REPORT_BUNDLE), what="nope")
+
+
+# ---- fixtures for the path/JSON comparators -----------------------------------
+
+
+_WASM_HEADER = b"\x00asm\x01\x00\x00\x00"
+_WASM_TYPES = b"\x01\x05\x01\x60\x00\x01\x7f"  # one () -> i32
+_WASM_IMPORT_EF = b"\x02\x07\x01\x01\x65\x01\x66\x00\x00"  # e.f = func 0
+_WASM_EXPORT_OK = b"\x07\x06\x01\x02\x6f\x6b\x00\x00"  # "ok" -> func 0
+_WASM_CODE = b"\x0a\x04\x01\x02\x00\x0b"  # one empty body
+
+_WASM_MODULE_A = (
+    _WASM_HEADER + _WASM_TYPES + _WASM_IMPORT_EF + _WASM_EXPORT_OK + _WASM_CODE
+)
+# Module B keeps import e.f, adds import g.h and a memory section, and
+# renames the export "ok" to "ok2".
+_WASM_IMPORTS_BOTH = b"\x02\x0d\x02\x01\x65\x01\x66\x00\x00\x01\x67\x01\x68\x00\x00"
+_WASM_MODULE_B = (
+    _WASM_HEADER
+    + _WASM_TYPES
+    + _WASM_IMPORTS_BOTH  # imports: e.f and g.h
+    + b"\x05\x03\x01\x00\x01"  # memory: 1 page
+    + b"\x07\x07\x01\x03\x6f\x6b\x32\x00\x00"  # "ok2" -> func 0
+    + _WASM_CODE
+)
+
+
+def _write_wasm(tmp_path: Path, name: str, blob: bytes) -> Path:
+    target = tmp_path / name
+    target.write_bytes(blob)
+    return target
+
+
+def _prstatus64_at(tid: int, signal: int, rip: int, rsp: int) -> bytes:
+    """``NT_PRSTATUS`` descriptor with explicit rip/rsp (test-local builder)."""
+    descriptor = bytearray(324)
+    struct.pack_into("<II", descriptor, 0, signal, 1)
+    struct.pack_into("<H", descriptor, 16, signal)
+    struct.pack_into("<I", descriptor, 24, tid)
+    struct.pack_into("<Q", descriptor, 104 + 16 * 8, rip)
+    struct.pack_into("<Q", descriptor, 104 + 19 * 8, rsp)
+    return bytes(descriptor)
+
+
+def _core_notes(*, rip: int = RIP, rsp: int = RSP, signal: int = 11) -> list[bytes]:
+    """The canonical four notes with parameterised rip/rsp/signal."""
+    return [
+        _note(_CORE_NAME, 1, _prstatus64_at(TID, signal, rip, rsp)),
+        _note(_CORE_NAME, 3, _prpsinfo64(TID, b"crashtest\x00", b"crashtest --run\x00")),
+        _note(_CORE_NAME, 0x53494749, _siginfo64(signal, 1, FAULT_ADDR)),
+        _note(
+            _CORE_NAME,
+            0x46494C45,
+            _nt_file64([(0x401000, 0x402000)], [b"/opt/crashtest"]),
+        ),
+    ]
+
+
+def _make_info(path: Path) -> BinaryInfo:
+    """Minimal metadata for one session row (mirrors test_nav.make_info)."""
+    return BinaryInfo(
+        path=path,
+        format="ELF",
+        architecture="x86_64",
+        bitness=64,
+        endianness="little",
+        entry_point=0x401000,
+        image_base=0x400000,
+        sha256="a" * 64,
+        file_size=4096,
+    )
+
+
+def _session_db(tmp_path: Path, name: str, session_id: str) -> Path:
+    """A session database with one saved session (and no annotations yet)."""
+    db_path = tmp_path / name
+    store = SessionStore(db_path)
+    try:
+        store.save(_make_info(db_path.with_suffix(".bin")), 1, 1, session_id=session_id)
+    finally:
+        store.close()
+    return db_path
+
+
+# ---- registry sanity ----------------------------------------------------------
+
+
+def test_registry_partitions_all_ten_kinds() -> None:
+    assert len(COMPARE_WHATS) == 10
+    assert set(JSON_COMPARE_WHATS) | set(PATH_COMPARE_WHATS) == set(COMPARE_WHATS)
+    assert not set(JSON_COMPARE_WHATS) & set(PATH_COMPARE_WHATS)
+    assert "functions" in JSON_COMPARE_WHATS and "firmware" in PATH_COMPARE_WHATS
+
+
+# ---- compare_reports ----------------------------------------------------------
+
+
+def test_reports_identical_payload_is_identical() -> None:
+    payload = json.loads(REPORT_ELF64.read_text(encoding="utf-8"))
+    result = compare_reports(payload, payload)
+    assert result.identical is True
+    assert result.changed == ()
+    assert result.added_sections == () and result.removed_sections == ()
+    paths = {count.path for count in result.section_counts}
+    assert {"functions", "strings", "binary.sections"} <= paths
+    functions = next(c for c in result.section_counts if c.path == "functions")
+    assert functions.left == functions.right and functions.to_dict()["delta"] == 0
+    _assert_json_safe(result.to_dict())
+    assert result.to_dict()["what"] == "reports"
+
+
+def test_reports_sample_pair_reports_changes_and_counts() -> None:
+    left = load_report_payload(REPORT_ELF64)
+    right = load_report_payload(REPORT_BUNDLE)
+    result = compare_reports(left, right)
+    assert result.left_sections == len(left)
+    assert result.right_sections == len(right)
+    assert result.identical is False
+    changed_names = {change.name for change in result.changed}
+    assert "provenance" in changed_names  # created_at differs between builds
+    for count in result.section_counts:
+        if count.left is not None and count.right is not None:
+            assert count.to_dict()["delta"] == count.right - count.left
+    _assert_json_safe(result.to_dict())
+
+
+def test_reports_added_removed_and_budget_bound() -> None:
+    left: dict[str, Any] = {"functions": [{"address": "0x1000"}], "binary": {"sections": []}}
+    right: dict[str, Any] = {
+        "functions": [{"address": "0x2000"}],
+        "binary": {"sections": []},
+        "metadata": {"tool": "codevanta"},
+    }
+    result = compare_reports(left, right)
+    assert result.added_sections == ("metadata",)
+    assert result.removed_sections == ()
+    assert [change.name for change in result.changed] == ["functions"]
+
+    many_left = {f"section_{i:02d}": {"i": i} for i in range(20)}
+    many_right = {f"section_{i:02d}": {"i": i + 1} for i in range(20)}
+    bounded = compare_reports(many_left, many_right)  # budget defaults to 16
+    assert len(bounded.changed) == DEFAULT_MAX_CHANGED_SECTIONS
+    assert any("changed sections: kept 16 of 20" in warning for warning in bounded.warnings)
+    with pytest.raises(AnalysisError):
+        compare_reports(left, right, max_changed_sections=0)
+
+
+def test_reports_rejects_non_object_payloads() -> None:
+    with pytest.raises(AnalysisError, match="left"):
+        compare_reports(["not", "an", "object"], {})
+    with pytest.raises(AnalysisError, match="right"):
+        compare_reports({}, "nope")
+
+
+# ---- compare_metadata ---------------------------------------------------------
+
+
+def _metadata_doc(kind: str, details: dict[str, Any]) -> dict[str, Any]:
+    return {"path": "ignored", "kind": kind, "details": details, "evidence": []}
+
+
+def test_metadata_kind_change_and_key_diff() -> None:
+    left = _metadata_doc("elf", {"format": "ELF64", "entry": "0x401000", "stripped": True})
+    right = _metadata_doc("pe", {"format": "PE32+", "entry": "0x401000", "compiler": "msvc"})
+    result = compare_metadata(left, right)
+    assert result.same_kind is False
+    assert result.left_kind == "elf" and result.right_kind == "pe"
+    assert result.added_keys == ("compiler",)
+    assert result.removed_keys == ("stripped",)
+    assert {change.key for change in result.changed} == {"format"}
+    assert result.identical is False
+    _assert_json_safe(result.to_dict())
+    assert result.to_dict()["what"] == "metadata"
+
+
+def test_metadata_identical_bounded_and_missing_kind() -> None:
+    details = {f"key_{i:02d}": i for i in range(40)}
+    result = compare_metadata(_metadata_doc("elf", details), _metadata_doc("elf", details))
+    assert result.identical is True and result.same_kind is True
+
+    changed_left = {f"key_{i:02d}": i for i in range(40)}
+    changed_right = {f"key_{i:02d}": i + 1 for i in range(40)}
+    bounded = compare_metadata(
+        _metadata_doc("elf", changed_left), _metadata_doc("elf", changed_right)
+    )
+    assert len(bounded.changed) == DEFAULT_MAX_DETAIL_KEYS
+    assert any(
+        "changed detail keys: kept 32 of 40" in warning for warning in bounded.warnings
+    )
+
+    missing_kind = compare_metadata({"details": {"a": 1}}, {"details": {"a": 1}})
+    assert missing_kind.same_kind is None and missing_kind.identical is True
+    assert any("'kind'" in warning for warning in missing_kind.warnings)
+
+
+def test_metadata_typed_errors() -> None:
+    with pytest.raises(AnalysisError, match="left"):
+        compare_metadata({"kind": "elf"}, _metadata_doc("elf", {}))
+    with pytest.raises(AnalysisError, match="right"):
+        compare_metadata(_metadata_doc("elf", {}), {"kind": "elf"})
+    with pytest.raises(AnalysisError):
+        compare_metadata(_metadata_doc("elf", {}), _metadata_doc("elf", {}), max_detail_keys=0)
+
+
+# ---- compare_wasm -------------------------------------------------------------
+
+
+def test_wasm_identical_modules(tmp_path: Path) -> None:
+    left = _write_wasm(tmp_path, "a.wasm", _WASM_MODULE_A)
+    right = _write_wasm(tmp_path, "b.wasm", _WASM_MODULE_A)
+    result = compare_wasm(left, right)
+    assert result.identical is True
+    assert result.added_sections == () and result.removed_sections == ()
+    assert result.section_deltas == ()
+    assert result.size_delta == 0
+    assert result.left_version == 1
+    _assert_json_safe(result.to_dict())
+    assert result.to_dict()["what"] == "wasm"
+
+
+def test_wasm_diff_sections_names_and_sizes(tmp_path: Path) -> None:
+    left = _write_wasm(tmp_path, "a.wasm", _WASM_MODULE_A)
+    right = _write_wasm(tmp_path, "b.wasm", _WASM_MODULE_B)
+    result = compare_wasm(left, right)
+    assert result.added_sections == ("5:memory",)
+    assert result.removed_sections == ()
+    assert result.imports_added == ("g.h",)
+    assert result.imports_removed == ()
+    assert result.exports_added == ("ok2",)
+    assert result.exports_removed == ("ok",)
+    assert result.size_delta == len(_WASM_MODULE_B) - len(_WASM_MODULE_A)
+    assert result.size_delta > 0
+    assert result.identical is False
+    _assert_json_safe(result.to_dict())
+
+
+def test_wasm_typed_errors(tmp_path: Path) -> None:
+    not_wasm = tmp_path / "elf.bin"
+    not_wasm.write_bytes(b"\x7fELF" + bytes(32))
+    with pytest.raises(AnalysisError, match="not a WebAssembly module"):
+        compare_wasm(not_wasm, not_wasm)
+    with pytest.raises(AnalysisError):
+        compare_wasm(tmp_path / "missing.wasm", not_wasm)
+
+
+# ---- compare_crash ------------------------------------------------------------
+
+
+def test_crash_same_site_verdict_high(tmp_path: Path) -> None:
+    left = make_core64(tmp_path / "left.core", _core_notes())
+    right = make_core64(tmp_path / "right.core", _core_notes())
+    result = compare_crash(left, right)
+    assert result.same_crash_site is True
+    assert result.verdict_confidence == "high"
+    assert result.same_signal is True
+    assert result.same_fault_module is True
+    assert result.left_fault_module == "/opt/crashtest"
+    assert result.rip_same is True and result.sp_same is True
+    assert result.rip_delta == 0
+    registers = {delta.register for delta in result.register_deltas}
+    assert {"rip", "rsp", "rbp"} <= registers
+    assert all(not delta.changed for delta in result.register_deltas)
+    assert len(result.register_deltas) <= MAX_COMPARE_REGISTERS
+    _assert_json_safe(result.to_dict())
+    assert result.to_dict()["what"] == "crash"
+
+
+def test_crash_rip_shift_is_a_different_site(tmp_path: Path) -> None:
+    left = make_core64(tmp_path / "left.core", _core_notes())
+    right = make_core64(tmp_path / "right.core", _core_notes(rip=RIP + 0x10))
+    result = compare_crash(left, right)
+    assert result.same_crash_site is False
+    assert result.verdict_confidence == "high"
+    assert result.rip_same is False
+    assert result.rip_delta == 0x10
+    changed = {delta.register for delta in result.register_deltas if delta.changed}
+    assert changed == {"rip"}
+    _assert_json_safe(result.to_dict())
+
+
+def test_crash_signal_mismatch_and_unmapped_module(tmp_path: Path) -> None:
+    left = make_core64(tmp_path / "left.core", _core_notes(signal=11))
+    right = make_core64(tmp_path / "right.core", _core_notes(signal=10))
+    result = compare_crash(left, right)
+    assert result.same_signal is False
+    assert result.same_crash_site is False
+
+    unmapped_left = make_core64(tmp_path / "u1.core", _core_notes()[:3])
+    unmapped_right = make_core64(tmp_path / "u2.core", _core_notes()[:3])
+    partial = compare_crash(unmapped_left, unmapped_right)
+    assert partial.same_fault_module is None
+    assert partial.left_fault_module is None
+    assert partial.same_crash_site is True
+    # signal + rip still decide the verdict even with both modules unknown.
+    assert partial.verdict_confidence == "high"
+
+
+def test_crash_undecidable_is_medium_confidence(tmp_path: Path) -> None:
+    # No NT_PRSTATUS and no NT_FILE: no signal, no ip, no module on either side.
+    minimal = [
+        _note(_CORE_NAME, 3, _prpsinfo64(TID, b"crashtest\x00", b"crashtest --run\x00")),
+    ]
+    left = make_core64(tmp_path / "l.core", minimal)
+    right = make_core64(tmp_path / "r.core", minimal)
+    result = compare_crash(left, right)
+    assert result.same_signal is None
+    assert result.rip_same is None
+    assert result.same_fault_module is None
+    assert result.verdict_confidence == "medium"
+
+
+def test_crash_typed_errors(tmp_path: Path) -> None:
+    junk = tmp_path / "junk.bin"
+    junk.write_bytes(b"not a core dump at all")
+    with pytest.raises(AnalysisError):
+        compare_crash(junk, junk)
+    with pytest.raises(AnalysisError):
+        compare_crash(tmp_path / "missing.core", junk)
+
+
+# ---- compare_sessions ---------------------------------------------------------
+
+
+def test_sessions_annotation_diff(tmp_path: Path) -> None:
+    left_db = _session_db(tmp_path, "left.db", "samesid0001")
+    right_db = _session_db(tmp_path, "right.db", "samesid0001")
+    left_store = SessionStore(left_db)
+    right_store = SessionStore(right_db)
+    try:
+        left_store.annotate("samesid0001", 0x1000, "left note")
+        left_store.annotate("samesid0001", 0x2000, "shared note")
+        right_store.annotate("samesid0001", 0x2000, "shared note")
+        right_store.annotate("samesid0001", 0x3000, "right note")
+    finally:
+        left_store.close()
+        right_store.close()
+    result = compare_sessions(left_db, right_db)
+    assert result.left_annotations == 2 and result.right_annotations == 2
+    assert result.annotation_delta == 0
+    assert result.addresses_only_left == ("0x1000",)
+    assert result.addresses_only_right == ("0x3000",)
+    assert result.left_sessions == 1 and result.right_sessions == 1
+    assert result.identical is False
+    _assert_json_safe(result.to_dict())
+    assert result.to_dict()["what"] == "sessions"
+
+
+def test_sessions_identical_empty_databases(tmp_path: Path) -> None:
+    left_db = _session_db(tmp_path, "l.db", "sess00000001")
+    right_db = _session_db(tmp_path, "r.db", "sess00000002")
+    result = compare_sessions(left_db, right_db)
+    assert result.left_annotations == 0 and result.right_annotations == 0
+    assert result.identical is True
+    assert result.addresses_only_left == () and result.addresses_only_right == ()
+
+
+def test_sessions_bounded_addresses(tmp_path: Path) -> None:
+    left_db = _session_db(tmp_path, "l.db", "sess00000001")
+    right_db = _session_db(tmp_path, "r.db", "sess00000002")
+    store = SessionStore(left_db)
+    try:
+        for index in range(DEFAULT_MAX_ROWS + 6):  # 70 > budget 64
+            store.annotate("sess00000001", 0x1000 + index, f"note {index}")
+    finally:
+        store.close()
+    result = compare_sessions(left_db, right_db)
+    assert result.left_annotations == DEFAULT_MAX_ROWS + 6
+    assert len(result.addresses_only_left) == DEFAULT_MAX_ROWS
+    assert any("kept 64 of 70" in warning for warning in result.warnings)
+
+
+def test_sessions_typed_errors(tmp_path: Path) -> None:
+    plain_db = tmp_path / "plain.db"
+    connection = sqlite3.connect(plain_db)
+    try:
+        connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(AnalysisError, match="not a CODEVANTA session database"):
+        compare_sessions(plain_db, plain_db)
+    not_sqlite = tmp_path / "not.db"
+    not_sqlite.write_bytes(b"garbage")
+    with pytest.raises(AnalysisError):
+        compare_sessions(not_sqlite, not_sqlite)
+    good_db = _session_db(tmp_path, "good.db", "sess00000003")
+    with pytest.raises(AnalysisError):
+        compare_sessions(good_db, good_db, max_addresses=0)
+
+
+# ---- compare_nav --------------------------------------------------------------
+
+
+def _navmark(
+    db_path: Path, sid: str, *, name_addr: int, comment_addr: int, cursor: int
+) -> None:
+    nav = NavStore(db_path)
+    try:
+        nav.bookmark(sid, name_addr, "entry")
+        nav.comment(sid, comment_addr, "looks fine")
+        nav.goto(sid, cursor)
+    finally:
+        nav.close()
+
+
+def test_nav_bookmark_comment_cursor_diff(tmp_path: Path) -> None:
+    left_db = _session_db(tmp_path, "left.db", "samesid0001")
+    right_db = _session_db(tmp_path, "right.db", "samesid0001")
+    _navmark(left_db, "samesid0001", name_addr=0x1000, comment_addr=0x2000, cursor=0x3000)
+    _navmark(right_db, "samesid0001", name_addr=0x1500, comment_addr=0x2500, cursor=0x3500)
+    nav_right = NavStore(right_db)
+    try:
+        nav_right.bookmark("samesid0001", 0x9000, "added")
+        nav_right.comment("samesid0001", 0x2000, "rewritten")
+    finally:
+        nav_right.close()
+
+    result = compare_nav(left_db, right_db, session_id="samesid0001")
+    assert result.session_id == "samesid0001"
+    assert result.left_bookmarks == 1 and result.right_bookmarks == 2
+    assert result.bookmarks_added == ("added",)
+    assert result.bookmarks_removed == ()
+    moves = {
+        (move.name, move.left_address, move.right_address)
+        for move in result.bookmarks_moved
+    }
+    assert moves == {("entry", "0x1000", "0x1500")}
+    assert result.comments_added == ("0x2500",)
+    assert result.comments_removed == ()
+    changed = {
+        (change.address, change.left_text, change.right_text)
+        for change in result.comments_changed
+    }
+    assert changed == {("0x2000", "looks fine", "rewritten")}
+    assert result.cursor_left == "0x3000" and result.cursor_right == "0x3500"
+    assert result.cursor_same is False
+    assert result.identical is False
+    _assert_json_safe(result.to_dict())
+    assert result.to_dict()["what"] == "nav"
+
+
+def test_nav_identical_and_auto_picked_session(tmp_path: Path) -> None:
+    left_db = _session_db(tmp_path, "left.db", "autoses00001")
+    right_db = _session_db(tmp_path, "right.db", "autoses00002")
+    _navmark(left_db, "autoses00001", name_addr=0x1000, comment_addr=0x2000, cursor=0x3000)
+    _navmark(right_db, "autoses00002", name_addr=0x1000, comment_addr=0x2000, cursor=0x3000)
+    result = compare_nav(left_db, right_db)  # session_id=None picks newest per db
+    assert result.session_id == "autoses00001"
+    assert result.identical is True
+    assert result.cursor_same is True
+    assert result.bookmarks_moved == ()
+
+
+def test_nav_typed_errors(tmp_path: Path) -> None:
+    # A valid SQLite database whose sessions table exists but is empty.
+    bare_db = tmp_path / "bare.db"
+    connection = sqlite3.connect(bare_db)
+    try:
+        connection.execute("CREATE TABLE sessions (session_id TEXT, created_at TEXT)")
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(AnalysisError, match="no saved sessions"):
+        compare_nav(bare_db, bare_db)
+    good_db = _session_db(tmp_path, "good.db", "sess00000002")
+    with pytest.raises(AnalysisError):
+        compare_nav(good_db, good_db, max_rows=0)
+
+
+# ---- compare_firmware ---------------------------------------------------------
+
+
+def test_firmware_hits_added_and_removed(tmp_path: Path) -> None:
+    left = bytearray(2048)
+    left[0:3] = b"\x1f\x8b\x08"  # gzip
+    left[512:516] = b"hsqs"  # squashfs
+    right = bytearray(2048)
+    right[0:3] = b"\x1f\x8b\x08"  # gzip kept
+    right[1024:1028] = b"\xd0\x0d\xfe\xed"  # DTB added
+    left_path = tmp_path / "left.img"
+    right_path = tmp_path / "right.img"
+    left_path.write_bytes(bytes(left))
+    right_path.write_bytes(bytes(right))
+    result = compare_firmware(left_path, right_path)
+    assert result.left_hits == 2 and result.right_hits == 2
+    assert result.unchanged_hit_count == 1  # the gzip magic at offset 0
+    added = {(hit["offset"], hit["kind"]) for hit in result.hits_added}
+    removed = {(hit["offset"], hit["kind"]) for hit in result.hits_removed}
+    assert added == {(1024, "dtb")}
+    assert removed == {(512, "squashfs")}
+    assert result.identical is False
+    assert result.size_delta == 0
+    payload = result.to_dict()
+    assert payload["what"] == "firmware"
+    assert payload["evidence"]["confidence"] == "medium"
+    _assert_json_safe(payload)
+
+
+def test_firmware_identical_and_no_hits(tmp_path: Path) -> None:
+    blob = bytearray(2048)
+    blob[0:3] = b"\x1f\x8b\x08"
+    left = tmp_path / "same1.img"
+    right = tmp_path / "same2.img"
+    left.write_bytes(bytes(blob))
+    right.write_bytes(bytes(blob))
+    result = compare_firmware(left, right)
+    assert result.identical is True and result.hits_added == ()
+
+    bigger = tmp_path / "bigger.img"
+    bigger.write_bytes(bytes(blob) + b"\x00" * 16)
+    grown = compare_firmware(left, bigger)
+    assert grown.identical is True and grown.size_delta == 16
+
+    empty_left = tmp_path / "e1.img"
+    empty_right = tmp_path / "e2.img"
+    empty_left.write_bytes(b"\x00" * 512)
+    empty_right.write_bytes(b"\x00" * 512)
+    no_hits = compare_firmware(empty_left, empty_right)
+    assert no_hits.left_hits == 0 and no_hits.identical is True
+
+
+def test_firmware_typed_errors(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.img"
+    with pytest.raises(AnalysisError):
+        compare_firmware(missing, missing)
+
+
+# ---- compare_artifacts dispatch -----------------------------------------------
+
+
+def test_dispatch_rejects_unknown_what(tmp_path: Path) -> None:
+    with pytest.raises(AnalysisError, match="unknown --what"):
+        compare_artifacts("entropy", tmp_path, tmp_path)
+
+
+def test_dispatch_runs_every_registered_kind(tmp_path: Path) -> None:
+    assert isinstance(compare_artifacts("functions", REPORT_ELF64, REPORT_BUNDLE), object)
+    assert isinstance(compare_artifacts("strings", REPORT_ELF64, REPORT_BUNDLE), object)
+    assert isinstance(compare_artifacts("bundles", REPORT_BUNDLE, REPORT_BUNDLE), object)
+    assert isinstance(compare_artifacts("reports", REPORT_ELF64, REPORT_BUNDLE), object)
+    doc = tmp_path / "meta.json"
+    doc.write_text(json.dumps({"kind": "elf", "details": {"fmt": "ELF64"}}), encoding="utf-8")
+    assert isinstance(compare_artifacts("metadata", doc, doc), object)
+    wasm_path = _write_wasm(tmp_path, "m.wasm", _WASM_MODULE_A)
+    assert isinstance(compare_artifacts("wasm", wasm_path, wasm_path), object)
+    core = make_core64(tmp_path / "c.core", _core_notes())
+    assert isinstance(compare_artifacts("crash", core, core), object)
+    left_db = _session_db(tmp_path, "l.db", "sess00000001")
+    right_db = _session_db(tmp_path, "r.db", "sess00000002")
+    assert isinstance(compare_artifacts("sessions", left_db, right_db), object)
+    assert isinstance(compare_artifacts("nav", left_db, right_db), object)
+    image = tmp_path / "fw.img"
+    image.write_bytes(b"\x00" * 512)
+    assert isinstance(compare_artifacts("firmware", image, image), object)
+
+
+def test_dispatch_bundles_rejects_non_bundle(tmp_path: Path) -> None:
+    plain = tmp_path / "plain.json"
+    plain.write_text(json.dumps({"functions": []}), encoding="utf-8")
+    with pytest.raises(AnalysisError, match="not an evidence-bundle document"):
+        compare_artifacts("bundles", plain, plain)
+
+
+# ---- CLI: the new kinds through codevanta compare -----------------------------
+
+
+def test_cli_compare_reports_text_and_json() -> None:
+    result = runner.invoke(
+        app,
+        ["compare", str(REPORT_ELF64), str(REPORT_BUNDLE), "--what", "reports"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Changed sections" in result.output
+    assert "report_section_sha_diff" in result.output
+
+    as_json = runner.invoke(
+        app,
+        [
+            "compare",
+            str(REPORT_ELF64),
+            str(REPORT_ELF64),
+            "--what",
+            "reports",
+            "--format",
+            "json",
+        ],
+    )
+    assert as_json.exit_code == 0, as_json.output
+    payload = json.loads(as_json.output)
+    assert payload["what"] == "reports" and payload["identical"] is True
+
+
+def test_cli_compare_wasm_text(tmp_path: Path) -> None:
+    left = _write_wasm(tmp_path, "a.wasm", _WASM_MODULE_A)
+    right = _write_wasm(tmp_path, "b.wasm", _WASM_MODULE_B)
+    result = runner.invoke(app, ["compare", str(left), str(right), "--what", "wasm"])
+    assert result.exit_code == 0, result.output
+    assert "5:memory" in result.output  # added section (title wraps on narrow consoles)
+    assert "g.h" in result.output
+    assert "wasm_summary_diff" in result.output
+
+
+def test_cli_compare_crash_json(tmp_path: Path) -> None:
+    core = make_core64(tmp_path / "c.core", _core_notes())
+    result = runner.invoke(
+        app,
+        ["compare", str(core), str(core), "--what", "crash", "--format", "json"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["what"] == "crash"
+    assert payload["same_crash_site"] is True
+    assert payload["verdict_confidence"] == "high"
+
+
+def test_cli_compare_firmware_text(tmp_path: Path) -> None:
+    image = tmp_path / "fw.img"
+    image.write_bytes(b"\x1f\x8b\x08" + b"\x00" * 509)
+    result = runner.invoke(app, ["compare", str(image), str(image), "--what", "firmware"])
+    assert result.exit_code == 0, result.output
+    assert "identical: True" in result.output
+    assert "firmware_magic_diff" in result.output
+
+
+def test_cli_compare_sessions_text_and_metadata_json(tmp_path: Path) -> None:
+    left_db = _session_db(tmp_path, "l.db", "sess00000001")
+    right_db = _session_db(tmp_path, "r.db", "sess00000002")
+    result = runner.invoke(
+        app, ["compare", str(left_db), str(right_db), "--what", "sessions"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "annotations: 0 vs 0" in result.output
+    assert "session_annotation_diff" in result.output
+
+    doc = tmp_path / "meta.json"
+    doc.write_text(json.dumps({"kind": "elf", "details": {"fmt": "ELF64"}}), encoding="utf-8")
+    as_json = runner.invoke(
+        app,
+        ["compare", str(doc), str(doc), "--what", "metadata", "--format", "json"],
+    )
+    assert as_json.exit_code == 0, as_json.output
+    payload = json.loads(as_json.output)
+    assert payload["what"] == "metadata" and payload["same_kind"] is True
+
+
+def test_cli_compare_new_kind_error_exits_two(tmp_path: Path) -> None:
+    junk = tmp_path / "junk.bin"
+    junk.write_bytes(b"junk")
+    result = runner.invoke(app, ["compare", str(junk), str(junk), "--what", "sessions"])
+    assert result.exit_code == 2
+    assert "error:" in result.output
+
+
+# ---- MCP: the registry through tools.compare ----------------------------------
+
+
+def test_mcp_compare_reports_and_wasm(tmp_path: Path) -> None:
+    from codevanta.mcp_server import tools
+
+    payload = tools.compare(str(REPORT_ELF64), str(REPORT_ELF64), what="reports")
+    assert payload["what"] == "reports" and payload["identical"] is True
+    wasm_path = _write_wasm(tmp_path, "m.wasm", _WASM_MODULE_A)
+    wasm_payload = tools.compare(str(wasm_path), str(wasm_path), what="wasm")
+    assert wasm_payload["what"] == "wasm" and wasm_payload["identical"] is True
+    with pytest.raises(AnalysisError):
+        tools.compare(str(wasm_path), str(wasm_path), what="sessions")
+

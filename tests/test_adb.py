@@ -922,6 +922,611 @@ class TestLiveAdb:
         assert json.dumps(result.to_dict())
 
 
+LOGCAT_OUTPUT = """\
+03-15 10:21:02.123  1234  5678 D WifiService : got a scan request
+03-15 10:21:02.456  1234  5679 I ActivityManager: displayed com.example.app
+03-15 10:21:03.999      9   129 W ActivityManager : slow operation
+not-a-logcat-line
+--------- beginning of main
+"""
+
+AM_START_OK = """\
+Starting: Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] cmp=com.example.app/.MainActivity }
+Status: ok
+LaunchState: COLD
+TotalTime: 412
+WaitTime: 445
+Complete
+"""
+
+AM_START_ERROR = """\
+Starting: Intent { cmp=com.example.app/.Missing }
+Error: Activity class {com.example.app/com.example.app.Missing} does not exist.
+Status: error
+"""
+
+
+class TestParseLogcat:
+    """``logcat -d -t`` ``threadtime`` rows, bounded and evidence-backed."""
+
+    def test_rows_fields_and_order(self) -> None:
+        result = adb.parse_logcat(LOGCAT_OUTPUT)
+        assert result.count == 3
+        assert result.lines[0].priority == "D"
+        assert result.lines[0].tag == "WifiService"
+        assert result.lines[0].pid == 1234
+        assert result.lines[0].message == "got a scan request"
+        assert result.lines[2].pid == 9
+
+    def test_junk_rows_become_warnings(self) -> None:
+        result = adb.parse_logcat(LOGCAT_OUTPUT)
+        assert len(result.warnings) == 2  # the chatter line and the header marker
+        assert result.evidence.confidence.value in ("high", "medium")
+
+    def test_blank_lines_are_skipped_silently(self) -> None:
+        result = adb.parse_logcat("03-15 10:21:02.123  1  2 I Tag : hi\n\n\n")
+        assert result.count == 1
+        assert result.warnings == []
+
+    def test_line_cap_truncates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(adb, "MAX_LOG_LINES", 2)
+        result = adb.parse_logcat(LOGCAT_OUTPUT)
+        assert result.count == 2
+        assert result.truncated
+
+    def test_message_clipped(self) -> None:
+        long_message = "x" * 1000
+        transcript = f"03-15 10:21:02.123  1  2 I Tag : {long_message}"
+        result = adb.parse_logcat(transcript)
+        assert result.lines[0].message == "x" * adb.MAX_LOG_MSG_CHARS
+
+    def test_to_dict_is_json_safe(self) -> None:
+        payload = adb.parse_logcat(LOGCAT_OUTPUT).to_dict()
+        assert json.dumps(payload)
+        assert payload["count"] == 3
+        assert payload["lines"][0]["tag"] == "WifiService"
+
+    def test_non_string_input_is_typed(self) -> None:
+        with pytest.raises(AnalysisError):
+            adb.parse_logcat(b"bytes-not-allowed")
+
+
+class TestParseAmStart:
+    def test_ok_launch(self) -> None:
+        result = adb.parse_am_start(AM_START_OK)
+        assert result.status == "ok"
+        assert result.launch_state == "COLD"
+        assert result.total_time_ms == 412
+        assert result.wait_time_ms == 445
+        assert result.component == "com.example.app/.MainActivity"
+        assert result.error is None
+        assert result.warnings == []
+        assert result.evidence.confidence.value in ("high", "certain")
+
+    def test_error_launch(self) -> None:
+        result = adb.parse_am_start(AM_START_ERROR)
+        assert result.status == "error"
+        assert result.error == (
+            "Activity class {com.example.app/com.example.app.Missing} does not exist."
+        )
+        assert result.launch_state is None
+
+    def test_unrecognised_transcript_warns(self) -> None:
+        result = adb.parse_am_start("nothing to see here")
+        assert result.status is None
+        assert result.launch_state is None
+        assert result.warnings
+
+    def test_blank_total_time_is_none(self) -> None:
+        result = adb.parse_am_start("Status: ok\nTotalTime: \n")
+        assert result.total_time_ms is None
+
+    def test_non_string_input_is_typed(self) -> None:
+        with pytest.raises(AnalysisError):
+            adb.parse_am_start(42)
+
+
+class TestFormat2Wrappers:
+    """New lane wrappers driven through the injectable runner -- never a real adb."""
+
+    def test_read_logcat_argv_pid_and_count(self) -> None:
+        fake = FakeRunner(FakeOutcome(0, LOGCAT_OUTPUT, ""))
+        result = adb.read_logcat("emulator-5554", pid=1234, count=25, runner=fake)
+        assert result.count == 3
+        command = fake.calls[0][0]
+        assert command[:5] == ("adb", "-s", "emulator-5554", "logcat", "-d")
+        assert "25" in command
+        assert "--pid=1234" in command
+
+    def test_read_logcat_without_pid(self) -> None:
+        fake = FakeRunner(FakeOutcome(0, LOGCAT_OUTPUT, ""))
+        adb.read_logcat("emulator-5554", runner=fake)
+        command = fake.calls[0][0]
+        assert not any(str(item).startswith("--pid") for item in command)
+        assert "50" in command
+
+    def test_read_logcat_rejects_bad_pid_and_count(self) -> None:
+        with pytest.raises(AnalysisError, match="pid"):
+            adb.read_logcat("emulator-5554", pid=-1, runner=FakeRunner(FakeOutcome(0, "", "")))
+        with pytest.raises(AnalysisError, match="count"):
+            adb.read_logcat("emulator-5554", count=0, runner=FakeRunner(FakeOutcome(0, "", "")))
+        with pytest.raises(AnalysisError, match="count"):
+            adb.read_logcat("emulator-5554", count=True, runner=FakeRunner(FakeOutcome(0, "", "")))
+
+    def test_read_logcat_adb_failure_is_typed(self) -> None:
+        with pytest.raises(AnalysisError):
+            adb.read_logcat("emulator-5554", runner=FakeRunner(FakeOutcome(1, "", "boom")))
+
+    def test_pull_records_digest_and_size(self, tmp_path: Path) -> None:
+        target = tmp_path / "out" / "pulled.bin"
+        payload = b"device-bytes"
+
+        def writing_runner(command: tuple[str, ...], **kwargs: object) -> FakeOutcome:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+            return FakeOutcome(0, "pulled", "")
+
+        result = adb.pull_file(
+            "emulator-5554", "/data/local/tmp/x", target, runner=writing_runner
+        )
+        assert result.direction == "pull"
+        assert result.size == len(payload)
+        assert result.sha256 == hashlib.sha256(payload).hexdigest()
+        assert result.device_path == "/data/local/tmp/x"
+        assert result.evidence.source == "adb.pull"
+        assert result.evidence.confidence.value == "certain"
+
+    def test_pull_empty_file_warns(self, tmp_path: Path) -> None:
+        target = tmp_path / "empty.bin"
+
+        def writing_runner(command: tuple[str, ...], **kwargs: object) -> FakeOutcome:
+            target.write_bytes(b"")
+            return FakeOutcome(0, "", "")
+
+        result = adb.pull_file("emulator-5554", "/x", target, runner=writing_runner)
+        assert any("is empty" in warning for warning in result.warnings)
+
+    def test_pull_missing_output_is_typed(self, tmp_path: Path) -> None:
+        with pytest.raises(AnalysisError, match="wrote nothing"):
+            adb.pull_file(
+                "emulator-5554",
+                "/x",
+                tmp_path / "missing.bin",
+                runner=FakeRunner(FakeOutcome(0, "", "")),
+            )
+
+    def test_pull_over_budget_is_typed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adb, "MAX_TRANSFER_BYTES", 4)
+        target = tmp_path / "big.bin"
+
+        def writing_runner(command: tuple[str, ...], **kwargs: object) -> FakeOutcome:
+            target.write_bytes(b"x" * 16)
+            return FakeOutcome(0, "", "")
+
+        with pytest.raises(AnalysisError, match="transfer budget"):
+            adb.pull_file("emulator-5554", "/x", target, runner=writing_runner)
+
+    def test_pull_bad_device_path_is_typed(self, tmp_path: Path) -> None:
+        with pytest.raises(AnalysisError, match="newline or NUL"):
+            adb.pull_file(
+                "emulator-5554",
+                "/bad\npath",
+                tmp_path / "out.bin",
+                runner=FakeRunner(FakeOutcome(0, "", "")),
+            )
+
+    def test_push_preflight_digest_and_argv(self, tmp_path: Path) -> None:
+        source = tmp_path / "local.bin"
+        payload = b"host-bytes"
+        source.write_bytes(payload)
+        fake = FakeRunner(FakeOutcome(0, "pushed", ""))
+        result = adb.push_file("emulator-5554", source, "/data/local/tmp/y", runner=fake)
+        assert result.direction == "push"
+        assert result.sha256 == hashlib.sha256(payload).hexdigest()
+        assert result.device_path == "/data/local/tmp/y"
+        assert result.evidence.source == "adb.push"
+        command = fake.calls[0][0]
+        assert command[:3] == ("adb", "-s", "emulator-5554")
+        assert "push" in command
+
+    def test_push_missing_file_is_typed(self, tmp_path: Path) -> None:
+        with pytest.raises(AnalysisError, match="not found"):
+            adb.push_file(
+                "emulator-5554",
+                tmp_path / "nope.bin",
+                "/y",
+                runner=FakeRunner(FakeOutcome(0, "", "")),
+            )
+
+    def test_push_empty_file_is_typed(self, tmp_path: Path) -> None:
+        source = tmp_path / "empty.bin"
+        source.write_bytes(b"")
+        with pytest.raises(AnalysisError, match="is empty"):
+            adb.push_file("emulator-5554", source, "/y", runner=FakeRunner(FakeOutcome(0, "", "")))
+
+    def test_push_over_budget_refused_before_adb(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adb, "MAX_TRANSFER_BYTES", 4)
+        source = tmp_path / "big.bin"
+        source.write_bytes(b"x" * 16)
+        fake = FakeRunner(FakeOutcome(0, "", ""))
+        with pytest.raises(AnalysisError, match="transfer budget"):
+            adb.push_file("emulator-5554", source, "/y", runner=fake)
+        assert fake.calls == []
+
+    def test_start_app_decodes_launch(self) -> None:
+        fake = FakeRunner(FakeOutcome(0, AM_START_OK, ""))
+        result = adb.start_app("emulator-5554", "com.example.app", runner=fake)
+        assert result.serial == "emulator-5554"
+        assert result.package == "com.example.app"
+        assert result.status == "ok"
+        assert result.launch_state == "COLD"
+        assert result.total_time_ms == 412
+        assert result.evidence.source == "adb.start"
+        command = fake.calls[0][0]
+        assert command == (
+            "adb",
+            "-s",
+            "emulator-5554",
+            "shell",
+            "am",
+            "start",
+            "-W",
+            "com.example.app",
+        )
+
+    def test_start_app_status_error_keeps_error_text(self) -> None:
+        fake = FakeRunner(FakeOutcome(0, AM_START_ERROR, ""))
+        result = adb.start_app("emulator-5554", "com.example.app", runner=fake)
+        assert result.status == "error"
+        assert "does not exist" in (result.error or "")
+
+    def test_start_app_status_error_without_error_line_warns(self) -> None:
+        fake = FakeRunner(FakeOutcome(0, "Status: error\n", ""))
+        result = adb.start_app("emulator-5554", "com.example.app", runner=fake)
+        assert any("without an Error line" in warning for warning in result.warnings)
+
+    def test_start_app_bad_package_is_typed(self) -> None:
+        with pytest.raises(AnalysisError, match="characters"):
+            adb.start_app(
+                "emulator-5554", "bad package;rm", runner=FakeRunner(FakeOutcome(0, "", ""))
+            )
+
+    def test_stop_app_succeeds_silently(self) -> None:
+        fake = FakeRunner(FakeOutcome(0, "", ""))
+        result = adb.stop_app("emulator-5554", "com.example.app", runner=fake)
+        assert result.stopped
+        assert result.warnings == []
+        assert result.evidence.source == "adb.stop"
+        assert fake.calls[0][0][-3:] == ("am", "force-stop", "com.example.app")
+
+    def test_stop_app_spoken_output_warns(self) -> None:
+        fake = FakeRunner(FakeOutcome(0, "warning: not running", ""))
+        result = adb.stop_app("emulator-5554", "com.example.app", runner=fake)
+        assert result.stopped
+        assert any("not running" in warning for warning in result.warnings)
+
+    def test_read_setting_value(self) -> None:
+        fake = FakeRunner(FakeOutcome(0, "255\n", ""))
+        result = adb.read_setting("emulator-5554", "system", "screen_brightness", runner=fake)
+        assert result.value == "255"
+        assert result.namespace == "system"
+        assert result.key == "screen_brightness"
+        assert result.warnings == []
+        assert result.evidence.source == "adb.setting"
+        assert fake.calls[0][0][-4:] == ("settings", "get", "system", "screen_brightness")
+
+    def test_read_setting_null_maps_to_none(self) -> None:
+        fake = FakeRunner(FakeOutcome(0, "null\n", ""))
+        result = adb.read_setting("emulator-5554", "global", "missing_key", runner=fake)
+        assert result.value is None
+        assert any("null" in warning for warning in result.warnings)
+
+    def test_read_setting_rejects_bad_namespace(self) -> None:
+        with pytest.raises(AnalysisError, match="settings table"):
+            adb.read_setting(
+                "emulator-5554", "volatile", "k", runner=FakeRunner(FakeOutcome(0, "", ""))
+            )
+
+    def test_parse_am_start_component_without_cmp(self) -> None:
+        result = adb.parse_am_start("Starting: Intent { act=android.intent.action.MAIN }\nStatus: ok\n")
+        assert result.component is None
+        assert result.status == "ok"
+
+    def test_parse_am_start_non_numeric_total_time(self) -> None:
+        result = adb.parse_am_start("Status: ok\nTotalTime: soon\n")
+        assert result.total_time_ms is None
+
+    def test_start_app_package_type_guards(self) -> None:
+        for bad in (None, 123):
+            with pytest.raises(AnalysisError):
+                adb.start_app("emulator-5554", bad, runner=FakeRunner(FakeOutcome(0, "", "")))  # type: ignore[arg-type]
+        with pytest.raises(AnalysisError, match="must not be empty"):
+            adb.start_app("emulator-5554", "   ", runner=FakeRunner(FakeOutcome(0, "", "")))
+        with pytest.raises(AnalysisError, match="at most 256"):
+            adb.start_app(
+                "emulator-5554", "a" * 300, runner=FakeRunner(FakeOutcome(0, "", ""))
+            )
+
+    def test_pull_device_path_type_guards(self, tmp_path: Path) -> None:
+        with pytest.raises(AnalysisError, match="must be a string"):
+            adb.pull_file("emulator-5554", 99, tmp_path / "o", runner=FakeRunner(FakeOutcome(0, "", "")))  # type: ignore[arg-type]
+        with pytest.raises(AnalysisError, match="must not be empty"):
+            adb.pull_file(
+                "emulator-5554", "  ", tmp_path / "o", runner=FakeRunner(FakeOutcome(0, "", ""))
+            )
+        with pytest.raises(AnalysisError, match="characters long"):
+            adb.pull_file(
+                "emulator-5554",
+                "/" + "d" * 600,
+                tmp_path / "o",
+                runner=FakeRunner(FakeOutcome(0, "", "")),
+            )
+
+    def test_push_directory_refused(self, tmp_path: Path) -> None:
+        source_dir = tmp_path / "adir"
+        source_dir.mkdir()
+        with pytest.raises(AnalysisError, match="not a regular file"):
+            adb.push_file(
+                "emulator-5554", source_dir, "/y", runner=FakeRunner(FakeOutcome(0, "", ""))
+            )
+
+
+class TestFormat2Cli:
+    """The six new mobile commands, wired through monkeypatched wrappers."""
+
+    def test_logcat_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def canned(serial: str, *, pid: int | None = None, count: int = 50) -> adb.AdbLogcatResult:
+            assert serial == "emulator-5554"
+            assert pid == 1234
+            assert count == 25
+            return adb.parse_logcat(LOGCAT_OUTPUT)
+
+        monkeypatch.setattr(mobile_cli, "read_logcat", canned)
+        result = runner.invoke(
+            app, ["mobile", "logcat", "emulator-5554", "--pid", "1234", "--count", "25"]
+        )
+        assert result.exit_code == 0
+        text = _output(result)
+        assert "WifiService" in text
+        assert "evidence: adb.logcat" in text
+
+    def test_logcat_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            mobile_cli, "read_logcat", lambda serial, **kw: adb.parse_logcat(LOGCAT_OUTPUT)
+        )
+        result = runner.invoke(app, ["mobile", "logcat", "emulator-5554", "--json"])
+        assert result.exit_code == 0
+        payload = _payload(result)
+        assert payload["count"] == 3
+
+    def test_logcat_error_exits_two(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def refuse(serial: str, **kwargs: object) -> adb.AdbLogcatResult:
+            raise AnalysisError(adb.ADB_MISSING_MESSAGE)
+
+        monkeypatch.setattr(mobile_cli, "read_logcat", refuse)
+        result = runner.invoke(app, ["mobile", "logcat", "emulator-5554"])
+        assert result.exit_code == 2
+
+    def test_pull_json(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def canned_pull(serial: str, device_path: str, out: str) -> adb.AdbFileTransferResult:
+            assert device_path == "/data/local/tmp/x"
+            return adb.AdbFileTransferResult(
+                serial=serial,
+                direction="pull",
+                device_path=device_path,
+                host_path=out,
+                sha256="ab" * 32,
+                size=10,
+                warnings=[],
+                evidence=adb.Evidence(
+                    source=adb.EVIDENCE_PULL, method="pull", confidence=Confidence.CERTAIN
+                ),
+            )
+
+        monkeypatch.setattr(mobile_cli, "pull_file", canned_pull)
+        out = str(tmp_path / "x.bin")
+        result = runner.invoke(
+            app, ["mobile", "pull", "emulator-5554", "/data/local/tmp/x", out, "--json"]
+        )
+        assert result.exit_code == 0
+        payload = _payload(result)
+        assert payload["sha256"] == "ab" * 32
+
+    def test_push_table(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        source = tmp_path / "local.bin"
+        source.write_bytes(b"data")
+
+        def canned_push(serial: str, local: str, device_path: str) -> adb.AdbFileTransferResult:
+            assert device_path == "/data/local/tmp/y"
+            return adb.AdbFileTransferResult(
+                serial=serial,
+                direction="push",
+                device_path=device_path,
+                host_path=local,
+                sha256="cd" * 32,
+                size=4,
+                warnings=[],
+                evidence=adb.Evidence(
+                    source=adb.EVIDENCE_PUSH, method="push", confidence=Confidence.CERTAIN
+                ),
+            )
+
+        monkeypatch.setattr(mobile_cli, "push_file", canned_push)
+        result = runner.invoke(
+            app, ["mobile", "push", "emulator-5554", str(source), "/data/local/tmp/y"]
+        )
+        assert result.exit_code == 0
+        assert "/data/local/tmp/y" in _output(result)
+        assert "evidence: adb.push" in _output(result)
+
+    def test_start_table_and_error_line(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            mobile_cli, "start_app", lambda serial, package: adb.parse_am_start(AM_START_ERROR)
+        )
+        result = runner.invoke(app, ["mobile", "start", "emulator-5554", "com.example.app"])
+        assert result.exit_code == 0
+        assert "does not exist" in _output(result)
+
+    def test_start_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            mobile_cli, "start_app", lambda serial, package: adb.parse_am_start(AM_START_OK)
+        )
+        result = runner.invoke(
+            app, ["mobile", "start", "emulator-5554", "com.example.app", "--json"]
+        )
+        assert result.exit_code == 0
+        payload = _payload(result)
+        assert payload["status"] == "ok"
+        assert payload["launch_state"] == "COLD"
+
+    def test_stop_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def canned_stop(serial: str, package: str) -> adb.AdbStopResult:
+            return adb.stop_app(serial, package, runner=FakeRunner(FakeOutcome(0, "", "")))
+
+        monkeypatch.setattr(mobile_cli, "stop_app", canned_stop)
+        result = runner.invoke(app, ["mobile", "stop", "emulator-5554", "com.example.app"])
+        assert result.exit_code == 0
+        assert "stopped: yes" in _output(result)
+
+    def test_setting_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def canned_setting(serial: str, namespace: str, key: str) -> adb.AdbSettingResult:
+            assert (namespace, key) == ("system", "screen_brightness")
+            return adb.AdbSettingResult(
+                serial=serial,
+                namespace=namespace,
+                key=key,
+                value="255",
+                warnings=[],
+                evidence=adb.Evidence(
+                    source=adb.EVIDENCE_SETTING,
+                    method="settings get",
+                    confidence=Confidence.CERTAIN,
+                ),
+            )
+
+        monkeypatch.setattr(mobile_cli, "read_setting", canned_setting)
+        result = runner.invoke(
+            app, ["mobile", "setting", "emulator-5554", "system", "screen_brightness", "--json"]
+        )
+        assert result.exit_code == 0
+        payload = _payload(result)
+        assert payload["value"] == "255"
+
+    def test_setting_bad_namespace_exits_two(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def refuse(serial: str, namespace: str, key: str) -> adb.AdbSettingResult:
+            raise AnalysisError("namespace 'volatile' is not a settings table")
+
+        monkeypatch.setattr(mobile_cli, "read_setting", refuse)
+        result = runner.invoke(app, ["mobile", "setting", "emulator-5554", "volatile", "k"])
+        assert result.exit_code == 2
+
+
+class TestFormat2Mcp:
+    """The extended ``codevanta_adb`` MCP actions (never a real adb)."""
+
+    def test_logcat_action(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            ext_mobile,
+            "read_logcat",
+            lambda device, pid=None, count=50: adb.parse_logcat(LOGCAT_OUTPUT),
+        )
+        payload = ext_mobile.codevanta_adb("logcat", device="emulator-5554", pid=9, count=10)
+        assert payload["action"] == "logcat"
+        assert payload["count"] == 3
+
+    def test_pull_action(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def canned_pull(device: str, remote: str, local: str) -> adb.AdbFileTransferResult:
+            assert (remote, local) == ("/data/x", "/tmp/x")
+            return adb.AdbFileTransferResult(
+                serial=device,
+                direction="pull",
+                device_path=remote,
+                host_path=local,
+                sha256="00" * 32,
+                size=1,
+                warnings=[],
+                evidence=adb.Evidence(source=adb.EVIDENCE_PULL, method="pull"),
+            )
+
+        monkeypatch.setattr(ext_mobile, "pull_file", canned_pull)
+        payload = ext_mobile.codevanta_adb(
+            "pull", device="emulator-5554", local_path="/tmp/x", remote_path="/data/x"
+        )
+        assert payload["direction"] == "pull"
+
+    def test_push_action(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def canned_push(device: str, local: str, remote: str) -> adb.AdbFileTransferResult:
+            assert (local, remote) == ("/tmp/y", "/data/y")
+            return adb.AdbFileTransferResult(
+                serial=device,
+                direction="push",
+                device_path=remote,
+                host_path=local,
+                sha256="11" * 32,
+                size=1,
+                warnings=[],
+                evidence=adb.Evidence(source=adb.EVIDENCE_PUSH, method="push"),
+            )
+
+        monkeypatch.setattr(ext_mobile, "push_file", canned_push)
+        payload = ext_mobile.codevanta_adb(
+            "push", device="emulator-5554", local_path="/tmp/y", remote_path="/data/y"
+        )
+        assert payload["direction"] == "push"
+
+    def test_start_and_stop_actions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            ext_mobile,
+            "start_app",
+            lambda device, package: adb.parse_am_start(AM_START_OK),
+        )
+        monkeypatch.setattr(
+            ext_mobile,
+            "stop_app",
+            lambda device, package: adb.stop_app(
+                device, package, runner=FakeRunner(FakeOutcome(0, "", ""))
+            ),
+        )
+        started = ext_mobile.codevanta_adb("start", device="d", package="com.example.app")
+        assert started["status"] == "ok"
+        stopped = ext_mobile.codevanta_adb("stop", device="d", package="com.example.app")
+        assert stopped["stopped"]
+
+    def test_setting_action(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            ext_mobile,
+            "read_setting",
+            lambda device, namespace, key: adb.AdbSettingResult(
+                serial=device,
+                namespace=namespace,
+                key=key,
+                value=None,
+                warnings=[],
+                evidence=adb.Evidence(source=adb.EVIDENCE_SETTING, method="settings get"),
+            ),
+        )
+        payload = ext_mobile.codevanta_adb("setting", device="d", namespace="global", key="k")
+        assert payload["value"] is None
+
+    def test_actions_require_their_arguments(self) -> None:
+        with pytest.raises(AnalysisError, match="local_path"):
+            ext_mobile.codevanta_adb("pull", device="d", remote_path="/x")
+        with pytest.raises(AnalysisError, match="remote_path"):
+            ext_mobile.codevanta_adb("push", device="d", local_path="/x")
+        with pytest.raises(AnalysisError, match="package"):
+            ext_mobile.codevanta_adb("start", device="d")
+        with pytest.raises(AnalysisError, match="namespace"):
+            ext_mobile.codevanta_adb("setting", device="d", key="k")
+        with pytest.raises(AnalysisError, match="key"):
+            ext_mobile.codevanta_adb("setting", device="d", namespace="system")
+        with pytest.raises(AnalysisError, match="unknown action"):
+            ext_mobile.codevanta_adb("screencap", device="d")
+
+
 
 
 

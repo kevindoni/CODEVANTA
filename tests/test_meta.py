@@ -1477,6 +1477,485 @@ def test_apk_plain_zip_without_signing_returns_none(tmp_path: Path) -> None:
     assert detect_apk_signing(path) is None
 
 
+# ---- lane-format2: BEAM / IL2CPP / Flutter / HAP / CUDA ---------------------------
+
+
+def _beam_file(path: Path, *, chunks: list[tuple[str, bytes]] | None = None) -> Path:
+    """Build a synthetic FOR1/BEAM IFF container with the given chunks.
+
+    Chunk names are padded to the format's four bytes ("c" becomes ``c\\0\\0\\0``).
+    """
+    body = b"BEAM"
+    for name, data in chunks or []:
+        encoded = name.encode("ascii")[:4].ljust(4, b"\x00")
+        body += encoded + struct.pack(">I", len(data)) + data
+        if len(data) % 2:
+            body += b"\x00"  # IFF pads chunks to even sizes
+    path.write_bytes(b"FOR1" + struct.pack(">I", len(body)) + body)
+    return path
+
+
+def _beam_compile_info(atoms: list[str]) -> bytes:
+    """The old ``c`` chunk layout: u32be count + (u16be length, name) rows."""
+    out = struct.pack(">I", len(atoms))
+    for atom in atoms:
+        encoded = atom.encode("ascii")
+        out += struct.pack(">H", len(encoded)) + encoded
+    return out
+
+
+def _il2cpp_header(version: int, endian: str, pairs: list[tuple[int, int]]) -> bytes:
+    """magic + version + (offset, size) header pairs in the given byte order."""
+    magic = b"\xaf\x1b\xb1\xfa" if endian == "little" else b"\xfa\xb1\x1b\xaf"
+    fmt = "<" if endian == "little" else ">"
+    out = magic + struct.pack(f"{fmt}i", version)
+    for offset, size in pairs:
+        out += struct.pack(f"{fmt}ii", offset, size)
+    return out
+
+
+def _cuda_fatbin(entries: list[tuple[int, int, bytes]]) -> bytes:
+    """fat_elf_header + fat_text entries; ``entries`` is (kind, version, payload)."""
+    body = b""
+    for kind, version, payload in entries:
+        body += struct.pack("<HHIQ", kind, version, 16, len(payload)) + payload
+    head = struct.pack("<IHHQ", 0xBA55ED50, 1, 16, len(body))
+    return head + body
+
+
+class TestBeam:
+    def test_chunk_table_and_compile_info(self, tmp_path: Path) -> None:
+        atoms = _beam_compile_info(["debug_info", "vsn"])
+        chunks = [("AtU8", b"\x00\x00\x00\x01\x00\x05hello"), ("c", atoms), ("ExpT", b"")]
+        path = _beam_file(tmp_path / "m.beam", chunks=chunks)
+        info = binmeta.detect_beam(path)
+        assert info is not None
+        assert info.chunk_count == 3
+        assert [name for name, _ in info.chunks] == ["AtU8", "c", "ExpT"]
+        assert info.compile_info_atoms == ("debug_info", "vsn")
+        assert info.compile_info_decoded
+        assert not info.chunks_truncated
+        assert info.evidence.source == "meta.beam"
+        assert info.evidence.confidence.value == "high"
+
+    def test_no_compile_chunk(self, tmp_path: Path) -> None:
+        path = _beam_file(tmp_path / "m.beam", chunks=[("AtU8", b"\x00\x00\x00\x01\x00\x01a")])
+        info = binmeta.detect_beam(path)
+        assert info is not None
+        assert info.compile_info_atoms == ()
+        assert not info.compile_info_decoded
+
+    def test_undecodable_compile_chunk(self, tmp_path: Path) -> None:
+        path = _beam_file(tmp_path / "m.beam", chunks=[("c", b"\x00\x00\x00\x09\xff\xff")])
+        info = binmeta.detect_beam(path)
+        assert info is not None
+        assert not info.compile_info_decoded
+        assert info.compile_info_atoms == ()
+
+    def test_atom_cap(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(binmeta, "MAX_BEAM_ATOMS", 1)
+        path = _beam_file(tmp_path / "m.beam", chunks=[("c", _beam_compile_info(["a", "b", "c"]))])
+        info = binmeta.detect_beam(path)
+        assert info is not None
+        assert info.compile_info_atoms == ("a",)
+        assert info.compile_info_decoded
+
+    def test_chunk_cap(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(binmeta, "MAX_BEAM_CHUNKS", 2)
+        chunks = [("AtU8", b""), ("c", _beam_compile_info(["a"])), ("ExpT", b""), ("LocT", b"")]
+        path = _beam_file(tmp_path / "m.beam", chunks=chunks)
+        info = binmeta.detect_beam(path)
+        assert info is not None
+        assert info.chunk_count == 2
+        assert info.chunks_truncated
+        assert "chunk limit 2" in (info.evidence.detail or "")
+
+    def test_garbage_is_none(self, tmp_path: Path) -> None:
+        p = tmp_path / "not.beam"
+        p.write_bytes(b"RIFX" + b"\x00" * 40)
+        assert binmeta.detect_beam(p) is None
+
+    def test_tiny_file_is_none(self, tmp_path: Path) -> None:
+        p = tmp_path / "tiny.beam"
+        p.write_bytes(b"FOR1\x00")
+        assert binmeta.detect_beam(p) is None
+
+    def test_chunk_overrun_is_typed(self, tmp_path: Path) -> None:
+        path = _beam_file(tmp_path / "m.beam", chunks=[("ExpT", b"")])
+        blob = bytearray(path.read_bytes())
+        blob[12 + 4 : 12 + 8] = struct.pack(">I", 9999)  # inflate ExpT's size
+        path.write_bytes(bytes(blob))
+        with pytest.raises(AnalysisError, match="overrunning the IFF form"):
+            binmeta.detect_beam(path)
+
+    def test_nonprintable_chunk_name_is_typed(self, tmp_path: Path) -> None:
+        path = _beam_file(tmp_path / "m.beam", chunks=[("ExpT", b"")])
+        blob = bytearray(path.read_bytes())
+        blob[12:16] = b"\x01\x02\x03\x04"
+        path.write_bytes(bytes(blob))
+        with pytest.raises(AnalysisError, match="not printable ASCII"):
+            binmeta.detect_beam(path)
+
+    def test_inspect_metadata_kind(self, tmp_path: Path) -> None:
+        path = _beam_file(tmp_path / "m.beam", chunks=[("ExpT", b"")])
+        assert binmeta.inspect_metadata(path).kind == "erlang-beam"
+
+
+def _il2cpp_pairs() -> list[tuple[int, int]]:
+    return [
+        (256, 128),   # string literals: 16 entries
+        (512, 8),     # string literal data
+        (768, 32),    # string blob
+        (1024, 72),   # events: 3 x 24
+        (2048, 40),   # properties: 2 x 20
+        (3072, 24),   # methods (bytes)
+        (4096, 60),   # parameters: 5 x 12
+        (5000, 36),
+        (6000, 128),
+        (7000, 48),
+        (8000, 48),   # fields: 4 x 12
+        (9000, 320),  # type definitions: floor 5
+    ]
+
+
+class TestIl2Cpp:
+    def test_header_le_known_version(self, tmp_path: Path) -> None:
+        blob = _il2cpp_header(31, "little", _il2cpp_pairs()) + b"\x00" * 9600
+        path = tmp_path / "global-metadata.dat"
+        path.write_bytes(blob)
+        info = binmeta.detect_il2cpp(path)
+        assert info is not None
+        assert info.version == 31
+        assert info.known_version
+        assert info.endian == "little"
+        assert info.string_count == 16
+        assert info.string_table_bytes == 32
+        assert info.event_count == 3
+        assert info.property_count == 2
+        assert info.param_count == 5
+        assert info.field_count == 4
+        assert info.type_count_min == 5
+        assert info.evidence.source == "meta.il2cpp"
+        assert info.evidence.confidence.value == "high"
+
+    def test_header_be_mirrored(self, tmp_path: Path) -> None:
+        blob = _il2cpp_header(27, "big", _il2cpp_pairs()) + b"\x00" * 9600
+        path = tmp_path / "metadata-be.dat"
+        path.write_bytes(blob)
+        info = binmeta.detect_il2cpp(path)
+        assert info is not None
+        assert info.endian == "big"
+        assert info.version == 27
+        assert info.event_count == 3
+
+    def test_unknown_version_warns_but_parses(self, tmp_path: Path) -> None:
+        blob = _il2cpp_header(30, "little", _il2cpp_pairs()) + b"\x00" * 9600
+        path = tmp_path / "v30.dat"
+        path.write_bytes(blob)
+        info = binmeta.detect_il2cpp(path)
+        assert info is not None
+        assert info.version == 30
+        assert not info.known_version
+        assert "unknown" in (info.evidence.detail or "")
+
+    def test_zero_padded_tail_stops_the_walk(self, tmp_path: Path) -> None:
+        blob = _il2cpp_header(31, "little", _il2cpp_pairs()) + b"\x00" * 9600
+        path = tmp_path / "tail.dat"
+        path.write_bytes(blob)
+        info = binmeta.detect_il2cpp(path)
+        assert info is not None
+        assert len(info.table_pairs) == 12
+        assert not info.tables_truncated
+
+    def test_table_cap(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(binmeta, "MAX_IL2CPP_TABLES", 4)
+        blob = _il2cpp_header(31, "little", _il2cpp_pairs()) + b"\x00" * 9600
+        path = tmp_path / "cap.dat"
+        path.write_bytes(blob)
+        info = binmeta.detect_il2cpp(path)
+        assert info is not None
+        assert info.tables_truncated
+        assert len(info.table_pairs) == 4
+
+    def test_garbage_is_none(self, tmp_path: Path) -> None:
+        p = tmp_path / "not-metadata.dat"
+        p.write_bytes(b"\x00\x00\x00\x00\x00\x00\x00\x00" * 4)
+        assert binmeta.detect_il2cpp(p) is None
+
+    def test_implausible_version_is_typed(self, tmp_path: Path) -> None:
+        blob = _il2cpp_header(4000, "little", _il2cpp_pairs())
+        path = tmp_path / "bad.dat"
+        path.write_bytes(blob)
+        with pytest.raises(AnalysisError, match="implausible IL2CPP version"):
+            binmeta.detect_il2cpp(path)
+
+    def test_no_plausible_pairs_is_typed(self, tmp_path: Path) -> None:
+        blob = _il2cpp_header(31, "little", [(0, 0), (0, 0)])
+        path = tmp_path / "empty.dat"
+        path.write_bytes(blob)
+        with pytest.raises(AnalysisError, match="no plausible table pairs"):
+            binmeta.detect_il2cpp(path)
+
+    def test_inspect_metadata_kind(self, tmp_path: Path) -> None:
+        blob = _il2cpp_header(31, "little", _il2cpp_pairs()) + b"\x00" * 9600
+        path = tmp_path / "global-metadata.dat"
+        path.write_bytes(blob)
+        assert binmeta.inspect_metadata(path).kind == "il2cpp-metadata"
+
+
+class TestFlutter:
+    def test_both_kinds_with_offsets(self, tmp_path: Path) -> None:
+        p = tmp_path / "libflutter.so"
+        p.write_bytes(
+            b"junk"
+            + b"kDartVmSnapshotData"
+            + b"pad"
+            + b"kDartIsolateSnapshotData"
+            + b"tail"
+        )
+        info = binmeta.detect_flutter(p)
+        assert info is not None
+        assert info.kinds == ("vm", "isolate")
+        assert info.vm_offsets == (4,)
+        assert info.isolate_offsets == (26,)
+        assert not info.scan_truncated
+        assert info.evidence.source == "meta.flutter"
+        assert info.evidence.confidence.value == "high"
+
+    def test_vm_only(self, tmp_path: Path) -> None:
+        p = tmp_path / "vm_blob"
+        p.write_bytes(b"kDartVmSnapshotData")
+        info = binmeta.detect_flutter(p)
+        assert info is not None
+        assert info.kinds == ("vm",)
+        assert info.isolate_offsets == ()
+
+    def test_no_magic_is_none(self, tmp_path: Path) -> None:
+        p = tmp_path / "plain.so"
+        p.write_bytes(b"\x7fELF" + b"\x00" * 64)
+        assert binmeta.detect_flutter(p) is None
+
+    def test_offsets_capped_at_four(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(binmeta, "MAX_FLUTTER_OFFSETS", 4)
+        p = tmp_path / "noisy.so"
+        p.write_bytes(b"kDartVmSnapshotData" * 6)
+        info = binmeta.detect_flutter(p)
+        assert info is not None
+        assert len(info.vm_offsets) == 4
+        assert info.scan_truncated
+        assert "limit 4" in (info.evidence.detail or "")
+
+    def test_inspect_metadata_kind(self, tmp_path: Path) -> None:
+        p = tmp_path / "libapp.so"
+        p.write_bytes(b"kDartIsolateSnapshotData" + b"\x00" * 8)
+        assert binmeta.inspect_metadata(p).kind == "flutter-dart-aot"
+
+
+class TestHap:
+    def test_pack_info_summary_and_modules(self, tmp_path: Path) -> None:
+        path = tmp_path / "entry.hap"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(
+                "pack.info",
+                json.dumps(
+                    {
+                        "summary": {
+                            "app": {"name": "Demo"},
+                            "modules": [
+                                {"moduleName": "entry", "deviceTypes": ["phone"]},
+                                {"moduleName": "feature1", "deviceTypes": ["phone"]},
+                            ],
+                        }
+                    }
+                ),
+            )
+            archive.writestr("ets/module.so", b"payload")
+        info = binmeta.detect_hap(path)
+        assert info is not None
+        assert info.entry_count == 2
+        assert "pack.info" in info.entry_names
+        assert not info.entries_truncated
+        assert info.module_count == 2
+        assert info.pack_info_decoded
+        assert info.pack_info_summary is not None
+        assert '"modules"' in info.pack_info_summary
+        assert info.evidence.source == "meta.hap"
+        assert info.evidence.confidence.value == "high"
+
+    def test_pack_info_not_json(self, tmp_path: Path) -> None:
+        path = tmp_path / "raw.hap"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("pack.info", b"\xff\xfe not json")
+        info = binmeta.detect_hap(path)
+        assert info is not None
+        assert not info.pack_info_decoded
+        assert info.module_count is None
+
+    def test_zip_without_pack_info_is_none(self, tmp_path: Path) -> None:
+        path = tmp_path / "plain.zip"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("other.txt", "x")
+        assert binmeta.detect_hap(path) is None
+
+    def test_non_zip_is_none(self, tmp_path: Path) -> None:
+        p = tmp_path / "blob.bin"
+        p.write_bytes(b"MZ" + b"\x00" * 64)
+        assert binmeta.detect_hap(p) is None
+
+    def test_broken_zip_is_typed(self, tmp_path: Path) -> None:
+        path = tmp_path / "broken.hap"
+        path.write_bytes(b"PK\x03\x04truncated-junk")
+        with pytest.raises(AnalysisError, match="malformed zip"):
+            binmeta.detect_hap(path)
+
+    def test_inspect_metadata_kind(self, tmp_path: Path) -> None:
+        path = tmp_path / "entry.hap"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("pack.info", '{"summary":{"modules":[]}}')
+        assert binmeta.inspect_metadata(path).kind == "harmonyos-hap"
+
+
+class TestCuda:
+    def test_elf_and_ptx_entries(self, tmp_path: Path) -> None:
+        path = tmp_path / "kernel.fatbin"
+        path.write_bytes(_cuda_fatbin([(1, 1, b"\x7fELF-payload"), (2, 1, b"ptx-payload")]))
+        info = binmeta.detect_cuda_fatbin(path)
+        assert info is not None
+        assert info.version == 1
+        assert info.header_size == 16
+        assert info.entry_count == 2
+        assert info.elf_count == 1
+        assert info.ptx_count == 1
+        assert info.kinds == ("elf", "ptx")
+        assert not info.entries_truncated
+        assert info.evidence.source == "meta.cuda"
+        assert info.evidence.confidence.value == "high"
+
+    def test_unknown_kind_labelled(self, tmp_path: Path) -> None:
+        path = tmp_path / "odd.fatbin"
+        path.write_bytes(_cuda_fatbin([(7, 2, b"data")]))
+        info = binmeta.detect_cuda_fatbin(path)
+        assert info is not None
+        assert info.kinds == ("kind-7",)
+        assert info.elf_count == 0
+
+    def test_zero_version_warns(self, tmp_path: Path) -> None:
+        path = tmp_path / "zero.fatbin"
+        path.write_bytes(_cuda_fatbin([(1, 0, b"data")]))
+        info = binmeta.detect_cuda_fatbin(path)
+        assert info is not None
+        assert "version 0" in (info.evidence.detail or "")
+
+    def test_garbage_is_none(self, tmp_path: Path) -> None:
+        p = tmp_path / "not.fatbin"
+        p.write_bytes(b"\x50\xed\x55\x00" + b"\x00" * 32)
+        assert binmeta.detect_cuda_fatbin(p) is None
+
+    def test_truncated_header_is_typed(self, tmp_path: Path) -> None:
+        p = tmp_path / "short.fatbin"
+        p.write_bytes(struct.pack("<I", 0xBA55ED50) + b"\x01\x00")
+        with pytest.raises(AnalysisError, match="truncated fatbin header"):
+            binmeta.detect_cuda_fatbin(p)
+
+    def test_small_header_size_is_typed(self, tmp_path: Path) -> None:
+        blob = struct.pack("<IHHQ", 0xBA55ED50, 1, 8, 0) + b"\x00" * 32
+        p = tmp_path / "small.fatbin"
+        p.write_bytes(blob)
+        with pytest.raises(AnalysisError, match="below the 16-byte minimum"):
+            binmeta.detect_cuda_fatbin(p)
+
+    def test_entry_overrun_is_typed(self, tmp_path: Path) -> None:
+        blob = struct.pack("<IHHQ", 0xBA55ED50, 1, 16, 0)
+        blob += struct.pack("<HHIQ", 1, 1, 16, 4096) + b"\x00" * 4
+        p = tmp_path / "over.fatbin"
+        p.write_bytes(blob)
+        with pytest.raises(AnalysisError, match="overruns the container"):
+            binmeta.detect_cuda_fatbin(p)
+
+    def test_entry_cap(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(binmeta, "MAX_CUDA_ENTRIES", 2)
+        path = tmp_path / "many.fatbin"
+        path.write_bytes(_cuda_fatbin([(1, 1, b"a"), (2, 1, b"b"), (1, 1, b"c"), (2, 1, b"d")]))
+        info = binmeta.detect_cuda_fatbin(path)
+        assert info is not None
+        assert info.entry_count == 2
+        assert info.entries_truncated
+        assert "entry limit 2" in (info.evidence.detail or "")
+
+    def test_inspect_metadata_kind(self, tmp_path: Path) -> None:
+        path = tmp_path / "kernel.fatbin"
+        path.write_bytes(_cuda_fatbin([(1, 1, b"\x7fELF")]))
+        assert binmeta.inspect_metadata(path).kind == "cuda-fatbin"
+
+    def test_beam_without_chunks_is_typed(self, tmp_path: Path) -> None:
+        path = _beam_file(tmp_path / "bare.beam", chunks=[])
+        with pytest.raises(AnalysisError, match="no chunk table"):
+            binmeta.detect_beam(path)
+
+    def test_beam_compile_info_truncated_mid_atom(self, tmp_path: Path) -> None:
+        path = _beam_file(tmp_path / "m.beam", chunks=[("c", b"\x00\x00\x00\x02\x00\x05he")])
+        info = binmeta.detect_beam(path)
+        assert info is not None
+        assert not info.compile_info_decoded
+        assert info.compile_info_atoms == ()
+
+    def test_beam_compile_info_atom_overruns_chunk(self, tmp_path: Path) -> None:
+        path = _beam_file(tmp_path / "m.beam", chunks=[("c", b"\x00\x00\x00\x01\x00\x10abc")])
+        info = binmeta.detect_beam(path)
+        assert info is not None
+        assert not info.compile_info_decoded
+
+    def test_hap_undecodable_zip_errors_are_typed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "locked.hap"
+        path.write_bytes(b"PK\x03\x04" + b"\x00" * 64)
+
+        def refuse(target: object) -> object:
+            raise OSError("boom")
+
+        monkeypatch.setattr(binmeta.zipfile, "ZipFile", refuse)
+        with pytest.raises(AnalysisError, match="cannot read"):
+            binmeta.detect_hap(path)
+
+    def test_hap_pack_info_json_array(self, tmp_path: Path) -> None:
+        path = tmp_path / "list.hap"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("pack.info", '["not", "an", "object"]')
+        info = binmeta.detect_hap(path)
+        assert info is not None
+        assert not info.pack_info_decoded
+        assert "not" in (info.pack_info_summary or "")
+
+    def test_cuda_truncated_container_header(self, tmp_path: Path) -> None:
+        p = tmp_path / "tiny.fatbin"
+        p.write_bytes(struct.pack("<IHH", 0xBA55ED50, 1, 16))
+        with pytest.raises(AnalysisError, match="truncated fatbin header"):
+            binmeta.detect_cuda_fatbin(p)
+
+    def test_cuda_payload_without_entries_is_typed(self, tmp_path: Path) -> None:
+        blob = struct.pack("<IHHQ", 0xBA55ED50, 1, 16, 512) + b"\x00" * 64
+        p = tmp_path / "empty.fatbin"
+        p.write_bytes(blob)
+        with pytest.raises(AnalysisError, match="declares header size"):
+            binmeta.detect_cuda_fatbin(p)
+
+    def test_hap_entry_cap(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(binmeta, "MAX_HAP_ENTRIES", 3)
+        path = tmp_path / "many.hap"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("pack.info", '{"summary":{"modules":[]}}')
+            for index in range(6):
+                archive.writestr(f"m{index}", "x")
+        info = binmeta.detect_hap(path)
+        assert info is not None
+        assert info.entry_count == 7
+        assert len(info.entry_names) == 3
+        assert info.entries_truncated
+
+
 
 
 

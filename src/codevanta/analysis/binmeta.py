@@ -17,6 +17,18 @@ detector per format (each returns ``None`` when the format does not match):
   list with on/off/removed states (32).
 * ELF notes (``PT_NOTE`` + ``SHT_NOTE``, 32) and Linux kernel-module
   ``.modinfo`` keys (64, ``ET_REL``).
+* Erlang BEAM (``FOR1``/``BEAM`` IFF container): bounded chunk table
+  (32) and compile-info atoms when the ``c`` chunk parses.
+* Unity IL2CPP global metadata (magic ``0xFAB11BAF``, versions 24/27/
+  29/31/39): native-endian header table walk with derived string, event,
+  field and type counts.
+* Flutter/Dart AOT snapshots (``kDartVmSnapshotData`` /
+  ``kDartIsolateSnapshotData`` magic strings): snapshot kinds present
+  with bounded offsets.
+* HarmonyOS HAP (a ZIP carrying ``pack.info``): entry count, bounded
+  ``pack.info`` summary and module count.
+* CUDA fatbin (magic ``0xBA55ED50``): version, header/data size and the
+  bounded ELF/PTX entry walk.
 * Desktop app classification (bounded walk: 2000 files, depth 4):
   Unity, IL2CPP, Unreal (``.pak``), Electron (``app.asar``), .NET
   (CLR header directory entry).
@@ -62,6 +74,19 @@ MAX_STRING_BYTES = 4096
 #: Never read more than this many bytes from any single file.
 MAX_FILE_BYTES = 256 * 1024 * 1024
 READ_CHUNK = 1 << 20
+#: BEAM chunks kept from one IFF chunk table (bounded work).
+MAX_BEAM_CHUNKS = 32
+#: BEAM compile-info atoms kept from one ``c`` chunk (bounded work).
+MAX_BEAM_ATOMS = 16
+#: IL2CPP header (offset, size) table pairs kept (bounded work).
+MAX_IL2CPP_TABLES = 32
+#: Flutter snapshot magic hits kept per snapshot kind (bounded work).
+MAX_FLUTTER_OFFSETS = 4
+#: HAP zip entry names and JSON summary characters kept (bounded work).
+MAX_HAP_ENTRIES = 64
+MAX_HAP_INFO_CHARS = 2000
+#: CUDA fatbin ELF/PTX entries walked from one container (bounded work).
+MAX_CUDA_ENTRIES = 8
 
 # ---- format constants -------------------------------------------------------
 GO_BUILDINFO_MAGIC = b"\xff Go buildinf:"
@@ -113,6 +138,47 @@ ELECTRON_FUSE_NAMES_V1: tuple[str, ...] = (
 ELECTRON_FUSE_STATES: dict[int, str] = {0x30: "off", 0x31: "on", 0x72: "removed"}
 CARGO_AUDIT_NOTE_OWNERS = ("AUDITABLE", "rust-audit")
 CARGO_AUDIT_SECTION = ".dep-v0"
+#: IL2CPP global-metadata sanity word. On disk it is little-endian
+#: (``af 1b b1 fa``); big-endian writers (``fa b1 1b af``) are accepted too
+#: and switch the whole header walk to big-endian ints.
+IL2CPP_MAGIC = 0xFAB11BAF
+#: IL2CPP metadata families this detector can name table positions for.
+IL2CPP_KNOWN_VERSIONS = (24, 27, 29, 31, 39)
+#: One Il2CppStringLiteral record: ``(uint32_t length, uint32_t dataIndex)``.
+IL2CPP_STRING_LITERAL_STRIDE = 8
+#: One Il2CppEventDefinition record: name, type, add, remove, raise, token.
+IL2CPP_EVENT_STRIDE = 24
+#: One Il2CppFieldDefinition record: name, type, token.
+IL2CPP_FIELD_STRIDE = 12
+#: One Il2CppParameterDefinition record: name, token, type.
+IL2CPP_PARAM_STRIDE = 12
+#: Lower bound on one Il2Cpp type-definition record: the fixed index/flags/
+#: start fields every family keeps. Dividing the type-table size by this
+#: yields an entry-count floor, never an over-count.
+IL2CPP_TYPE_STRIDE_FLOOR = 64
+#: Header pair indexes shared by the v24.1-v39 metadata families
+#: (0-based, after the magic+version pair). ``parameters`` is family-specific
+#: in the wild and is therefore only counted for the v24 layout this module
+#: documents; the remaining tables are positionally stable.
+IL2CPP_TABLE_POSITIONS: dict[str, int] = {
+    "string_literals": 0,
+    "string_blob": 2,
+    "events": 3,
+    "properties": 4,
+    "methods": 5,
+    "parameters": 6,
+    "fields": 10,
+    "type_definitions": 11,
+}
+#: Flutter/Dart AOT snapshot magic strings (VM and isolate snapshots).
+FLUTTER_VM_MAGIC = b"kDartVmSnapshotData"
+FLUTTER_ISOLATE_MAGIC = b"kDartIsolateSnapshotData"
+#: HarmonyOS HAP package descriptor entry.
+HAP_PACK_INFO = "pack.info"
+#: CUDA fatbin container magic, little-endian on disk.
+CUDA_FATBIN_MAGIC = 0xBA55ED50
+#: CUDA fatbin entry kinds (fat_text_header ``kind``).
+CUDA_ENTRY_KINDS: dict[int, str] = {1: "elf", 2: "ptx"}
 
 # ---- typed results ----------------------------------------------------------
 
@@ -311,6 +377,138 @@ class DesktopAppInfo:
 
 
 @dataclass(frozen=True)
+class BeamInfo:
+    """Erlang BEAM IFF container: bounded chunk table plus compile-info atoms."""
+
+    iff_size: int
+    chunk_count: int
+    chunks: tuple[tuple[str, int], ...]
+    chunks_truncated: bool
+    compile_info_atoms: tuple[str, ...]
+    compile_info_decoded: bool
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "iff_size": self.iff_size,
+            "chunk_count": self.chunk_count,
+            "chunks": [{"name": name, "size": size} for name, size in self.chunks],
+            "chunks_truncated": self.chunks_truncated,
+            "compile_info_atoms": list(self.compile_info_atoms),
+            "compile_info_decoded": self.compile_info_decoded,
+        }
+
+
+@dataclass(frozen=True)
+class Il2CppInfo:
+    """Unity IL2CPP global-metadata header: bounded table walk and counts."""
+
+    version: int
+    known_version: bool
+    endian: str
+    string_count: int | None
+    string_table_bytes: int | None
+    event_count: int | None
+    property_count: int | None
+    method_table_bytes: int | None
+    param_count: int | None
+    field_count: int | None
+    type_count_min: int | None
+    table_pairs: tuple[tuple[int, int, int], ...]
+    tables_truncated: bool
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "known_version": self.known_version,
+            "endian": self.endian,
+            "string_count": self.string_count,
+            "string_table_bytes": self.string_table_bytes,
+            "event_count": self.event_count,
+            "property_count": self.property_count,
+            "method_table_bytes": self.method_table_bytes,
+            "param_count": self.param_count,
+            "field_count": self.field_count,
+            "type_count_min": self.type_count_min,
+            "table_pairs": [
+                {"index": index, "offset": offset, "bytes": size}
+                for index, offset, size in self.table_pairs
+            ],
+            "tables_truncated": self.tables_truncated,
+        }
+
+
+@dataclass(frozen=True)
+class FlutterSnapshotInfo:
+    """Flutter/Dart AOT snapshot magics found in one binary blob."""
+
+    kinds: tuple[str, ...]
+    vm_offsets: tuple[int, ...]
+    isolate_offsets: tuple[int, ...]
+    scan_truncated: bool
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kinds": list(self.kinds),
+            "vm_offsets": list(self.vm_offsets),
+            "isolate_offsets": list(self.isolate_offsets),
+            "scan_truncated": self.scan_truncated,
+        }
+
+
+@dataclass(frozen=True)
+class HapInfo:
+    """HarmonyOS HAP: a zip carrying ``pack.info``."""
+
+    entry_count: int
+    entry_names: tuple[str, ...]
+    entries_truncated: bool
+    module_count: int | None
+    pack_info_summary: str | None
+    pack_info_decoded: bool
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entry_count": self.entry_count,
+            "entry_names": list(self.entry_names),
+            "entries_truncated": self.entries_truncated,
+            "module_count": self.module_count,
+            "pack_info_summary": self.pack_info_summary,
+            "pack_info_decoded": self.pack_info_decoded,
+        }
+
+
+@dataclass(frozen=True)
+class CudaFatbinInfo:
+    """CUDA fatbin container: header fields plus the bounded entry walk."""
+
+    version: int
+    header_size: int
+    data_size: int
+    entry_count: int
+    elf_count: int
+    ptx_count: int
+    kinds: tuple[str, ...]
+    entries_truncated: bool
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "header_size": self.header_size,
+            "data_size": self.data_size,
+            "entry_count": self.entry_count,
+            "elf_count": self.elf_count,
+            "ptx_count": self.ptx_count,
+            "kinds": list(self.kinds),
+            "entries_truncated": self.entries_truncated,
+        }
+
+
+@dataclass(frozen=True)
 class MetadataReport:
     """Auto-detected format metadata for one path."""
 
@@ -359,6 +557,22 @@ def _read_slice(handle: Any, offset: int, length: int) -> bytes:
         return b""
     handle.seek(offset)
     return handle.read(length)
+
+
+def _note(warnings: list[str], message: str) -> None:
+    """Append one bounded advisory to a detector's warning list."""
+    if len(warnings) < 8:
+        warnings.append(message)
+
+
+def _join_notes(detail: str, warnings: list[str]) -> str:
+    """Fold up to two detector advisories into one evidence detail line."""
+    if not warnings:
+        return detail
+    extra = "; ".join(warnings[:2])
+    if len(warnings) > 2:
+        extra += f"; +{len(warnings) - 2} more"
+    return f"{detail}; {extra}"
 
 
 def _hex_preview(data: bytes, limit: int = 32) -> str:
@@ -1441,11 +1655,480 @@ def detect_desktop_app(path: str | Path) -> DesktopAppInfo | None:
     )
 
 
+# ---- Erlang BEAM (IFF container) ---------------------------------------------
+
+
+def _beam_parse_compile_info(data: bytes, warnings: list[str]) -> tuple[tuple[str, ...], bool]:
+    """Decode the deprecated ``c`` chunk: atom-count + (u16 length, name) rows.
+
+    The old compile-info chunk stores its atoms in the same shape as the
+    ``Atom`` chunk (a big-endian count followed by length-prefixed names).
+    Anything that does not conform is reported as ``decoded=False`` with a
+    warning rather than a hard error -- the chunk is optional and deprecated.
+    """
+    if len(data) < 4:
+        return (), False
+    count = int(struct.unpack_from(">I", data, 0)[0])
+    cursor = 4
+    atoms: list[str] = []
+    for _ in range(min(count, MAX_BEAM_ATOMS)):
+        if cursor + 2 > len(data):
+            _note(warnings, "compile-info chunk truncated mid-atom")
+            return tuple(atoms), False
+        length = struct.unpack_from(">H", data, cursor)[0]
+        cursor += 2
+        if cursor + length > len(data):
+            _note(warnings, "compile-info atom overruns its chunk")
+            return tuple(atoms), False
+        raw = data[cursor : cursor + length]
+        cursor += length
+        if not raw or not all(0x20 <= byte < 0x7F for byte in raw):
+            _note(warnings, "compile-info atom is not printable ASCII")
+            return tuple(atoms), False
+        atoms.append(raw.decode("ascii"))
+    if count > MAX_BEAM_ATOMS:
+        _note(warnings, f"compile-info atom limit {MAX_BEAM_ATOMS} reached; further atoms dropped")
+    return tuple(atoms), True
+
+
+def detect_beam(path: str | Path) -> BeamInfo | None:
+    """Inspect an Erlang BEAM file (``FOR1`` + ``BEAM`` IFF). ``None`` when not BEAM."""
+    p = Path(path)
+    if p.is_dir():
+        return None
+    size = _checked_size(p)
+    with _open_file(p) as handle:
+        head = _read_slice(handle, 0, 12)
+        if len(head) < 12:
+            return None
+        if head[:4] != b"FOR1" or head[8:12] != b"BEAM":
+            return None
+        iff_size = int(struct.unpack_from(">I", head, 4)[0])
+        if iff_size < 4:
+            raise AnalysisError(f"BEAM IFF size {iff_size} is below the 'BEAM' form type")
+        end = min(size, 8 + iff_size)
+        cursor = 12
+        chunks: list[tuple[str, int]] = []
+        warnings: list[str] = []
+        truncated = False
+        compile_atoms: tuple[str, ...] = ()
+        compile_decoded = False
+        while cursor + 8 <= size and cursor < end:
+            if len(chunks) >= MAX_BEAM_CHUNKS:
+                truncated = True
+                _note(warnings, f"chunk limit {MAX_BEAM_CHUNKS} reached; further chunks dropped")
+                break
+            block = _read_slice(handle, cursor, 8)
+            if len(block) < 8:
+                break
+            name = block[:4]
+            length = int(struct.unpack_from(">I", block, 4)[0])
+            # Short chunk names are NUL-padded to four bytes ("c", 0, 0, 0).
+            label_raw = name.rstrip(b"\x00")
+            if not label_raw or not all(0x20 <= byte < 0x7F for byte in label_raw):
+                raise AnalysisError(
+                    f"BEAM chunk name {name.hex()} at offset {cursor} is not printable ASCII"
+                )
+            if cursor + 8 + length > end:
+                raise AnalysisError(
+                    f"BEAM chunk {label_raw.decode('ascii')!r} at offset {cursor} declares "
+                    f"{length} bytes, overrunning the IFF form (size {iff_size})"
+                )
+            label = label_raw.decode("ascii")
+            chunks.append((label, length))
+            if label == "c" and length > 0:
+                compile_atoms, compile_decoded = _beam_parse_compile_info(
+                    _read_slice(handle, cursor + 8, min(length, MAX_SECTION_READ)), warnings
+                )
+            cursor += 8 + length + (length & 1)
+        if not chunks:
+            raise AnalysisError("BEAM file carries no chunk table")
+        evidence = Evidence(
+            source="meta.beam",
+            method="iff-chunk-table",
+            confidence=Confidence.HIGH,
+            detail=_join_notes(f"{len(chunks)} chunks; form size {iff_size}", warnings),
+            extra={"chunks": ",".join(name for name, _ in chunks[:8])},
+        )
+        return BeamInfo(
+            iff_size=iff_size,
+            chunk_count=len(chunks),
+            chunks=tuple(chunks),
+            chunks_truncated=truncated,
+            compile_info_atoms=compile_atoms,
+            compile_info_decoded=compile_decoded,
+            evidence=evidence,
+        )
+
+
+# ---- Unity IL2CPP global metadata --------------------------------------------
+
+
+def _il2cpp_plausible(offset: int, length: int, size: int) -> bool:
+    """One header (offset, size) pair is plausible when it lands inside the file.
+
+    Offset 0 is never valid -- the file opens with the header itself -- so
+    zero-padded header tails stop the walk instead of being counted as empty
+    tables.
+    """
+    return 0 < offset < size and 0 <= length and offset + length <= size
+
+
+def detect_il2cpp(path: str | Path) -> Il2CppInfo | None:
+    """Inspect Unity IL2CPP ``global-metadata.dat``. ``None`` when not IL2CPP.
+
+    The header opens with the ``0xFAB11BAF`` sanity word and a version int at
+    offset 4 (families 24/27/29/31/39 are known), then a table of
+    ``(offset, size)`` int pairs. Byte order follows whichever encoding the
+    magic arrived in (little-endian in every file Unity ships; big-endian is
+    accepted for the mirrored variant). Counts derive from the documented
+    record strides; the type count is a floor because the exact
+    type-definition stride varies inside one family, and the parameter count
+    follows the documented v24.1+ family layout.
+    """
+    p = Path(path)
+    if p.is_dir():
+        return None
+    size = _checked_size(p)
+    with _open_file(p) as handle:
+        head = _read_slice(handle, 0, 16)
+    if len(head) < 8:
+        return None
+    le_magic = struct.unpack_from("<I", head, 0)[0]
+    be_magic = struct.unpack_from(">I", head, 0)[0]
+    if le_magic == IL2CPP_MAGIC:
+        endian = "little"
+    elif be_magic == IL2CPP_MAGIC:
+        endian = "big"
+    else:
+        return None
+    fmt = "<" if endian == "little" else ">"
+    version = int(struct.unpack_from(f"{fmt}i", head, 4)[0])
+    if version <= 0 or version > 1000:
+        raise AnalysisError(f"implausible IL2CPP version {version}")
+    known = version in IL2CPP_KNOWN_VERSIONS
+    with _open_file(p) as handle:
+        window = _read_slice(handle, 8, MAX_IL2CPP_TABLES * 8)
+    warnings: list[str] = []
+    pairs: list[tuple[int, int, int]] = []
+    tables_truncated = False
+    for index in range(len(window) // 8):
+        offset, length = struct.unpack_from(f"{fmt}ii", window, index * 8)
+        if not _il2cpp_plausible(offset, length, size):
+            _note(warnings, f"header pair {index} is not plausible; stopping the table walk")
+            break
+        pairs.append((index, offset, length))
+        if len(pairs) >= MAX_IL2CPP_TABLES:
+            tables_truncated = True
+            _note(warnings, f"table limit {MAX_IL2CPP_TABLES} reached; further pairs dropped")
+            break
+    if not pairs:
+        raise AnalysisError("IL2CPP header carries no plausible table pairs")
+    by_name = {
+        name: pairs[position]
+        for name, position in IL2CPP_TABLE_POSITIONS.items()
+        if position < len(pairs)
+    }
+    string_literals = by_name.get("string_literals")
+    string_blob = by_name.get("string_blob")
+    events = by_name.get("events")
+    properties = by_name.get("properties")
+    methods = by_name.get("methods")
+    params = by_name.get("parameters")
+    fields = by_name.get("fields")
+    types = by_name.get("type_definitions")
+    string_count = string_literals[2] // IL2CPP_STRING_LITERAL_STRIDE if string_literals else None
+    event_count = events[2] // IL2CPP_EVENT_STRIDE if events else None
+    property_count = (
+        properties[2] // (5 * 4) if properties and properties[2] % (5 * 4) == 0 else None
+    )
+    param_count = (
+        params[2] // IL2CPP_PARAM_STRIDE
+        if params and params[2] % IL2CPP_PARAM_STRIDE == 0
+        else None
+    )
+    field_count = fields[2] // IL2CPP_FIELD_STRIDE if fields else None
+    type_count_min = types[2] // IL2CPP_TYPE_STRIDE_FLOOR if types else None
+    if not known:
+        _note(
+            warnings,
+            f"metadata version {version} is outside the known families "
+            f"{', '.join(str(item) for item in IL2CPP_KNOWN_VERSIONS)}; the v24.1+ layout "
+            "is applied structurally",
+        )
+    if param_count is None and "parameters" in by_name:
+        _note(warnings, "parameters table size is not a whole number of 12-byte records")
+    evidence = Evidence(
+        source="meta.il2cpp",
+        method="global-metadata-header",
+        confidence=Confidence.HIGH,
+        detail=_join_notes(
+            (
+                f"version {version} ({'known' if known else 'unknown'} family, {endian}-endian); "
+                f"{len(pairs)} header pairs"
+            ),
+            warnings,
+        ),
+        extra={"version": version},
+    )
+    return Il2CppInfo(
+        version=version,
+        known_version=known,
+        endian=endian,
+        string_count=string_count,
+        string_table_bytes=string_blob[2] if string_blob else None,
+        event_count=event_count,
+        property_count=property_count,
+        method_table_bytes=methods[2] if methods else None,
+        param_count=param_count,
+        field_count=field_count,
+        type_count_min=type_count_min,
+        table_pairs=tuple(pairs),
+        tables_truncated=tables_truncated,
+        evidence=evidence,
+    )
+
+
+# ---- Flutter / Dart AOT snapshots ---------------------------------------------
+
+
+def _scan_all_magics(
+    handle: Any, size: int, needle: bytes, cap: int
+) -> tuple[tuple[int, ...], bool]:
+    """Bounded chunked scan for *every* occurrence of ``needle`` (up to ``cap``)."""
+    hits: list[int] = []
+    overlap = len(needle) - 1
+    cursor = 0
+    truncated = False
+    while cursor < size:
+        window = _read_slice(handle, cursor, min(READ_CHUNK, size - cursor))
+        if not window:
+            break
+        start = 0
+        while True:
+            idx = window.find(needle, start)
+            if idx == -1:
+                break
+            hits.append(cursor + idx)
+            start = idx + 1
+            if len(hits) >= cap:
+                truncated = True
+                break
+        if truncated:
+            break
+        if cursor + len(window) >= size:
+            break
+        cursor = cursor + len(window) - overlap
+    return tuple(hits), truncated
+
+
+def detect_flutter(path: str | Path) -> FlutterSnapshotInfo | None:
+    """Detect Flutter/Dart AOT snapshot magics inside a ``.so`` or blob."""
+    p = Path(path)
+    if p.is_dir():
+        return None
+    size = _checked_size(p)
+    with _open_file(p) as handle:
+        vm_hits, vm_trunc = _scan_all_magics(handle, size, FLUTTER_VM_MAGIC, MAX_FLUTTER_OFFSETS)
+        isolate_hits, iso_trunc = _scan_all_magics(
+            handle, size, FLUTTER_ISOLATE_MAGIC, MAX_FLUTTER_OFFSETS
+        )
+    if not vm_hits and not isolate_hits:
+        return None
+    kinds: list[str] = []
+    if vm_hits:
+        kinds.append("vm")
+    if isolate_hits:
+        kinds.append("isolate")
+    warnings: list[str] = []
+    if vm_trunc or iso_trunc:
+        _note(
+            warnings,
+            f"snapshot magic limit {MAX_FLUTTER_OFFSETS} per kind reached; further hits dropped",
+        )
+    evidence = Evidence(
+        source="meta.flutter",
+        method="snapshot-magic-scan",
+        confidence=Confidence.HIGH,
+        detail=_join_notes(f"snapshot kinds: {', '.join(kinds)}", warnings),
+        extra={"vm_hits": len(vm_hits), "isolate_hits": len(isolate_hits)},
+    )
+    return FlutterSnapshotInfo(
+        kinds=tuple(kinds),
+        vm_offsets=vm_hits,
+        isolate_offsets=isolate_hits,
+        scan_truncated=vm_trunc or iso_trunc,
+        evidence=evidence,
+    )
+
+
+# ---- HarmonyOS HAP ------------------------------------------------------------
+
+
+def detect_hap(path: str | Path) -> HapInfo | None:
+    """Inspect a HarmonyOS HAP (a zip carrying ``pack.info``). ``None`` when not HAP.
+
+    Only the structure is reported: the central-directory entry count, a
+    bounded slice of entry names, and the ``pack.info`` descriptor decoded as
+    JSON when it parses (module count plus a bounded summary string). A file
+    that starts as a zip but refuses to open raises the typed malformed-zip
+    error; a valid zip without ``pack.info`` (an APK, a jar) is simply not a HAP.
+    """
+    p = Path(path)
+    if p.is_dir():
+        return None
+    _checked_size(p)
+    with _open_file(p) as handle:
+        lead = _read_slice(handle, 0, 4)
+    if lead != b"PK\x03\x04":
+        return None
+    try:
+        with zipfile.ZipFile(p) as archive:
+            infos = archive.infolist()
+            names = [info.filename for info in infos]
+            pack = archive.read(HAP_PACK_INFO) if HAP_PACK_INFO in names else None
+    except zipfile.BadZipFile as exc:
+        raise AnalysisError(f"malformed zip archive (HAP): {p}: {exc}") from exc
+    except OSError as exc:
+        raise AnalysisError(f"cannot read {p}: {exc}") from exc
+    if pack is None:
+        return None
+    warnings: list[str] = []
+    module_count: int | None = None
+    summary_text: str | None = None
+    decoded = False
+    try:
+        document = json.loads(pack.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _note(warnings, "pack.info is not decodable as UTF-8 JSON; reported as raw bytes")
+        document = None
+    if isinstance(document, dict):
+        decoded = True
+        summary_text = json.dumps(document, ensure_ascii=False, sort_keys=True)[:MAX_HAP_INFO_CHARS]
+        modules = document.get("summary", {}).get("modules")
+        if isinstance(modules, list):
+            module_count = len(modules)
+        else:
+            _note(warnings, "pack.info has no summary.modules list; module count unknown")
+    else:
+        summary_text = pack[:MAX_HAP_INFO_CHARS].decode("utf-8", errors="replace")
+    if len(names) > MAX_HAP_ENTRIES:
+        _note(warnings, f"entry-name limit {MAX_HAP_ENTRIES} reached; further names dropped")
+    evidence = Evidence(
+        source="meta.hap",
+        method="zip-pack-info",
+        confidence=Confidence.HIGH,
+        detail=_join_notes(
+            (
+                f"{len(infos)} entries; pack.info "
+                + ("decoded" if decoded else "not decoded")
+                + (f"; {module_count} modules" if module_count is not None else "")
+            ),
+            warnings,
+        ),
+        extra={"entries": len(infos)},
+    )
+    return HapInfo(
+        entry_count=len(infos),
+        entry_names=tuple(names[:MAX_HAP_ENTRIES]),
+        entries_truncated=len(names) > MAX_HAP_ENTRIES,
+        module_count=module_count,
+        pack_info_summary=summary_text,
+        pack_info_decoded=decoded,
+        evidence=evidence,
+    )
+
+
+# ---- CUDA fatbin ---------------------------------------------------------------
+
+
+def detect_cuda_fatbin(path: str | Path) -> CudaFatbinInfo | None:
+    """Inspect a CUDA fatbin container (magic ``0xBA55ED50``). ``None`` when not fatbin."""
+    p = Path(path)
+    if p.is_dir():
+        return None
+    size = _checked_size(p)
+    with _open_file(p) as handle:
+        head = _read_slice(handle, 0, 16)
+        if len(head) < 4 or struct.unpack_from("<I", head, 0)[0] != CUDA_FATBIN_MAGIC:
+            return None
+        if len(head) < 16:
+            raise AnalysisError("truncated fatbin header (need 16 bytes)")
+        version = int(struct.unpack_from("<H", head, 4)[0])
+        header_size = int(struct.unpack_from("<H", head, 6)[0])
+        data_size = int(struct.unpack_from("<Q", head, 8)[0])
+        if header_size < 16:
+            raise AnalysisError(f"fatbin header size {header_size} is below the 16-byte minimum")
+        limit = min(size, header_size + data_size) if data_size else size
+        cursor = header_size
+        warnings: list[str] = []
+        kinds: list[str] = []
+        elf_count = 0
+        ptx_count = 0
+        truncated = False
+        while cursor + 16 <= size and cursor < limit:
+            if len(kinds) >= MAX_CUDA_ENTRIES:
+                truncated = True
+                _note(warnings, f"entry limit {MAX_CUDA_ENTRIES} reached; further entries dropped")
+                break
+            block = _read_slice(handle, cursor, 16)
+            kind = int(struct.unpack_from("<H", block, 0)[0])
+            entry_version = int(struct.unpack_from("<H", block, 2)[0])
+            entry_header = int(struct.unpack_from("<I", block, 4)[0])
+            entry_size = int(struct.unpack_from("<Q", block, 8)[0])
+            if entry_header < 16:
+                raise AnalysisError(
+                    f"fatbin entry at offset {cursor} declares header size {entry_header}"
+                )
+            if cursor + entry_header + entry_size > size:
+                raise AnalysisError(
+                    f"fatbin entry at offset {cursor} ({entry_header}+{entry_size} bytes) "
+                    "overruns the container"
+                )
+            label = CUDA_ENTRY_KINDS.get(kind, f"kind-{kind}")
+            kinds.append(label)
+            if kind == 1:
+                elf_count += 1
+            elif kind == 2:
+                ptx_count += 1
+            if entry_version == 0:
+                _note(warnings, f"fatbin entry at offset {cursor} reports version 0")
+            cursor += entry_header + entry_size
+    if not kinds and data_size:
+        raise AnalysisError("fatbin declares a payload but carries no entries")
+    evidence = Evidence(
+        source="meta.cuda",
+        method="fatbin-header",
+        confidence=Confidence.HIGH,
+        detail=_join_notes(
+            f"version {version}; {len(kinds)} entries ({elf_count} elf, {ptx_count} ptx)",
+            warnings,
+        ),
+        extra={"version": version},
+    )
+    return CudaFatbinInfo(
+        version=version,
+        header_size=header_size,
+        data_size=data_size,
+        entry_count=len(kinds),
+        elf_count=elf_count,
+        ptx_count=ptx_count,
+        kinds=tuple(kinds),
+        entries_truncated=truncated,
+        evidence=evidence,
+    )
+
+
 # ---- auto-detecting entry point ----------------------------------------------
 
 _KIND_PRIORITY: tuple[tuple[str, str], ...] = (
     ("apk", "apk-signing"),
+    ("hap", "harmonyos-hap"),
     ("pyc", "python-pyc"),
+    ("beam", "erlang-beam"),
+    ("il2cpp", "il2cpp-metadata"),
+    ("flutter", "flutter-dart-aot"),
+    ("cuda", "cuda-fatbin"),
     ("go", "go-buildinfo"),
     ("cargo-auditable", "cargo-auditable"),
     ("electron-fuses", "electron-fuses"),
@@ -1481,10 +2164,30 @@ def inspect_metadata(path: str | Path) -> MetadataReport:
     if apk is not None:
         results["apk"] = apk.to_dict()
         evidence.extend(apk.evidence)
+    hap = detect_hap(p)
+    if hap is not None:
+        results["hap"] = hap.to_dict()
+        evidence.append(hap.evidence)
     pyc = detect_pyc(p)
     if pyc is not None:
         results["pyc"] = pyc.to_dict()
         evidence.append(pyc.evidence)
+    beam = detect_beam(p)
+    if beam is not None:
+        results["beam"] = beam.to_dict()
+        evidence.append(beam.evidence)
+    il2cpp = detect_il2cpp(p)
+    if il2cpp is not None:
+        results["il2cpp"] = il2cpp.to_dict()
+        evidence.append(il2cpp.evidence)
+    flutter = detect_flutter(p)
+    if flutter is not None:
+        results["flutter"] = flutter.to_dict()
+        evidence.append(flutter.evidence)
+    cuda = detect_cuda_fatbin(p)
+    if cuda is not None:
+        results["cuda"] = cuda.to_dict()
+        evidence.append(cuda.evidence)
     go = detect_go_buildinfo(p)
     if go is not None:
         results["go"] = go.to_dict()
