@@ -6,6 +6,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 
@@ -72,6 +73,15 @@ from codevanta.analysis.decompile import (
 )
 from codevanta.analysis.decompile import (
     DEFAULT_MAX_INSTRUCTIONS as DECOMPILE_MAX_INSTRUCTIONS,
+)
+from codevanta.analysis.decompile_router import (
+    PROVIDERS as DECOMPILE_PROVIDERS,
+)
+from codevanta.analysis.decompile_router import (
+    provider_report as decompile_provider_report,
+)
+from codevanta.analysis.decompile_router import (
+    route_provider as route_decompile_provider,
 )
 from codevanta.analysis.decompilers import BackendResult, decompile_function
 from codevanta.analysis.evidence_bundle import build_bundle, dumps_bundle, write_bundle
@@ -1626,6 +1636,87 @@ def _print_decompilation(result: BackendResult, start: int) -> None:
         console.print(f"[yellow]warning:[/] {escape(warning)}")
 
 
+def _resolve_decompile_provider(
+    provider: str | None, backend: str, path: Path
+) -> tuple[str, tuple[str, ...]]:
+    """Turn ``--provider``/``--backend`` into a backend name plus route warnings.
+
+    ``--provider`` wins when given; otherwise the historical ``--backend`` value
+    is returned untouched, so existing invocations behave exactly as before.
+    ``auto`` routes through
+    :func:`codevanta.analysis.decompile_router.route_provider` and returns the
+    address-level backend it picked plus one warning per skipped provider.
+    ``jeb`` and ``hopper`` are typed refusals rather than silent substitutions:
+    JEB renders DEX/APK *classes* (not a function at an address) and Hopper has
+    no headless interface at all.
+    """
+    if provider is None:
+        return backend, ()
+    key = provider.strip().lower() or "auto"
+    if key not in DECOMPILE_PROVIDERS:
+        _fail(
+            f"--provider must be one of {', '.join(DECOMPILE_PROVIDERS)}, got {provider!r}",
+            2,
+        )
+    if key == "hopper":
+        _fail(
+            "the hopper provider has no headless interface (it is a macOS GUI application); "
+            "export pseudocode from the Hopper GUI or use --provider ghidra",
+            2,
+        )
+    if key == "jeb":
+        _fail(
+            "the jeb provider decompiles DEX/APK classes, not one binary function by address; "
+            "call codevanta.analysis.jeb_bridge.decompile_dex(class_name=...) instead, "
+            "or use --provider auto for address-level rendering",
+            2,
+        )
+    if key != "auto":
+        return key, ()
+    route = route_decompile_provider(path)
+    if route.provider == "jeb":
+        _fail(
+            f"auto selected jeb for the {route.suffix} target, but this command renders one "
+            "binary function by address and JEB exports DEX/APK classes; call "
+            "codevanta.analysis.jeb_bridge.decompile_dex(class_name=...) instead",
+            2,
+        )
+    warnings = tuple(
+        f"auto: provider {name!r} was unavailable and skipped: {reason}"
+        for name, reason in route.skipped
+    )
+    return route.address_backend, warnings
+
+
+@app.command("providers", help="Report decompiler provider availability for this machine.")
+def providers_command(
+    output_format: Annotated[
+        str, typer.Option("--format", help="Output format: text or json.")
+    ] = "text",
+) -> None:
+    """Print the typed decompiler provider report (native, ghidra, angr, jeb, hopper)."""
+    if output_format not in ("text", "json"):
+        raise typer.BadParameter("format must be 'text' or 'json'")
+    report = decompile_provider_report()
+    if output_format == "json":
+        console.print_json(json.dumps(report.to_dict(), indent=2))
+        return
+    table = Table(title="Decompiler providers")
+    table.add_column("Provider")
+    table.add_column("Available")
+    table.add_column("Kind")
+    table.add_column("Reason")
+    for status in report.providers:
+        table.add_row(
+            status.name,
+            "yes" if status.available else "no",
+            status.kind,
+            status.reason or "-",
+        )
+    console.print(table)
+
+
+
 @app.command()
 def decompile(
     path: Path,
@@ -1654,6 +1745,16 @@ def decompile(
     max_blocks: Annotated[
         int, typer.Option("--max-blocks", help="Maximum basic blocks to render")
     ] = DECOMPILE_MAX_BLOCKS,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            help=(
+                "Provider for auto-routing (default: --backend): 'auto' picks jeb for "
+                ".dex/.apk, then ghidra, angr, native; 'jeb'/'hopper' are class-level/GUI-only"
+            ),
+        ),
+    ] = None,
     json_output: Annotated[
         bool, typer.Option("--json", help="Emit the JSON rendering instead of a panel")
     ] = False,
@@ -1679,6 +1780,16 @@ def decompile(
     instead of substituting another provider. A missing optional dependency never
     surfaces as ``ImportError``.
 
+    ``--provider`` is the newer, additive spelling of the same choice and wins
+    when both are given: ``auto`` routes through
+    :func:`codevanta.analysis.decompile_router.route_provider`, which picks the
+    first available provider in the order jeb (only for ``.dex``/``.apk``
+    targets), ghidra, angr, native and records one warning per unavailable
+    provider; ``jeb`` exits 2 because JEB renders DEX/APK classes rather than
+    addresses; ``hopper`` exits 2 because the Hopper GUI has no headless
+    interface (export pseudocode from the GUI instead). ``codevanta providers``
+    prints that availability report without decompiling anything.
+
     ``--max-instructions`` and ``--max-blocks`` bound the work; an out-of-range
     budget is rejected before any backend runs.
 
@@ -1691,6 +1802,7 @@ def decompile(
     -- to a file. Load errors, a bad address, an unknown function, an unknown
     backend and an unavailable backend all exit 2.
     """
+    backend, route_warnings = _resolve_decompile_provider(provider, backend, path)
     requested = None if address is None else _parse_address(address)
     loaded = _load(path)
     try:
@@ -1705,6 +1817,8 @@ def decompile(
         )
     except AnalysisError as exc:
         _fail(str(exc), 2)
+    if route_warnings:
+        result = replace(result, warnings=(*route_warnings, *result.warnings))
     payload = result.to_dict()
     if output is not None:
         written = json.dumps(payload) if json_output else result.text

@@ -1125,6 +1125,17 @@ def build_server() -> MCPServer:
     def codevanta_rizin_functions(path: str) -> dict:
         return tools.codevanta_rizin_functions(path)
 
+    @server.tool(
+        description=(
+            "Report decompiler provider availability for this machine: native "
+            "(always available), ghidra/angr (when importable/configured), jeb "
+            "(commercial, dex/apk targets only) and hopper (macOS GUI probe). "
+            "Read-only."
+        )
+    )
+    def codevanta_providers() -> dict:
+        return tools.codevanta_providers()
+
     return server
 
 

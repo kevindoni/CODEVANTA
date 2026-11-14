@@ -30,7 +30,7 @@
 | Lane | CODEVANTA | REA | Edge |
 |------|-----------|-----|------|
 | Static analysis | Loader PE/ELF/Mach-O, x86/x64 disasm, xrefs + jump tables, linear+recursive CFG, call graphs (DOT/GraphML/HTML), strings, entropy, struct recovery, dwarf, vtables, binary diff, fingerprints/similarity | Provider-normalized equivalents over Hopper/Ghidra/Rizin/JEB | 🤝 parity in scope; REA deeper per-provider |
-| Decompilation | native + Ghidra + angr bridges | + Hopper GUI, JEB, objdump wrappers | ⬜ REA |
+| Decompilation | native + Ghidra + angr + **JEB headless (dex/apk)** + objdump + `--provider auto` routing + Hopper probe (GUI export) | + Hopper GUI, JEB MCP | 🤝 parity when tools installed |
 | Live debugging | **Owned gdb MI2 sessions** (break/step/registers/memory/backtrace, verified shutdown) + LLDB batch runs + Rizin batch analysis (skip-gated) | gdb MI3 persistent + Frida full lifecycle + LLDB observation + Rizin debug sessions + Cutter | 🤝 near-parity (we own gdb; Frida full lifecycle shipped; REA broader) |
 | Frida | script generation + trace replay | full session lifecycle (spawn-paused, script load/unload/resume) | 🟡 REA |
 | Mobile/ADB | devices, props, packages, processes, services, install, screencap, bugreport, **logcat, pull/push, start/stop app, read settings** | same surface + intent launches, file pull/push, window/display details | 🤝 near-parity |

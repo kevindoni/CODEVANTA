@@ -199,10 +199,16 @@ def test_bridges_report_is_deterministic_and_honest_offline() -> None:
     )
     assert [cap.to_dict() for cap in report] == [cap.to_dict() for cap in again]
     for capability in report:
+        if capability.tool in {"z3", "jeb", "hopper"}:
+            # z3 is the honest import probe of this machine; jeb reads JEB_HOME
+            # rather than the runner seam; hopper is a macOS GUI glob probe.
+            # Each has dedicated offline tests, so only JSON-safety is asserted
+            # under this all-available seam.
+            assert json.loads(json.dumps(capability.to_dict())) == capability.to_dict()
+            continue
         assert capability.available is True
-        if capability.tool != "z3":  # z3 is the honest import probe of this machine
-            assert capability.version == "7.7.7"
-            assert capability.reason is None
+        assert capability.version == "7.7.7"
+        assert capability.reason is None
         assert json.loads(json.dumps(capability.to_dict())) == capability.to_dict()
 
 
