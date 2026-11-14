@@ -19,18 +19,21 @@ from codevanta.analysis.callgraph import build_call_graph
 from codevanta.analysis.cfg import build_cfg
 from codevanta.analysis.compare import (
     COMPARE_WHATS,
-    BundleCompare,
-    InventoryCompare,
-    StringsCompare,
-    compare_bundles,
-    compare_inventories,
-    compare_strings,
+    compare_artifacts,
     is_bundle_document,
     load_document,
-    load_report_payload,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_CHANGED_SECTIONS as COMPARE_MAX_CHANGED_SECTIONS,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_DETAIL_KEYS as COMPARE_MAX_DETAIL_KEYS,
 )
 from codevanta.analysis.compare import (
     DEFAULT_MAX_FUNCTIONS as COMPARE_MAX_FUNCTIONS,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_ROWS as COMPARE_MAX_ROWS,
 )
 from codevanta.analysis.compare import (
     DEFAULT_MAX_STRINGS as COMPARE_MAX_STRINGS,
@@ -69,10 +72,16 @@ from codevanta.analysis.decompilers import BackendResult, supported_backends
 from codevanta.analysis.decompilers import (
     decompile_function as decompile_with_backend,
 )
+from codevanta.analysis.frida_bridge import (
+    DEFAULT_DURATION as DEFAULT_FRIDA_DURATION,  # noqa: F401 -- server wrapper default
+)
 from codevanta.analysis.function_hash import function_fingerprint, function_similarity
 from codevanta.analysis.jump_tables import MAX_ENTRIES as MAX_JUMP_TABLE_ENTRIES
 from codevanta.analysis.jump_tables import MODE_RELATIVE, resolve_jump_table
 from codevanta.analysis.jump_tables import MODES as JUMP_TABLE_MODES
+from codevanta.analysis.lldb_bridge import (
+    DEFAULT_TIMEOUT as DEFAULT_LLDB_TIMEOUT,  # noqa: F401 -- server wrapper default
+)
 from codevanta.analysis.symbolic import (
     DEFAULT_MAX_PATHS as DEFAULT_SYMBOLIC_MAX_PATHS,
 )
@@ -114,6 +123,15 @@ from codevanta.core.entropy import (
     analyze_entropy,
 )
 from codevanta.core.functions import discover_functions
+from codevanta.core.obligations import (
+    DEFAULT_OBLIGATION_AUTHORITY as DEFAULT_OBLIGATION_AUTHORITY,
+)
+from codevanta.core.obligations import (
+    DEFAULT_OBLIGATION_CONFIDENCE as DEFAULT_OBLIGATION_CONFIDENCE,
+)
+from codevanta.core.obligations import (
+    DEFAULT_OBLIGATION_ENVIRONMENT as DEFAULT_OBLIGATION_ENVIRONMENT,
+)
 from codevanta.core.report import (
     MAX_DISASSEMBLY_COUNT,
     MAX_STRING_LIMIT,
@@ -127,6 +145,7 @@ from codevanta.core.strings import StringExtractor
 from codevanta.core.unknowns import (
     DEFAULT_UNKNOWN_SEVERITY,
     UNKNOWN_STATUSES,
+    find_record,
     make_open_unknown,
     records_from_payload,
     records_to_payload,
@@ -148,6 +167,18 @@ from codevanta.mcp_server.ext_depth import (
 )
 from codevanta.mcp_server.ext_depth import (
     codevanta_js_recover as codevanta_js_recover,
+)
+from codevanta.mcp_server.ext_format2 import (  # lane-format2: ONE MCP registration import line
+    codevanta_codesign,  # noqa: F401
+)
+from codevanta.mcp_server.ext_ledger2 import (  # lane-ledger2: ONE MCP registration import line
+    codevanta_coverage,  # noqa: F401
+    codevanta_obligations,  # noqa: F401
+)
+from codevanta.mcp_server.ext_live import (  # lane-live2: ONE MCP registration import line
+    codevanta_frida,  # noqa: F401
+    codevanta_lldb_run,  # noqa: F401
+    codevanta_rizin_functions,  # noqa: F401
 )
 from codevanta.mcp_server.ext_meta import (
     codevanta_metadata as codevanta_metadata,  # lane-meta: ONE MCP registration line
@@ -1513,41 +1544,41 @@ def compare(
     what: str = "functions",
     max_functions: int = COMPARE_MAX_FUNCTIONS,
     max_strings: int = COMPARE_MAX_STRINGS,
+    max_changed_sections: int = COMPARE_MAX_CHANGED_SECTIONS,
+    max_detail_keys: int = COMPARE_MAX_DETAIL_KEYS,
+    max_rows: int = COMPARE_MAX_ROWS,
 ) -> dict[str, Any]:
-    """Compare two offline JSON artifacts (reports or evidence bundles).
+    """Compare two offline CODEVANTA artifacts.
 
-    ``what="functions"`` and ``what="strings"`` compare analyze report payloads
-    (a bundle document is unwrapped to its ``report`` entry automatically);
-    ``what="bundles"`` diffs two evidence-bundle documents by record kind and
-    digest membership. Nothing is executed or disassembled: the comparison is
-    reproducible from the two documents alone, and every result carries an
-    evidence record stating how far the claim reaches.
+    ``what`` picks the comparator: ``functions``/``strings`` diff analyze
+    report payloads (a bundle document is unwrapped to its ``report`` entry
+    automatically); ``bundles`` diffs two evidence-bundle documents by
+    record kind and digest membership; ``reports`` diffs two report
+    payloads structurally by canonical-JSON section digests and element
+    counts; ``metadata`` diffs two binmeta MetadataReport documents; the
+    path-backed kinds take non-JSON files directly -- ``wasm`` (two WASM
+    modules), ``crash`` (two ELF core dumps with a same_crash_site
+    verdict), ``sessions``/``nav`` (two session databases) and ``firmware``
+    (two firmware images' magic-scan hits). Nothing is executed or
+    disassembled, and every result carries an evidence record stating how
+    far the claim reaches.
     """
     if what not in COMPARE_WHATS:
-        raise AnalysisError(f"unknown --what {what!r}; expected one of {', '.join(COMPARE_WHATS)}")
+        raise AnalysisError(
+            f"unknown --what {what!r}; expected one of {', '.join(COMPARE_WHATS)}"
+        )
     left_path = _validate_path(a)
     right_path = _validate_path(b)
-    result: InventoryCompare | StringsCompare | BundleCompare
-    if what == "functions":
-        result = compare_inventories(
-            load_report_payload(left_path),
-            load_report_payload(right_path),
-            max_functions=max_functions,
-        )
-    elif what == "strings":
-        result = compare_strings(
-            load_report_payload(left_path),
-            load_report_payload(right_path),
-            max_strings=max_strings,
-        )
-    else:
-        left_document = load_document(left_path)
-        right_document = load_document(right_path)
-        if not is_bundle_document(left_document):
-            raise AnalysisError(f"{a} is not an evidence-bundle document")
-        if not is_bundle_document(right_document):
-            raise AnalysisError(f"{b} is not an evidence-bundle document")
-        result = compare_bundles(left_document, right_document)
+    result = compare_artifacts(
+        what,
+        left_path,
+        right_path,
+        max_functions=max_functions,
+        max_strings=max_strings,
+        max_changed_sections=max_changed_sections,
+        max_detail_keys=max_detail_keys,
+        max_rows=max_rows,
+    )
     return result.to_dict()
 
 
@@ -1561,18 +1592,22 @@ def unknowns(
     evidence_refs: list[str] | None = None,
     note: str | None = None,
     status: str | None = None,
+    expected_revision: int | None = None,
 ) -> dict[str, Any]:
     """Manage the residual-unknown ledger at ``ledger`` (a JSON file).
 
     ``action="list"`` returns the records (optionally filtered by ``status``);
     ``action="open"`` appends one typed open record built from ``domain`` /
     ``summary`` / ``severity`` / ``evidence_refs`` (the ledger file is created
-    when missing); ``action="resolve"`` closes ``unknown_id`` with ``note``.
-    Ids are deterministic content digests, so opening the same finding twice
-    is refused as a duplicate.
+    when missing); ``action="resolve"`` closes ``unknown_id`` with ``note``
+    (CAS via ``expected_revision``); ``action="history"`` returns one record's
+    immutable revision trail. Ids are deterministic content digests, so
+    opening the same finding twice is refused as a duplicate.
     """
-    if action not in ("list", "open", "resolve"):
-        raise AnalysisError(f"unknown action {action!r}; expected list, open or resolve")
+    if action not in ("list", "open", "resolve", "history"):
+        raise AnalysisError(
+            f"unknown action {action!r}; expected list, open, resolve or history"
+        )
     if status is not None and status not in UNKNOWN_STATUSES:
         raise AnalysisError(
             f"unknown status {status!r}; expected one of {', '.join(UNKNOWN_STATUSES)}"
@@ -1614,13 +1649,30 @@ def unknowns(
             "items": listing["items"],
         }
 
+    if action == "history":
+        if not unknown_id:
+            raise AnalysisError("history requires unknown_id")
+        record = find_record(document, unknown_id)
+        return {
+            "action": "history",
+            "id": record.id,
+            "count": len(record.revisions),
+            "revisions": [revision.to_dict() for revision in record.revisions],
+            "revisions_truncated": record.revisions_truncated,
+            "evidence": {"source": "ledger.revision", "method": "revision_history"},
+        }
+
     # action == "resolve"
     if not unknown_id:
         raise AnalysisError("resolving an unknown requires unknown_id")
-    payload = resolve_unknowns(document, [unknown_id], note=note or "")
+    payload = resolve_unknowns(
+        document, [unknown_id], note=note or "", expected_revision=expected_revision
+    )
     _write_ledger_payload(ledger_path, payload)
+    resolved = find_record(payload, unknown_id)
     return {
         "action": "resolve",
         "resolved": unknown_id,
+        "revision": resolved.revisions[-1].revision,
         "count": int(payload["count"]),
     }

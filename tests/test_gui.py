@@ -20,9 +20,17 @@ from urllib.parse import quote
 
 import pytest
 
+from codevanta.analysis.bridge import BridgeCapability
 from codevanta.analysis.decompilers import available_backends
 from codevanta.analysis.emulate import MAX_MAX_INSTRUCTIONS
+from codevanta.analysis.nav import NavStore
 from codevanta.analysis.symbolic import MAX_MAX_PATHS
+from codevanta.core.report import AnalysisError
+from codevanta.core.unknowns import (
+    make_open_unknown,
+    records_to_payload,
+    resolve_record,
+)
 from codevanta.gui import (
     ROUTES,
     VERSION,
@@ -1231,4 +1239,422 @@ def test_dashboard_page_has_a_sessions_panel() -> None:
     for column in ("session_id", "created_at", "path", "format", "architecture", "notes"):
         assert f'"{column}"' in page
     assert "SESSION_COLUMNS" in page
+    assert "innerHTML" not in page
+
+
+# ---------------------------------------------------------------------------
+# lane routes: /bridges, /unknowns, /obligations, /compare, /nav, /metadata
+# ---------------------------------------------------------------------------
+
+#: Committed JSON artifacts the /compare happy paths compare offline.
+SAMPLES_DIR = Path(__file__).resolve().parents[1] / "samples"
+
+#: The six routes this block adds to the dashboard.
+LANE_ROUTES = (
+    "/bridges",
+    "/unknowns",
+    "/obligations",
+    "/compare",
+    "/nav",
+    "/metadata",
+)
+
+
+@pytest.fixture()
+def unknowns_ledger(tmp_path: Path) -> Path:
+    """A ledger file holding two open records and one resolved record."""
+    records = [
+        make_open_unknown(domain="functions", summary="unreached block at the tail"),
+        make_open_unknown(domain="strings", summary="unlabeled blob in .data", severity="high"),
+        resolve_record(
+            make_open_unknown(domain="cfg", summary="loop exit unknown"),
+            note="checked by hand",
+        ),
+    ]
+    ledger = tmp_path / "unknowns.json"
+    ledger.write_text(json.dumps(records_to_payload(records)), encoding="utf-8")
+    return ledger
+
+
+def test_lane_routes_are_registered_and_listed_by_health(
+    gui_server: ThreadingHTTPServer,
+) -> None:
+    status, payload = _get(gui_server, "/api/health")
+
+    assert status == 200
+    assert set(payload["routes"]) == set(ROUTES)
+    for route in LANE_ROUTES:
+        assert route in payload["routes"]
+    # Fourteen established routes plus the six lane routes.
+    assert len(ROUTES) == 20
+    # A near-miss spelling stays an unknown route: 404, never a silent match.
+    miss_status, miss_payload = _get(gui_server, "/bridge")
+    assert miss_status == 404
+    assert "unknown route" in miss_payload["error"]
+
+
+def test_bridges_reports_capability_records(
+    gui_server: ThreadingHTTPServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The real probe walks PATH with per-tool subprocess budgets; the report is
+    # served from canned records so the assertion is deterministic and offline.
+    monkeypatch.setattr(
+        gui_server_module,
+        "bridges_report",
+        lambda: [
+            BridgeCapability(
+                tool="binwalk", available=False, reason="binwalk is not installed"
+            ),
+            BridgeCapability(tool="z3", available=True, version="4.13.0"),
+        ],
+    )
+
+    status, payload = _get(gui_server, "/bridges")
+
+    assert status == 200
+    assert payload["count"] == 2
+    assert payload["available"] == 1
+    assert payload["tools"][0]["tool"] == "binwalk"
+    assert payload["tools"][0]["available"] is False
+    assert payload["tools"][1]["version"] == "4.13.0"
+
+
+def test_bridges_engine_failure_is_a_typed_400(
+    gui_server: ThreadingHTTPServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom() -> list[BridgeCapability]:
+        raise AnalysisError("probe runner exploded")
+
+    monkeypatch.setattr(gui_server_module, "bridges_report", boom)
+
+    status, payload = _get(gui_server, "/bridges")
+
+    assert status == 400
+    assert payload["error"] == "probe runner exploded"
+
+
+def test_unknowns_lists_the_ledger(
+    gui_server: ThreadingHTTPServer, unknowns_ledger: Path
+) -> None:
+    ledger = quote(unknowns_ledger.as_posix())
+
+    status, payload = _get(gui_server, f"/unknowns?ledger={ledger}")
+
+    assert status == 200
+    assert payload["count"] == 3
+    assert payload["returned"] == 3
+    assert payload["truncated"] is False
+    assert {item["domain"] for item in payload["items"]} == {"functions", "strings", "cfg"}
+    assert {item["status"] for item in payload["items"]} == {"open", "resolved"}
+    assert Path(payload["path"]) == unknowns_ledger
+
+    status_two, two = _get(gui_server, f"/unknowns?ledger={ledger}&limit=2")
+
+    assert status_two == 200
+    assert two["count"] == 3
+    assert two["returned"] == 2
+    assert two["truncated"] is True
+
+
+def test_unknowns_bad_inputs_are_typed_400s(
+    gui_server: ThreadingHTTPServer, unknowns_ledger: Path, tmp_path: Path
+) -> None:
+    # Missing parameter.
+    status, payload = _get(gui_server, "/unknowns")
+    assert status == 400
+    assert payload["error"] == "ledger is required"
+
+    # Named file does not exist.
+    missing = (tmp_path / "absent.json").as_posix()
+    status, payload = _get(gui_server, f"/unknowns?ledger={quote(missing)}")
+    assert status == 400
+    assert "ledger does not exist" in payload["error"]
+
+    # Out-of-bounds limit.
+    status, payload = _get(
+        gui_server, f"/unknowns?ledger={quote(unknowns_ledger.as_posix())}&limit=-1"
+    )
+    assert status == 400
+    assert "limit" in payload["error"]
+
+    # Malformed JSON.
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    status, payload = _get(gui_server, f"/unknowns?ledger={quote(bad.as_posix())}")
+    assert status == 400
+    assert "not valid JSON" in payload["error"]
+
+    # Well-formed JSON that is not a valid ledger shape (engine validation).
+    wrong = tmp_path / "wrong.json"
+    wrong.write_text(json.dumps({"items": "nope"}), encoding="utf-8")
+    status, payload = _get(gui_server, f"/unknowns?ledger={quote(wrong.as_posix())}")
+    assert status == 400
+    assert "items" in payload["error"]
+
+
+def test_unknowns_ledger_documents_are_read_bounded(
+    gui_server: ThreadingHTTPServer, unknowns_ledger: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A ledger larger than the read budget is refused before it is parsed.
+    monkeypatch.setattr(gui_server_module, "MAX_LEDGER_BYTES", 8)
+    status, payload = _get(
+        gui_server, f"/unknowns?ledger={quote(unknowns_ledger.as_posix())}"
+    )
+    assert status == 400
+    assert "read budget" in payload["error"]
+
+    # A JSON document that is not an object.
+    monkeypatch.setattr(gui_server_module, "MAX_LEDGER_BYTES", 4 * 1024 * 1024)
+    array_doc = tmp_path / "array.json"
+    array_doc.write_text("[1, 2]", encoding="utf-8")
+    status, payload = _get(gui_server, f"/unknowns?ledger={quote(array_doc.as_posix())}")
+    assert status == 400
+    assert "not a JSON object" in payload["error"]
+
+    # A file that is not UTF-8 text at all.
+    binary = tmp_path / "binary.json"
+    binary.write_bytes(b"\xff\xfe\x00bad")
+    status, payload = _get(gui_server, f"/unknowns?ledger={quote(binary.as_posix())}")
+    assert status == 400
+    assert "not UTF-8 text" in payload["error"]
+
+
+def test_obligations_lists_the_ledger(
+    gui_server: ThreadingHTTPServer, tmp_path: Path
+) -> None:
+    obligations = pytest.importorskip("codevanta.core.obligations")
+    record = obligations.make_open_obligation(
+        question="verify the string table offset",
+        evidence_refs=("report:sections",),
+    )
+    ledger = tmp_path / "obligations.json"
+    ledger.write_text(
+        json.dumps(obligations.obligations_to_payload([record])), encoding="utf-8"
+    )
+
+    status, payload = _get(gui_server, f"/obligations?ledger={quote(ledger.as_posix())}")
+
+    assert status == 200
+    assert payload["count"] == 1
+    assert payload["returned"] == 1
+    assert payload["items"][0]["question"] == "verify the string table offset"
+    assert payload["items"][0]["status"] == "open"
+
+
+def test_obligations_bad_inputs_are_typed_400s(
+    gui_server: ThreadingHTTPServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Missing parameter (the module is present on this build, so the route
+    # reaches the parameter validation).
+    status, payload = _get(gui_server, "/obligations")
+    assert status == 400
+    assert payload["error"] == "ledger is required"
+
+    # Named file does not exist.
+    missing = (tmp_path / "absent.json").as_posix()
+    status, payload = _get(gui_server, f"/obligations?ledger={quote(missing)}")
+    assert status == 400
+    assert "ledger does not exist" in payload["error"]
+
+    # On a build without the ledger module the route answers the typed
+    # "not available" payload instead of an import-time crash.
+    monkeypatch.setattr(gui_server_module, "_obligations_module", None)
+    any_file = tmp_path / "whatever.json"
+    any_file.write_text("{}", encoding="utf-8")
+    status, payload = _get(gui_server, f"/obligations?ledger={quote(any_file.as_posix())}")
+    assert status == 400
+    assert "not available" in payload["error"]
+    assert "codevanta.core.obligations" in payload["error"]
+
+
+def test_compare_dispatches_each_kind(gui_server: ThreadingHTTPServer) -> None:
+    report = quote((SAMPLES_DIR / "report_elf64.json").as_posix())
+    other = quote((SAMPLES_DIR / "report_notepad.json").as_posix())
+    bundle = quote((SAMPLES_DIR / "report_bundle.json").as_posix())
+
+    status_f, functions = _get(
+        gui_server, f"/compare?left={report}&right={other}&what=functions"
+    )
+    assert status_f == 200
+    assert functions["what"] == "functions"
+    assert isinstance(functions["added"], list)
+
+    # The default kind is "functions", like the CLI's --what default.
+    status_d, default_kind = _get(gui_server, f"/compare?left={report}&right={other}")
+    assert status_d == 200
+    assert default_kind["what"] == "functions"
+
+    status_s, strings = _get(
+        gui_server, f"/compare?left={report}&right={other}&what=strings&max_strings=5"
+    )
+    assert status_s == 200
+    assert strings["what"] == "strings"
+    assert strings["max_strings"] == 5
+    assert isinstance(strings["added"], list)
+
+    status_b, bundles = _get(
+        gui_server, f"/compare?left={bundle}&right={bundle}&what=bundles"
+    )
+    assert status_b == 200
+    assert bundles["what"] == "bundles"
+    assert bundles["added_count"] == 0
+    assert bundles["changed_count"] == 0
+    assert bundles["unchanged_count"] >= 1
+
+
+def test_compare_bad_inputs_are_typed_400s(
+    gui_server: ThreadingHTTPServer, tmp_path: Path
+) -> None:
+    report = quote((SAMPLES_DIR / "report_elf64.json").as_posix())
+    missing = quote((tmp_path / "absent.json").as_posix())
+
+    # Unknown kind, with the supported kinds named in the error.
+    status, payload = _get(gui_server, f"/compare?left={report}&right={report}&what=sounds")
+    assert status == 400
+    assert "what" in payload["error"]
+    assert "bundles" in payload["error"]
+
+    # Missing right parameter.
+    status, payload = _get(gui_server, f"/compare?left={report}")
+    assert status == 400
+    assert payload["error"] == "right is required"
+
+    # Left path does not exist.
+    status, payload = _get(gui_server, f"/compare?left={missing}&right={report}")
+    assert status == 400
+    assert "left does not exist" in payload["error"]
+
+
+def test_nav_returns_bookmarks_comments_and_cursor(
+    gui_server: ThreadingHTTPServer,
+    sample_binary: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _session_db(monkeypatch, tmp_path)
+    status, saved = _save(gui_server, sample_binary)
+    assert status == 200, saved
+    session_id = saved["session_id"]
+
+    # Seed the navigation state the read APIs serve, on the same database the
+    # dashboard session routes wrote (same helper, same production path).
+    with NavStore(db) as store:
+        store.bookmark(session_id, 0x401000, "entry")
+        store.comment(session_id, 0x402000, "string table here")
+        store.goto(session_id, 0x401400)
+
+    status, payload = _get(
+        gui_server, f"/nav?db={quote(db.as_posix())}&session={quote(session_id)}"
+    )
+
+    assert status == 200
+    assert payload["session_id"] == session_id
+    assert [row["name"] for row in payload["bookmarks"]] == ["entry"]
+    assert payload["bookmarks"][0]["address"] == "0x401000"
+    assert [row["text"] for row in payload["comments"]] == ["string table here"]
+    assert payload["cursor"] is not None
+    assert payload["cursor"]["address"] == "0x401400"
+
+
+def test_nav_bad_inputs_are_typed_400s(
+    gui_server: ThreadingHTTPServer,
+    sample_binary: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _session_db(monkeypatch, tmp_path)
+    status, saved = _save(gui_server, sample_binary)
+    assert status == 200, saved
+    session_id = saved["session_id"]
+
+    # Missing session parameter.
+    status, payload = _get(gui_server, f"/nav?db={quote(db.as_posix())}")
+    assert status == 400
+    assert payload["error"] == "session is required"
+
+    # A database that does not exist is refused (never created) by the route.
+    missing_db = tmp_path / "absent.db"
+    status, payload = _get(
+        gui_server, f"/nav?db={quote(missing_db.as_posix())}&session={quote(session_id)}"
+    )
+    assert status == 400
+    assert "db does not exist" in payload["error"]
+    assert not missing_db.exists()
+
+    # A session the database does not know: the engine's typed error, hint in.
+    status, payload = _get(gui_server, f"/nav?db={quote(db.as_posix())}&session=zz-other")
+    assert status == 400
+    assert "zz-other" in payload["error"]
+
+
+def test_metadata_detects_a_pyc_file(gui_server: ThreadingHTTPServer, tmp_path: Path) -> None:
+    # A PEP 552 timestamp-based .pyc header (16 bytes): magic 3439, "\r\n",
+    # flags 0, timestamp, source size. Bytecode is never read by the detector.
+    pyc = tmp_path / "stripped.pyc"
+    pyc.write_bytes(struct.pack("<H", 3439) + b"\r\n" + struct.pack("<III", 0, 0x5F000000, 16))
+
+    status, payload = _get(gui_server, f"/metadata?path={quote(pyc.as_posix())}")
+
+    assert status == 200
+    assert payload["kind"] == "python-pyc"
+    assert Path(payload["path"]) == pyc
+    assert payload["details"]["pyc"]["magic"] == 3439
+    assert isinstance(payload["evidence"], list)
+
+
+def test_metadata_bad_inputs_are_typed_400s(
+    gui_server: ThreadingHTTPServer, tmp_path: Path
+) -> None:
+    # Missing parameter.
+    status, payload = _get(gui_server, "/metadata")
+    assert status == 400
+    assert payload["error"] == "path is required"
+
+    # Named path does not exist (the engine's typed error).
+    missing = (tmp_path / "absent.bin").as_posix()
+    status, payload = _get(gui_server, f"/metadata?path={quote(missing)}")
+    assert status == 400
+    assert "path does not exist" in payload["error"]
+
+    # An existing file no detector claims.
+    plain = tmp_path / "plain.bin"
+    plain.write_bytes(b"\x00" * 64)
+    status, payload = _get(gui_server, f"/metadata?path={quote(plain.as_posix())}")
+    assert status == 400
+    assert "unrecognized file format" in payload["error"]
+
+
+def test_dashboard_page_has_the_lane_controls() -> None:
+    page = render_dashboard_html()
+
+    for element_id in (
+        "uk-ledger",
+        "uk-limit",
+        "ob-ledger",
+        "cmp-what",
+        "nv-db",
+        "nv-session",
+        "md-path",
+    ):
+        assert f'id="{element_id}"' in page
+    for action in LANE_ROUTES:
+        assert f'data-action="{action.lstrip("/")}"' in page
+    for endpoint in (
+        'bridges: "/bridges"',
+        'unknowns: "/unknowns"',
+        'obligations: "/obligations"',
+        'compare: "/compare"',
+        'nav: "/nav"',
+        'metadata: "/metadata"',
+    ):
+        assert endpoint in page
+    # The lane controls build their own query strings and never fall through to
+    # the generic "path" line, so the main binary input cannot leak into them.
+    for line in (
+        'addParam(parts, "ledger", fieldValue("uk-ledger"));',
+        'addParam(parts, "what", fieldValue("cmp-what") || "functions");',
+        'addParam(parts, "session", fieldValue("nv-session"));',
+        'addParam(parts, "path", fieldValue("md-path"));',
+    ):
+        assert line in page
     assert "innerHTML" not in page

@@ -17,6 +17,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from codevanta.analysis import binmeta
+from codevanta.analysis.codesign import inspect_codesign
 from codevanta.core.report import AnalysisError
 
 meta_app = typer.Typer(
@@ -105,3 +106,71 @@ def metadata(
             escape(data.get("detail", "")),
         )
     console.print(evidence_table)
+
+
+def codesign(
+    macho: Annotated[Path, typer.Argument(help="Thin Mach-O file to inspect")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the JSON result instead of a summary"),
+    ] = False,
+) -> None:
+    """Summarise a Mach-O's embedded code signature (structure only, offline).
+
+    Prints the LC_CODE_SIGNATURE offset, the SuperBlob slot table, the
+    code-directory identifier, the entitlements keys and a certificate count.
+    A file without a signature load command exits 2 with a typed message;
+    nothing here verifies trust -- parse-only.
+    """
+    try:
+        report = inspect_codesign(macho)
+    except AnalysisError as exc:
+        _fail(str(exc))
+    if report is None:
+        _fail(f"no embedded code signature found in {macho}")
+    assert report is not None  # narrowed by _fail above
+    if json_output:
+        console.print_json(json.dumps(report.to_dict()))
+        return
+    console.print(
+        f"[bold]Codesign[/] {escape(str(macho))} · {escape(report.macho_kind)}"
+        f" ({escape(report.endian)}-endian)"
+    )
+    console.print(
+        f"[dim]LC_CODE_SIGNATURE:[/] offset {report.signature_offset}"
+        f" · size {report.signature_size} bytes · slots {report.slot_count}"
+    )
+    if report.identifier:
+        console.print(f"[dim]identifier:[/] {escape(report.identifier)}")
+    console.print(
+        f"[dim]team id:[/] {escape(report.team_id if report.team_id else '-')}"
+        f" · certificates: {report.certificates_count if report.certificates_count is not None else '-'}"
+    )
+    table = Table(title="SuperBlob slots")
+    table.add_column("Type")
+    table.add_column("Name")
+    table.add_column("Offset", justify="right")
+    table.add_column("Length", justify="right")
+    for slot_type, name, offset, length in report.slots:
+        table.add_row(
+            f"0x{slot_type:x}",
+            escape(name),
+            str(offset),
+            str(length),
+        )
+    if not report.slots:
+        table.add_row("-", "-", "-", "-")
+    console.print(table)
+    if report.entitlements_keys:
+        console.print(f"[dim]entitlements keys:[/] {len(report.entitlements_keys)}")
+        for key in report.entitlements_keys[:16]:
+            console.print(f"  {escape(key)}")
+        if report.entitlements_truncated:
+            console.print("[yellow]warning:[/] key list truncated at 32 entries")
+    for warning in report.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    data = report.evidence.to_dict()
+    console.print(
+        f"[dim]evidence: {escape(str(data['source']))} via {escape(str(data['method']))}"
+        f" · confidence: {escape(str(data['confidence']))}[/]"
+    )

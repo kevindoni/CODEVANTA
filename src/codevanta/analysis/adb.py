@@ -47,7 +47,10 @@ __all__ = [
     "AdbBugreportResult",
     "AdbDevice",
     "AdbDevicesResult",
+    "AdbFileTransferResult",
     "AdbInstallResult",
+    "AdbLogcatLine",
+    "AdbLogcatResult",
     "AdbPackageEntry",
     "AdbPackageInfoResult",
     "AdbPackagesResult",
@@ -57,15 +60,21 @@ __all__ = [
     "AdbScreencapResult",
     "AdbServiceEntry",
     "AdbServicesResult",
+    "AdbSettingResult",
+    "AdbStartResult",
+    "AdbStopResult",
     "AdbWindowFocusResult",
     "DEFAULT_TIMEOUT",
     "MAX_APK_BYTES",
     "MAX_DEVICES",
+    "MAX_LOG_LINES",
+    "MAX_LOG_MSG_CHARS",
     "MAX_PACKAGES",
     "MAX_PROCESSES",
     "MAX_PROPS",
     "MAX_SERVICES",
     "MAX_TIMEOUT",
+    "MAX_TRANSFER_BYTES",
     "MAX_WARNINGS",
     "Runner",
     "RunnerOutcome",
@@ -76,14 +85,22 @@ __all__ = [
     "list_devices",
     "list_packages",
     "list_processes",
+    "parse_am_start",
     "parse_devices",
     "parse_dumpsys_package",
     "parse_getprop",
+    "parse_logcat",
     "parse_packages",
     "parse_processes",
     "parse_services",
     "parse_window_focus",
+    "pull_file",
+    "push_file",
+    "read_logcat",
+    "read_setting",
     "screencap",
+    "start_app",
+    "stop_app",
 ]
 
 #: Devices kept from one ``adb devices -l`` transcript, whatever is attached.
@@ -114,6 +131,18 @@ MAX_TIMEOUT = 600.0
 
 #: Hard ceiling on the size of an APK :func:`install_apk` will accept.
 MAX_APK_BYTES = 4 * 1024 * 1024 * 1024
+
+#: Logcat lines kept from one ``logcat -d -t`` transcript (bounded work).
+MAX_LOG_LINES = 200
+
+#: Characters kept of one logcat message before it is clipped.
+MAX_LOG_MSG_CHARS = 512
+
+#: Hard ceiling on one file :func:`pull_file` / :func:`push_file` accepts.
+MAX_TRANSFER_BYTES = 512 * 1024 * 1024
+
+#: Characters accepted for one device-side path argument (argv hygiene).
+MAX_DEVICE_PATH_CHARS = 512
 
 #: Characters a serial may contain (``emulator-5554``, ``127.0.0.1:5555``,
 #: USB serials, product names); anything else is refused before it reaches argv.
@@ -169,6 +198,18 @@ _PS_COLUMNS = {
     "pcy",
 }
 
+#: ``threadtime`` logcat row:
+#: ``03-15 10:21:02.123  1234  5678 D TagName : message``.
+_LOGCAT_ROW = re.compile(
+    r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d+)\s+"
+    r"(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<priority>[VDIWEFS])\s+"
+    r"(?P<tag>\S*?)\s*:\s(?P<message>.*)$"
+)
+
+#: Android package names are ``com.example.app`` segments; anything outside
+#: this alphabet is refused before it reaches argv.
+_PACKAGE_CHARS = re.compile(r"^[A-Za-z0-9._]+$")
+
 #: Evidence ``source`` ids, one per adb command family (``adb.<command>``).
 EVIDENCE_DEVICES = "adb.devices"
 EVIDENCE_GETPROP = "adb.getprop"
@@ -180,6 +221,12 @@ EVIDENCE_WINDOW = "adb.dumpsys_window"
 EVIDENCE_INSTALL = "adb.install"
 EVIDENCE_SCREENCAP = "adb.screencap"
 EVIDENCE_BUGREPORT = "adb.bugreport"
+EVIDENCE_LOGCAT = "adb.logcat"
+EVIDENCE_PULL = "adb.pull"
+EVIDENCE_PUSH = "adb.push"
+EVIDENCE_START = "adb.start"
+EVIDENCE_STOP = "adb.stop"
+EVIDENCE_SETTING = "adb.setting"
 
 #: Typed failure for every wrapper when adb is absent, with the install hint.
 ADB_MISSING_MESSAGE = (
@@ -1344,6 +1391,597 @@ def bugreport(
             confidence=Confidence.CERTAIN,
             detail=f"{size} bytes",
             extra={"serial": checked},
+        ),
+    )
+
+
+# ---- logcat ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdbLogcatLine:
+    """One ``threadtime`` logcat row: priority, tag, pid and clipped message."""
+
+    priority: str
+    tag: str
+    pid: int
+    message: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "priority": self.priority,
+            "tag": self.tag,
+            "pid": self.pid,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class AdbLogcatResult:
+    """Bounded, evidence-backed parse of one ``logcat -d -t`` transcript."""
+
+    lines: tuple[AdbLogcatLine, ...]
+    truncated: bool
+    warnings: list[str] = field(default_factory=list)
+    evidence: Evidence = field(
+        default_factory=lambda: Evidence(
+            source=EVIDENCE_LOGCAT,
+            method="logcat -d -t",
+            confidence=Confidence.UNKNOWN,
+        )
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "count": len(self.lines),
+            "lines": [line.to_dict() for line in self.lines],
+            "truncated": self.truncated,
+            "warnings": list(self.warnings),
+            "evidence": self.evidence.to_dict(),
+        }
+
+    @property
+    def count(self) -> int:
+        """Number of decoded rows (same value ``to_dict()`` reports)."""
+        return len(self.lines)
+
+
+def parse_logcat(text: str) -> AdbLogcatResult:
+    """Decode ``logcat -d -t`` ``threadtime`` rows (priority, tag, pid, message).
+
+    Junk lines (daemon chatter, blank rows, other formats) become warnings,
+    never errors; at :data:`MAX_LOG_LINES` rows the parse sets ``truncated``
+    and stops, and every message is clipped to :data:`MAX_LOG_MSG_CHARS`.
+    Malformed *input* (anything that is not ``str``) raises
+    :class:`~codevanta.core.report.AnalysisError`.
+    """
+    raw = _as_text(text)
+    lines: list[AdbLogcatLine] = []
+    warnings: list[str] = []
+    truncated = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if len(lines) >= MAX_LOG_LINES:
+            truncated = True
+            _note(warnings, f"line limit {MAX_LOG_LINES} reached; further rows dropped")
+            break
+        row = _LOGCAT_ROW.match(stripped)
+        if row is None:
+            _note(warnings, f"unparsable logcat row skipped: {stripped[:80]!r}")
+            continue
+        message = row.group("message")
+        if len(message) > MAX_LOG_MSG_CHARS:
+            message = message[:MAX_LOG_MSG_CHARS]
+        lines.append(
+            AdbLogcatLine(
+                priority=row.group("priority"),
+                tag=row.group("tag"),
+                pid=int(row.group("pid")),
+                message=message,
+            )
+        )
+    return AdbLogcatResult(
+        lines=tuple(lines),
+        truncated=truncated,
+        warnings=warnings,
+        evidence=_evidence_for(EVIDENCE_LOGCAT, "logcat -d -t", len(lines), warnings),
+    )
+
+
+def read_logcat(
+    serial: str,
+    *,
+    pid: int | None = None,
+    count: int = 50,
+    runner: Runner | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> AdbLogcatResult:
+    """Dump the recent log via ``adb -s <serial> logcat -d -t <count> [--pid=<pid>]``.
+
+    ``count`` is what adb is asked for (1..10000); the parser still keeps at
+    most :data:`MAX_LOG_LINES` rows so one noisy buffer cannot flood memory.
+    """
+    checked = _check_serial(serial)
+    if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or pid < 0):
+        raise AnalysisError(f"pid must be a non-negative int, got {pid!r}")
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise AnalysisError(f"count must be an int, got {count!r}")
+    if not 1 <= count <= 10000:
+        raise AnalysisError(f"count {count} is out of range; expected 1 .. 10000")
+    args = ["-s", checked, "logcat", "-d", "-t", str(count)]
+    label = f"logcat -d -t {count}"
+    if pid is not None:
+        args.append(f"--pid={pid}")
+        label = f"{label} --pid={pid}"
+    code, out, err = _run_adb(tuple(args), timeout=timeout, runner=runner)
+    _check_exit(("adb", "-s", checked, label), code, err)
+    return parse_logcat(out if isinstance(out, str) else "")
+
+
+# ---- am start / force-stop / settings ------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdbStartResult:
+    """Decoded ``am start -W`` launch: Status, LaunchState and TotalTime."""
+
+    serial: str
+    package: str
+    status: str | None
+    launch_state: str | None
+    total_time_ms: int | None
+    wait_time_ms: int | None
+    component: str | None
+    error: str | None
+    warnings: list[str] = field(default_factory=list)
+    evidence: Evidence = field(
+        default_factory=lambda: Evidence(
+            source=EVIDENCE_START,
+            method="am start -W",
+            confidence=Confidence.UNKNOWN,
+        )
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "serial": self.serial,
+            "package": self.package,
+            "status": self.status,
+            "launch_state": self.launch_state,
+            "total_time_ms": self.total_time_ms,
+            "wait_time_ms": self.wait_time_ms,
+            "component": self.component,
+            "error": self.error,
+            "warnings": list(self.warnings),
+            "evidence": self.evidence.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class AdbStopResult:
+    """Confirmation of one ``am force-stop`` invocation."""
+
+    serial: str
+    package: str
+    stopped: bool
+    warnings: list[str] = field(default_factory=list)
+    evidence: Evidence = field(
+        default_factory=lambda: Evidence(
+            source=EVIDENCE_STOP,
+            method="am force-stop",
+            confidence=Confidence.UNKNOWN,
+        )
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "serial": self.serial,
+            "package": self.package,
+            "stopped": self.stopped,
+            "warnings": list(self.warnings),
+            "evidence": self.evidence.to_dict(),
+        }
+
+
+def parse_am_start(text: str) -> AdbStartResult:
+    """Decode ``am start -W`` output into status, launch state and timings.
+
+    ``Status:``/``LaunchState:``/``TotalTime:``/``WaitTime:`` lines are kept
+    when present, the ``cmp=`` component of the launched intent is extracted,
+    and ``Error:`` lines become the result's ``error`` field. A transcript
+    with none of the markers warns and reports an unknown-confidence result.
+    Malformed *input* (anything that is not ``str``) raises
+    :class:`~codevanta.core.report.AnalysisError`.
+    """
+    raw = _as_text(text)
+    status: str | None = None
+    launch_state: str | None = None
+    total_time: int | None = None
+    wait_time: int | None = None
+    component: str | None = None
+    error: str | None = None
+    warnings: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Status:"):
+            status = stripped[len("Status:") :].strip() or None
+        elif stripped.startswith("LaunchState:"):
+            launch_state = stripped[len("LaunchState:") :].strip() or None
+        elif stripped.startswith("TotalTime:"):
+            total_time = _maybe_int(stripped[len("TotalTime:") :])
+        elif stripped.startswith("WaitTime:"):
+            wait_time = _maybe_int(stripped[len("WaitTime:") :])
+        elif stripped.startswith("Error:"):
+            error = stripped[len("Error:") :].strip() or None
+        elif stripped.startswith("Starting: Intent"):
+            component = _am_start_component(stripped)
+    found = sum(
+        1 for value in (status, launch_state, total_time, component) if value is not None
+    )
+    if found == 0:
+        _note(warnings, "no Status/LaunchState/TotalTime lines in the am start transcript")
+    detail = (
+        f"status {status!r}; launch state {launch_state!r}; total {total_time} ms"
+        if found
+        else None
+    )
+    return AdbStartResult(
+        serial="",
+        package="",
+        status=status,
+        launch_state=launch_state,
+        total_time_ms=total_time,
+        wait_time_ms=wait_time,
+        component=component,
+        error=error,
+        warnings=warnings,
+        evidence=_evidence_for(EVIDENCE_START, "am start -W", found, warnings, detail=detail),
+    )
+
+
+def _maybe_int(value: str) -> int | None:
+    """Parse one integer field, ``None`` when adb printed nothing numeric."""
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _am_start_component(line: str) -> str | None:
+    """Extract ``cmp=package/component`` from an ``am start`` intent line."""
+    info = re.search(r"cmp=(\S+?)(?=[\s}]|$)", line)
+    if info is None:
+        return None
+    return info.group(1)
+
+
+def _check_package(package: Any) -> str:
+    """Validate one Android package name before it reaches argv."""
+    if not isinstance(package, str):
+        raise AnalysisError(f"package must be a string, got {type(package).__name__}")
+    text = package.strip()
+    if not text:
+        raise AnalysisError("package must not be empty")
+    if len(text) > 256:
+        raise AnalysisError(f"package is {len(text)} characters long; expected at most 256")
+    if not _PACKAGE_CHARS.match(text):
+        raise AnalysisError(
+            f"package {text!r} contains characters adb does not accept; "
+            "expected alphanumerics plus . _"
+        )
+    return text
+
+
+def _check_device_path(path: Any) -> str:
+    """Validate one device-side path argument before it reaches argv."""
+    if not isinstance(path, str):
+        raise AnalysisError(f"device path must be a string, got {type(path).__name__}")
+    text = path.strip()
+    if not text:
+        raise AnalysisError("device path must not be empty")
+    if len(text) > MAX_DEVICE_PATH_CHARS:
+        raise AnalysisError(
+            f"device path is {len(text)} characters long; expected at most {MAX_DEVICE_PATH_CHARS}"
+        )
+    if any(char in text for char in ("\n", "\r", "\x00")):
+        raise AnalysisError("device path must not contain newline or NUL characters")
+    return text
+
+
+@dataclass(frozen=True)
+class AdbSettingResult:
+    """One ``settings get <namespace> <key>`` value."""
+
+    serial: str
+    namespace: str
+    key: str
+    value: str | None
+    warnings: list[str] = field(default_factory=list)
+    evidence: Evidence = field(
+        default_factory=lambda: Evidence(
+            source=EVIDENCE_SETTING,
+            method="settings get",
+            confidence=Confidence.UNKNOWN,
+        )
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "serial": self.serial,
+            "namespace": self.namespace,
+            "key": self.key,
+            "value": self.value,
+            "warnings": list(self.warnings),
+            "evidence": self.evidence.to_dict(),
+        }
+
+
+def start_app(
+    serial: str,
+    package: str,
+    *,
+    runner: Runner | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> AdbStartResult:
+    """Launch ``package`` via ``am start -W`` and decode the launch report."""
+    checked = _check_serial(serial)
+    checked_package = _check_package(package)
+    code, out, err = _run_adb(
+        ("-s", checked, "shell", "am", "start", "-W", checked_package),
+        timeout=timeout,
+        runner=runner,
+    )
+    _check_exit(("adb", "-s", checked, "shell am start -W", checked_package), code, err)
+    result = parse_am_start(out if isinstance(out, str) else "")
+    if result.status == "error" and result.error is None:
+        _note(result.warnings, "am start reported Status: error without an Error line")
+    return AdbStartResult(
+        serial=checked,
+        package=checked_package,
+        status=result.status,
+        launch_state=result.launch_state,
+        total_time_ms=result.total_time_ms,
+        wait_time_ms=result.wait_time_ms,
+        component=result.component,
+        error=result.error,
+        warnings=result.warnings,
+        evidence=result.evidence,
+    )
+
+
+def stop_app(
+    serial: str,
+    package: str,
+    *,
+    runner: Runner | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> AdbStopResult:
+    """Kill ``package`` via ``am force-stop`` (the process list decides success)."""
+    checked = _check_serial(serial)
+    checked_package = _check_package(package)
+    code, out, err = _run_adb(
+        ("-s", checked, "shell", "am", "force-stop", checked_package),
+        timeout=timeout,
+        runner=runner,
+    )
+    _check_exit(("adb", "-s", checked, "shell am force-stop", checked_package), code, err)
+    spoken = (out if isinstance(out, str) else "").strip()
+    warnings: list[str] = []
+    if spoken:
+        _note(warnings, f"am force-stop printed: {_tail(spoken, 200)}")
+    return AdbStopResult(
+        serial=checked,
+        package=checked_package,
+        stopped=code == 0,
+        warnings=warnings,
+        evidence=Evidence(
+            source=EVIDENCE_STOP,
+            method="am force-stop",
+            confidence=Confidence.CERTAIN,
+            detail=f"package {checked_package} force-stopped",
+            extra={"serial": checked},
+        ),
+    )
+
+
+def read_setting(
+    serial: str,
+    namespace: str,
+    key: str,
+    *,
+    runner: Runner | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> AdbSettingResult:
+    """Read one setting via ``settings get <namespace> <key>``.
+
+    ``namespace`` must be one of adb's ``system``/``secure``/``global``
+    tables. A missing setting prints ``null``; that is reported as ``None``
+    rather than the literal string.
+    """
+    checked = _check_serial(serial)
+    checked_key = _check_package(key)
+    if namespace not in ("system", "secure", "global"):
+        raise AnalysisError(
+            f"namespace {namespace!r} is not a settings table; expected system, secure or global"
+        )
+    code, out, err = _run_adb(
+        ("-s", checked, "shell", "settings", "get", namespace, checked_key),
+        timeout=timeout,
+        runner=runner,
+    )
+    _check_exit(
+        ("adb", "-s", checked, f"shell settings get {namespace}", checked_key), code, err
+    )
+    spoken = (out if isinstance(out, str) else "").strip()
+    warnings: list[str] = []
+    value: str | None = spoken or None
+    if spoken == "null":
+        value = None
+        _note(warnings, "the setting is unset on the device (adb printed null)")
+    return AdbSettingResult(
+        serial=checked,
+        namespace=namespace,
+        key=checked_key,
+        value=value,
+        warnings=warnings,
+        evidence=_evidence_for(
+            EVIDENCE_SETTING,
+            f"settings get {namespace}",
+            1 if value is not None else 0,
+            warnings,
+            detail=f"{namespace}/{checked_key} = {value!r}",
+        ),
+    )
+
+
+# ---- pull / push ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdbFileTransferResult:
+    """One file moved over adb, digested on the host side."""
+
+    serial: str
+    direction: str
+    device_path: str
+    host_path: str
+    sha256: str
+    size: int
+    warnings: list[str] = field(default_factory=list)
+    evidence: Evidence = field(
+        default_factory=lambda: Evidence(
+            source=EVIDENCE_PULL,
+            method="pull",
+            confidence=Confidence.UNKNOWN,
+        )
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "serial": self.serial,
+            "direction": self.direction,
+            "device_path": self.device_path,
+            "host_path": self.host_path,
+            "sha256": self.sha256,
+            "size": self.size,
+            "warnings": list(self.warnings),
+            "evidence": self.evidence.to_dict(),
+        }
+
+
+def pull_file(
+    serial: str,
+    device_path: str,
+    out_path: str | Path,
+    *,
+    runner: Runner | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> AdbFileTransferResult:
+    """Pull ``device_path`` to ``out_path``; the host-side sha256 is recorded.
+
+    The transfer budget is :data:`MAX_TRANSFER_BYTES` (512 MiB): a larger
+    landing file raises a typed error naming both sizes.
+    """
+    checked = _check_serial(serial)
+    checked_path = _check_device_path(device_path)
+    target = Path(out_path).expanduser()
+    parent = target.parent
+    if str(parent):
+        parent.mkdir(parents=True, exist_ok=True)
+    command_tail = ("-s", checked, "pull", checked_path, str(target))
+    code, out, err = _run_adb(command_tail, timeout=timeout, runner=runner)
+    _check_exit(("adb", "-s", checked, "pull", checked_path), code, err)
+    if not target.exists():
+        raise AnalysisError(
+            f"adb pull of {checked_path} on {checked} exited {code} but wrote nothing "
+            f"to {target}"
+        )
+    size = target.stat().st_size
+    warnings: list[str] = []
+    if size == 0:
+        _note(warnings, f"pulled file {target} is empty")
+    if size > MAX_TRANSFER_BYTES:
+        raise AnalysisError(
+            f"pulled file is {size} bytes; the transfer budget is {MAX_TRANSFER_BYTES} bytes"
+        )
+    digest, measured = _sha256_file(target)
+    spoken = (out if isinstance(out, str) else "").strip()
+    if spoken:
+        _note(warnings, f"adb pull reported: {_tail(spoken, 200)}")
+    return AdbFileTransferResult(
+        serial=checked,
+        direction="pull",
+        device_path=checked_path,
+        host_path=str(target),
+        sha256=digest,
+        size=measured,
+        warnings=warnings,
+        evidence=Evidence(
+            source=EVIDENCE_PULL,
+            method="pull",
+            confidence=Confidence.CERTAIN,
+            detail=f"sha256 {digest}",
+            extra={"size": measured, "serial": checked, "device_path": checked_path},
+        ),
+    )
+
+
+def push_file(
+    serial: str,
+    local_path: str | Path,
+    device_path: str,
+    *,
+    runner: Runner | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> AdbFileTransferResult:
+    """Push ``local_path`` to ``device_path``; the host-side sha256 is recorded first.
+
+    The size and digest are measured *before* adb runs, so the result names
+    exactly which bytes the device was asked to accept. The transfer budget is
+    :data:`MAX_TRANSFER_BYTES` (512 MiB) and is enforced pre-flight.
+    """
+    checked = _check_serial(serial)
+    checked_path = _check_device_path(device_path)
+    source = Path(local_path).expanduser()
+    if not source.exists():
+        raise AnalysisError(f"local file not found: {source}")
+    if not source.is_file():
+        raise AnalysisError(f"not a regular file: {source}")
+    size = source.stat().st_size
+    if size <= 0:
+        raise AnalysisError(f"local file {source} is empty")
+    if size > MAX_TRANSFER_BYTES:
+        raise AnalysisError(
+            f"local file {source} is {size} bytes; the transfer budget is "
+            f"{MAX_TRANSFER_BYTES} bytes"
+        )
+    digest, measured = _sha256_file(source)
+    command_tail = ("-s", checked, "push", str(source), checked_path)
+    code, out, err = _run_adb(command_tail, timeout=timeout, runner=runner)
+    _check_exit(("adb", "-s", checked, "push", checked_path), code, err)
+    spoken = (out if isinstance(out, str) else "").strip()
+    warnings: list[str] = []
+    if spoken:
+        _note(warnings, f"adb push reported: {_tail(spoken, 200)}")
+    return AdbFileTransferResult(
+        serial=checked,
+        direction="push",
+        device_path=checked_path,
+        host_path=str(source),
+        sha256=digest,
+        size=measured,
+        warnings=warnings,
+        evidence=Evidence(
+            source=EVIDENCE_PUSH,
+            method="push",
+            confidence=Confidence.CERTAIN,
+            detail=f"sha256 {digest}",
+            extra={"size": measured, "serial": checked, "device_path": checked_path},
         ),
     )
 
