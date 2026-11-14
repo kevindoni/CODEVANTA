@@ -1,0 +1,94 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', sans-serif; }
+  body { width: 1280px; height: 820px; background: #0b0d14; color: #d6e2f0; overflow: hidden; }
+  .titlebar { height: 36px; background: #12141d; display: flex; align-items: center; padding: 0 14px; border-bottom: 1px solid #1e2233; }
+  .dots span { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 7px; }
+  .d1 { background: #ff5f57; } .d2 { background: #febc2e; } .d3 { background: #28c840; }
+  .title { margin-left: 12px; font-size: 12.5px; color: #8b93a7; }
+  .badge { margin-left: auto; font-size: 11px; color: #7aa2f7; border: 1px solid #2a3350; padding: 2px 9px; border-radius: 10px; }
+  .shell { display: flex; height: 784px; }
+  .sidebar { width: 215px; background: #10121b; border-right: 1px solid #1e2233; padding: 14px 10px; }
+  .logo { font-size: 16px; font-weight: 700; color: #7aa2f7; letter-spacing: 1.5px; padding: 4px 10px 16px; }
+  .nav a { display: flex; align-items: center; gap: 10px; padding: 9px 12px; margin: 2px 0; border-radius: 8px; color: #98a2b8; font-size: 13px; text-decoration: none; }
+  .nav a.active { background: #1a2032; color: #c9d6ee; border-left: 3px solid #7aa2f7; }
+  .nav .ic { width: 16px; text-align: center; color: #7aa2f7; }
+  .main { flex: 1; padding: 20px 24px; }
+  h1 { font-size: 19px; margin-bottom: 4px; }
+  .sub { font-size: 12px; color: #6b748c; margin-bottom: 16px; }
+  .pick { display: grid; grid-template-columns: 1fr 40px 1fr 160px; gap: 10px; margin-bottom: 14px; align-items: end; }
+  .field label { display: block; font-size: 10.5px; color: #6b748c; margin-bottom: 4px; }
+  .input { background: #0e111a; border: 1px solid #262e45; border-radius: 7px; padding: 8px 10px; font-size: 12px; color: #cdd8ee; font-family: Consolas, monospace; }
+  .go { background: #2b57cf; color: #fff; text-align: center; padding: 9px 0; border-radius: 7px; font-size: 12px; font-weight: 600; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 14px; }
+  .card { background: #131722; border: 1px solid #232a3d; border-radius: 10px; padding: 12px 16px; }
+  .card .v { font-size: 20px; font-weight: 700; }
+  .card .k { font-size: 10.5px; color: #8b93a7; margin-top: 2px; }
+  .v-add { color: #4ade80; } .v-rem { color: #f87171; } .v-chg { color: #fbbf24; } .v-same { color: #7aa2f7; }
+  .panel { background: #131722; border: 1px solid #232a3d; border-radius: 10px; padding: 14px 16px; }
+  .panel h3 { font-size: 12px; color: #a9b4cc; text-transform: uppercase; letter-spacing: .8px; margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: #6b748c; font-size: 10.5px; padding: 5px 8px; }
+  td { padding: 6px 8px; border-top: 1px solid #1c2133; font-family: Consolas, monospace; font-size: 11.5px; }
+  .add { color: #4ade80; } .rem { color: #f87171; } .chg { color: #fbbf24; }
+  .evi { margin-top: 12px; font-size: 11px; color: #7a8399; font-family: Consolas, monospace; background: #0e111a; border: 1px solid #262e45; border-radius: 7px; padding: 8px 12px; }
+  .evi b { color: #7aa2f7; }
+</style>
+</head>
+<body>
+  <div class="titlebar">
+    <div class="dots"><span class="d1"></span><span class="d2"></span><span class="d3"></span></div>
+    <div class="title">CODEVANTA Desktop — decode · analyze · understand</div>
+    <div class="badge">compare.functions · HIGH</div>
+  </div>
+  <div class="shell">
+    <div class="sidebar">
+      <div class="logo">CODEVANTA</div>
+      <div class="nav">
+        <a><span class="ic">◈</span> Dashboard</a>
+        <a><span class="ic">⚙</span> Analisis</a>
+        <a><span class="ic">▤</span> Sesi</a>
+        <a class="active"><span class="ic">⇄</span> Compare (12)</a>
+        <a><span class="ic">✦</span> Frida / Live</a>
+        <a><span class="ic">?</span> Unknowns</a>
+        <a><span class="ic">✓</span> Obligations</a>
+        <a><span class="ic">⇌</span> Bridges</a>
+        <a><span class="ic">▣</span> Metadata</a>
+        <a><span class="ic">◉</span> MCP Server</a>
+      </div>
+    </div>
+    <div class="main">
+      <h1>Compare — v0.3.0-build</h1>
+      <div class="sub">Dua artifact, satu jawaban bertipe: apa yang berubah.</div>
+      <div class="pick">
+        <div class="field"><label>KIRI</label><div class="input">samples\report_elf64.json</div></div>
+        <div style="text-align:center; color:#6b748c; font-size:16px; padding-bottom:8px">⇄</div>
+        <div class="field"><label>KANAN</label><div class="input">samples\report_bundle.json</div></div>
+        <div class="field"><label>JENIS</label><div class="input">functions ▾</div></div>
+        <div class="go">Bandingkan</div>
+      </div>
+      <div class="cards">
+        <div class="card"><div class="v v-add">3</div><div class="k">DITAMBAHKAN</div></div>
+        <div class="card"><div class="v v-rem">1</div><div class="k">DIHAPUS</div></div>
+        <div class="card"><div class="v v-chg">2</div><div class="k">COCOK NAMA (PINDAH)</div></div>
+        <div class="card"><div class="v v-same">1</div><div class="k">FINGERPRINT SAMA</div></div>
+      </div>
+    </div>
+      <div class="panel">
+        <h3>Detail perubahan</h3>
+        <table>
+          <tr><th>STATUS</th><th>NAMA</th><th>KIRI</th><th>KANAN</th><th>BUKTI</th></tr>
+          <tr><td class="add">+ ditambahkan</td><td>codevanta_sample_helper</td><td>—</td><td>0x1400011A0</td><td>fingerprint baru</td></tr>
+          <tr><td class="rem">− dihapus</td><td>_legacy_init</td><td>0x1400012B0</td><td>—</td><td>tidak ada di kanan</td></tr>
+          <tr><td class="chg">~ pindah</td><td>codevanta_sample_main</td><td>0x140001000</td><td>0x140001130</td><td>alamat berubah</td></tr>
+          <tr><td class="chg">~ pindah</td><td>_dtor_helper</td><td>0x140001060</td><td>0x140001190</td><td>alamat berubah</td></tr>
+          <tr><td style="color:#7aa2f7">= identik</td><td>codevanta_sample_main</td><td>0x140001000</td><td>0x140001000</td><td>sha256 sama</td></tr>
+        </table>
+        <div class="evi">evidence: <b>compare.functions</b> / name_and_fingerprint_matching / confidence=<b>HIGH</b> · dibatasi MAX_FUNCTIONS=256 · one-run</div>
+      </div>
+  </div>
+</body>
+</html>
