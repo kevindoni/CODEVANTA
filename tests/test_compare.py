@@ -12,6 +12,7 @@ import hashlib
 import json
 import sqlite3
 import struct
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -22,25 +23,30 @@ from codevanta.analysis.compare import (
     COMPARE_WHATS,
     DEFAULT_MAX_CHANGED_SECTIONS,
     DEFAULT_MAX_DETAIL_KEYS,
+    DEFAULT_MAX_HAR_PATHS,
     DEFAULT_MAX_ROWS,
     JSON_COMPARE_WHATS,
     MAX_COMPARE_FUNCTIONS,
+    MAX_COMPARE_HAR_PATHS,
     MAX_COMPARE_REGISTERS,
     PATH_COMPARE_WHATS,
     compare_artifacts,
     compare_bundles,
     compare_crash,
     compare_firmware,
+    compare_har,
     compare_inventories,
     compare_metadata,
     compare_nav,
     compare_reports,
+    compare_screenshots,
     compare_sessions,
     compare_strings,
     compare_wasm,
     load_report_payload,
 )
 from codevanta.analysis.nav import NavStore
+from codevanta.analysis.png_diff import MAX_PNG_PIXELS, decode_png, load_png
 from codevanta.cli.main import app
 from codevanta.core.loader import BinaryInfo
 from codevanta.core.report import AnalysisError
@@ -501,11 +507,12 @@ def _session_db(tmp_path: Path, name: str, session_id: str) -> Path:
 # ---- registry sanity ----------------------------------------------------------
 
 
-def test_registry_partitions_all_ten_kinds() -> None:
-    assert len(COMPARE_WHATS) == 10
+def test_registry_partitions_all_twelve_kinds() -> None:
+    assert len(COMPARE_WHATS) == 12
     assert set(JSON_COMPARE_WHATS) | set(PATH_COMPARE_WHATS) == set(COMPARE_WHATS)
     assert not set(JSON_COMPARE_WHATS) & set(PATH_COMPARE_WHATS)
     assert "functions" in JSON_COMPARE_WHATS and "firmware" in PATH_COMPARE_WHATS
+    assert {"screenshots", "har"} <= set(PATH_COMPARE_WHATS)
 
 
 # ---- compare_reports ----------------------------------------------------------
@@ -941,7 +948,459 @@ def test_firmware_typed_errors(tmp_path: Path) -> None:
         compare_firmware(missing, missing)
 
 
-# ---- compare_artifacts dispatch -----------------------------------------------
+# ---- png_diff: fixture builder, decoder, pixel_diff ---------------------------
+
+
+def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+    """One CRC-verified PNG chunk (test-local builder)."""
+    return (
+        struct.pack(">I", len(payload))
+        + chunk_type
+        + payload
+        + struct.pack(">I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
+    )
+
+
+def _paeth(a: int, b: int, c: int) -> int:
+    """Encoder-side Paeth predictor (must mirror the decoder's)."""
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def _make_png(
+    width: int,
+    height: int,
+    pixels: list[list[tuple[int, ...]]],
+    *,
+    color_type: int = 2,
+    filter_type: int = 0,
+    bit_depth: int = 8,
+    interlace: int = 0,
+    compression: int = 0,
+) -> bytes:
+    """A minimal valid 8-bit PNG with the requested filter applied per row."""
+    channels = {0: 1, 2: 3, 6: 4}[color_type]
+    header = struct.pack(
+        ">IIBBBBB", width, height, bit_depth, color_type, compression, 0, interlace
+    )
+    stream = bytearray()
+    previous = [0] * (width * channels)
+    for row in pixels:
+        flat = [value for pixel in row for value in pixel]
+        filtered = bytearray([filter_type])
+        for x in range(len(flat)):
+            left = flat[x - channels] if x >= channels else 0
+            above = previous[x]
+            upper_left = previous[x - channels] if x >= channels else 0
+            if filter_type == 0:
+                value = flat[x]
+            elif filter_type == 1:
+                value = (flat[x] - left) & 0xFF
+            elif filter_type == 2:
+                value = (flat[x] - above) & 0xFF
+            elif filter_type == 3:
+                value = (flat[x] - ((left + above) >> 1)) & 0xFF
+            else:
+                value = (flat[x] - _paeth(left, above, upper_left)) & 0xFF
+            filtered.append(value)
+        stream.extend(filtered)
+        previous = flat
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(bytes(stream)))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _gradient(width: int, height: int) -> list[list[tuple[int, int, int]]]:
+    """Deterministic RGB image used as the baseline screenshot fixture."""
+    return [
+        [((column * 7) % 256, (row * 3) % 256, 128) for column in range(width)]
+        for row in range(height)
+    ]
+
+
+def _write_png(path: Path, blob: bytes) -> Path:
+    path.write_bytes(blob)
+    return path
+
+
+def test_png_decoder_roundtrips_all_five_filters() -> None:
+    pixels = _gradient(16, 16)
+    expected = tuple(tuple(row) for row in pixels)
+    for filter_type in range(5):
+        image = decode_png(_make_png(16, 16, pixels, filter_type=filter_type))
+        assert image.width == 16 and image.height == 16
+        assert image.color_type == 2 and image.channels == 3
+        assert image.pixels == expected, f"filter {filter_type}"
+
+
+def test_png_decoder_supports_grayscale_and_rgba() -> None:
+    gray = decode_png(_make_png(2, 2, [[(10,), (20,)], [(30,), (40,)]], color_type=0))
+    assert gray.channels == 1
+    assert gray.pixels == (((10,), (20,)), ((30,), (40,)))
+    rgba = decode_png(
+        _make_png(1, 2, [[(1, 2, 3, 4)], [(5, 6, 7, 8)]], color_type=6)
+    )
+    assert rgba.channels == 4
+    assert rgba.pixels == (((1, 2, 3, 4),), ((5, 6, 7, 8),))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "pixels", "message"),
+    [
+        ({"bit_depth": 16}, [[(1, 2, 3)]], "unsupported bit depth 16"),
+        ({"filter_type": 5}, [[(1, 2, 3)]], "unsupported filter type 5"),
+        ({"interlace": 1}, [[(1, 2, 3)]], "interlaced"),
+        ({"compression": 1}, [[(1, 2, 3)]], "compression method"),
+    ],
+)
+def test_png_header_and_filter_typed_errors(
+    kwargs: dict[str, Any], pixels: list[list[tuple[int, ...]]], message: str
+) -> None:
+    blob = _make_png(1, 1, pixels, **kwargs)
+    with pytest.raises(AnalysisError, match=message):
+        decode_png(blob)
+
+
+def test_png_typed_errors_structural(tmp_path: Path) -> None:
+    signature = b"\x89PNG\r\n\x1a\n"
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    body = _make_png(1, 1, [[(1, 2, 3)]])
+    with pytest.raises(AnalysisError, match="bad signature"):
+        decode_png(b"NOTPNG!" + body[8:])
+    with pytest.raises(AnalysisError, match="missing IHDR"):
+        decode_png(signature + _png_chunk(b"IEND", b""))
+    with pytest.raises(AnalysisError, match="IDAT before IHDR"):
+        decode_png(
+            signature + _png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00")) + _png_chunk(b"IEND", b"")
+        )
+    with pytest.raises(AnalysisError, match="duplicate IHDR"):
+        decode_png(body[:-12] + _png_chunk(b"IHDR", header) + _png_chunk(b"IEND", b""))
+    with pytest.raises(AnalysisError, match="fails its CRC"):
+        broken = bytearray(body)
+        broken[-1] ^= 0xFF  # corrupt IEND's stored CRC byte
+        decode_png(bytes(broken))
+    with pytest.raises(AnalysisError, match="missing IEND"):
+        decode_png(body[:-12])
+    with pytest.raises(AnalysisError, match="unsupported critical chunk"):
+        decode_png(
+            signature
+            + _png_chunk(b"ABCD", b"x")
+            + _png_chunk(b"IHDR", header)
+            + _png_chunk(b"IEND", b"")
+        )
+    with pytest.raises(AnalysisError, match="invalid dimensions"):
+        decode_png(
+            signature
+            + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 0, 4, 8, 2, 0, 0, 0))
+            + _png_chunk(b"IEND", b"")
+        )
+    with pytest.raises(AnalysisError, match="pixel ceiling"):
+        assert 5000 * 5000 > MAX_PNG_PIXELS
+        decode_png(
+            signature
+            + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 5000, 5000, 8, 2, 0, 0, 0))
+            + _png_chunk(b"IDAT", zlib.compress(b"\x00"))
+            + _png_chunk(b"IEND", b"")
+        )
+    with pytest.raises(AnalysisError, match="missing IDAT"):
+        decode_png(signature + _png_chunk(b"IHDR", header) + _png_chunk(b"IEND", b""))
+    # A truncated decompressed scanline stream is a typed error, not a crash.
+    with pytest.raises(AnalysisError, match="scanline data truncated"):
+        decode_png(
+            signature
+            + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+            + _png_chunk(b"IDAT", zlib.compress(b"\x00\x01\x02\x03"))
+            + _png_chunk(b"IEND", b"")
+        )
+    # An oversize decompressed stream (IDAT lies about its content) too.
+    with pytest.raises(AnalysisError, match="exceeds the expected size"):
+        decode_png(
+            signature
+            + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+            + _png_chunk(
+                b"IDAT", zlib.compress(b"\x00" + b"\x01" * 12 + b"\x00" + b"\x02" * 12)
+            )
+            + _png_chunk(b"IEND", b"")
+        )
+
+
+def test_load_png_rejects_unreadable_file(tmp_path: Path) -> None:
+    with pytest.raises(AnalysisError, match="cannot read"):
+        load_png(tmp_path / "absent.png")
+
+
+def test_pixel_diff_identical_pair_is_identical(tmp_path: Path) -> None:
+    blob = _make_png(16, 16, _gradient(16, 16))
+    left = _write_png(tmp_path / "a.png", blob)
+    right = _write_png(tmp_path / "b.png", blob)
+    result = compare_screenshots(left, right)
+    diff = result.diff
+    assert diff.verdict == "identical" and diff.identical is True
+    assert diff.changed_pixels == 0 and diff.changed_ratio == 0.0
+    assert all(delta.mean == 0.0 for delta in diff.channel_deltas)
+    payload = result.to_dict()
+    assert payload["what"] == "screenshots"
+    assert payload["evidence"]["source"] == "compare.screenshots"
+    assert payload["evidence"]["confidence"] == "high"
+    text = json.dumps(payload, allow_nan=False)
+    assert json.loads(text) == payload
+
+
+def test_pixel_diff_one_pixel_change_is_minor(tmp_path: Path) -> None:
+    pixels = _gradient(16, 16)
+    changed = [list(row) for row in pixels]
+    changed[3][5] = (0, 0, 200)
+    left = _write_png(tmp_path / "a.png", _make_png(16, 16, pixels))
+    right = _write_png(
+        tmp_path / "b.png", _make_png(16, 16, [tuple(p) for p in changed])
+    )
+    result = compare_screenshots(left, right)
+    diff = result.diff
+    assert pixels[3][5] == (35, 9, 128)  # derived expectation, not hardcoded
+    assert diff.changed_pixels == 1
+    assert diff.changed_ratio == round(1 / (16 * 16), 6)
+    assert diff.verdict == "minor" and diff.identical is False
+    assert {delta.name: delta.mean for delta in diff.channel_deltas} == {
+        "r": 35.0,
+        "g": 9.0,
+        "b": 72.0,
+    }
+    assert result.warnings == ()
+
+
+def test_pixel_diff_ratio_at_threshold_is_major(tmp_path: Path) -> None:
+    pixels = _gradient(10, 10)
+    changed = [list(row) for row in pixels]
+    changed[0][0] = (255, 0, 0)
+    left = _write_png(tmp_path / "a.png", _make_png(10, 10, pixels))
+    right = _write_png(
+        tmp_path / "b.png", _make_png(10, 10, [tuple(p) for p in changed])
+    )
+    result = compare_screenshots(left, right)
+    # 1 of 100 pixels is exactly 0.01 -- minor is strictly below the bound.
+    assert result.diff.changed_ratio == 0.01
+    assert result.diff.verdict == "major"
+
+
+def test_pixel_diff_different_dimensions_is_major_with_note(tmp_path: Path) -> None:
+    left = _write_png(tmp_path / "small.png", _make_png(2, 2, [[(1, 2, 3)] * 2] * 2))
+    right = _write_png(
+        tmp_path / "big.png",
+        _make_png(4, 4, [[(0, 0, 0)] * 4 for _ in range(4)]),
+    )
+    result = compare_screenshots(left, right)
+    diff = result.diff
+    assert diff.verdict == "major" and diff.identical is False
+    assert diff.changed_ratio == 1.0
+    assert diff.changed_pixels == 0  # no aligned grid, so no pixel loop ran
+    assert any("dimensions differ" in warning for warning in diff.warnings)
+    assert result.warnings == diff.warnings
+
+
+def test_pixel_diff_color_type_mismatch_compares_prefix(tmp_path: Path) -> None:
+    left = _write_png(
+        tmp_path / "rgb.png", _make_png(2, 1, [[(10, 20, 30), (1, 2, 3)]])
+    )
+    right = _write_png(
+        tmp_path / "rgba.png",
+        _make_png(2, 1, [[(10, 20, 30, 255), (1, 2, 3, 0)]], color_type=6),
+    )
+    result = compare_screenshots(left, right)
+    assert result.diff.verdict == "identical"
+    assert any("color types differ" in warning for warning in result.warnings)
+    assert [delta.name for delta in result.diff.channel_deltas] == ["ch0", "ch1", "ch2"]
+
+
+def test_compare_screenshots_rejects_broken_png(tmp_path: Path) -> None:
+    junk = _write_png(tmp_path / "junk.png", b"definitely not a png")
+    good = _write_png(tmp_path / "good.png", _make_png(1, 1, [[(0, 0, 0)]]))
+    with pytest.raises(AnalysisError, match="not a PNG"):
+        compare_screenshots(junk, good)
+    with pytest.raises(AnalysisError, match="cannot read"):
+        compare_screenshots(tmp_path / "missing.png", good)
+
+
+# ---- compare_har: fixtures through the sibling har_capture parser -------------
+
+
+def _har_entry(method: str, url: str, status: int, time_ms: float = 10.0) -> dict[str, Any]:
+    """One minimal HAR log entry with a request/response pair."""
+    return {
+        "startedDateTime": "2026-01-01T00:00:00.000Z",
+        "time": time_ms,
+        "request": {"method": method, "url": url, "headers": []},
+        "response": {
+            "status": status,
+            "headers": [],
+            "content": {"size": 1, "mimeType": "application/json"},
+        },
+    }
+
+
+def _write_har(path: Path, entries: list[dict[str, Any]]) -> Path:
+    """Write a small HAR document; expectations derive from ``entries``."""
+    path.write_text(
+        json.dumps({"log": {"entries": entries}}, sort_keys=True), encoding="utf-8"
+    )
+    return path
+
+
+def test_har_self_compare_is_identical(tmp_path: Path) -> None:
+    entries = [
+        _har_entry("GET", "https://app.test/api/a?token=x", 200),
+        _har_entry("POST", "https://app.test/api/b", 201, time_ms=2.5),
+    ]
+    left = _write_har(tmp_path / "a.har", entries)
+    right = _write_har(tmp_path / "b.har", entries)
+    result = compare_har(left, right)
+    assert result.identical is True and result.verdict == "identical"
+    assert result.left_entries == result.right_entries == len(entries)
+    assert result.paths_added == () and result.paths_removed == ()
+    assert result.status_changes == () and result.method_deltas == ()
+    payload = result.to_dict()
+    assert payload["what"] == "har"
+    assert payload["evidence"]["source"] == "compare.har"
+    assert payload["evidence"]["confidence"] == "high"
+    text = json.dumps(payload, allow_nan=False)
+    assert json.loads(text) == payload
+
+
+def test_har_path_status_and_method_diff(tmp_path: Path) -> None:
+    left = _write_har(
+        tmp_path / "a.har",
+        [
+            _har_entry("GET", "https://app.test/api/a?q=1", 200),
+            _har_entry("POST", "https://app.test/api/b", 201),
+            _har_entry("DELETE", "https://app.test/gone", 204),
+        ],
+    )
+    right = _write_har(
+        tmp_path / "b.har",
+        [
+            _har_entry("GET", "https://app.test/api/a?q=2", 200),
+            _har_entry("POST", "https://app.test/api/b", 404),
+            _har_entry("get", "https://other.test/new", 200),  # case + new host
+        ],
+    )
+    result = compare_har(left, right)
+    assert result.paths_added == ("/new",)
+    assert result.paths_removed == ("/gone",)
+    assert result.status_change_count == 1
+    change = result.status_changes[0]
+    assert (change.method, change.path) == ("POST", "/api/b")
+    assert change.left_statuses == (201,) and change.right_statuses == (404,)
+    methods = {delta.method: delta.to_dict() for delta in result.method_deltas}
+    assert methods["GET"]["delta"] == 1
+    assert methods["DELETE"]["delta"] == -1  # method normalised case-insensitively
+    assert result.identical is False and result.verdict == "changed"
+    payload = result.to_dict()
+    assert payload["entry_delta"] == 0  # 3 vs 3 entries; drift shows in paths
+    assert payload["left_listed"] == 3 and payload["right_listed"] == 3
+
+
+def test_har_time_delta_never_breaks_identity(tmp_path: Path) -> None:
+    entries_a = [_har_entry("GET", "https://app.test/x", 200, time_ms=10.0)]
+    entries_b = [_har_entry("GET", "https://app.test/x", 200, time_ms=99.5)]
+    left = _write_har(tmp_path / "a.har", entries_a)
+    right = _write_har(tmp_path / "b.har", entries_b)
+    result = compare_har(left, right)
+    assert result.identical is True
+    assert result.time_delta_ms == 89.5
+
+
+def test_har_path_budget_bounds_and_warns(tmp_path: Path) -> None:
+    left = _write_har(tmp_path / "a.har", [_har_entry("GET", "https://h.test/keep", 200)])
+    right = _write_har(
+        tmp_path / "b.har",
+        [_har_entry("GET", f"https://h.test/new{i}", 200) for i in range(5)],
+    )
+    result = compare_har(left, right, max_paths=2)
+    assert result.paths_added == ("/new0", "/new1")
+    assert any("kept 2 of 5" in warning for warning in result.warnings)
+    with pytest.raises(AnalysisError, match="max_paths must be between 1 and"):
+        compare_har(left, right, max_paths=0)
+    with pytest.raises(AnalysisError, match="max_paths must be between 1 and"):
+        compare_har(left, right, max_paths=MAX_COMPARE_HAR_PATHS + 1)
+    assert DEFAULT_MAX_HAR_PATHS == 64  # the documented bound
+
+
+def test_har_typed_errors_pass_through(tmp_path: Path) -> None:
+    entries = [_har_entry("GET", "https://h.test/x", 200)]
+    left = _write_har(tmp_path / "a.har", entries)
+    broken = tmp_path / "broken.har"
+    broken.write_text("{not json", encoding="utf-8")
+    with pytest.raises(AnalysisError):
+        compare_har(left, broken)
+    with pytest.raises(AnalysisError, match="cannot read|file not found"):
+        compare_har(left, tmp_path / "absent.har")
+
+
+# ---- CLI + dispatch + MCP for the two new kinds --------------------------------
+
+
+def test_cli_compare_screenshots_text_and_json(tmp_path: Path) -> None:
+    changed = [list(row) for row in _gradient(16, 16)]
+    changed[0][0] = (1, 1, 1)
+    left = _write_png(tmp_path / "a.png", _make_png(16, 16, _gradient(16, 16)))
+    right = _write_png(
+        tmp_path / "b.png", _make_png(16, 16, [tuple(p) for p in changed])
+    )
+    result = runner.invoke(app, ["compare", str(left), str(right), "--what", "screenshots"])
+    assert result.exit_code == 0, result.output
+    # 1 of 256 pixels = 0.003906 < 0.01 -> minor; the footer is the compare-level record.
+    assert "verdict: minor" in result.output
+    assert "screenshot_file_diff" in result.output
+
+    as_json = runner.invoke(
+        app,
+        ["compare", str(left), str(right), "--what", "screenshots", "--format", "json"],
+    )
+    assert as_json.exit_code == 0, as_json.output
+    payload = json.loads(as_json.output)
+    assert payload["what"] == "screenshots"
+    assert payload["changed_pixels"] == 1
+    assert payload["verdict"] == "minor"
+
+
+def test_cli_compare_har_text_and_json(tmp_path: Path) -> None:
+    left = _write_har(tmp_path / "a.har", [_har_entry("GET", "https://h.test/x", 200)])
+    right = _write_har(
+        tmp_path / "b.har",
+        [
+            _har_entry("GET", "https://h.test/x", 200),
+            _har_entry("POST", "https://h.test/y", 201),
+        ],
+    )
+    result = runner.invoke(app, ["compare", str(left), str(right), "--what", "har"])
+    assert result.exit_code == 0, result.output
+    assert "entries: 1 vs 2" in result.output
+    assert "har_summary_diff" in result.output
+    as_json = runner.invoke(
+        app, ["compare", str(left), str(right), "--what", "har", "--format", "json"]
+    )
+    assert as_json.exit_code == 0, as_json.output
+    payload = json.loads(as_json.output)
+    assert payload["what"] == "har"
+    assert payload["paths_added"] == ["/y"]
+    assert payload["verdict"] == "changed"
+
+
+def test_cli_compare_screenshots_error_exits_two(tmp_path: Path) -> None:
+    junk = _write_png(tmp_path / "junk.png", b"nope")
+    result = runner.invoke(app, ["compare", str(junk), str(junk), "--what", "screenshots"])
+    assert result.exit_code == 2
+    assert "error:" in result.output
+
+
+# --- dispatch registry additions appended below ---
 
 
 def test_dispatch_rejects_unknown_what(tmp_path: Path) -> None:
@@ -968,6 +1427,10 @@ def test_dispatch_runs_every_registered_kind(tmp_path: Path) -> None:
     image = tmp_path / "fw.img"
     image.write_bytes(b"\x00" * 512)
     assert isinstance(compare_artifacts("firmware", image, image), object)
+    shot = _write_png(tmp_path / "shot.png", _make_png(4, 4, _gradient(4, 4)))
+    assert isinstance(compare_artifacts("screenshots", shot, shot), object)
+    har_path = _write_har(tmp_path / "c.har", [_har_entry("GET", "https://h.test/x", 200)])
+    assert isinstance(compare_artifacts("har", har_path, har_path), object)
 
 
 def test_dispatch_bundles_rejects_non_bundle(tmp_path: Path) -> None:
@@ -1080,4 +1543,14 @@ def test_mcp_compare_reports_and_wasm(tmp_path: Path) -> None:
     assert wasm_payload["what"] == "wasm" and wasm_payload["identical"] is True
     with pytest.raises(AnalysisError):
         tools.compare(str(wasm_path), str(wasm_path), what="sessions")
+    shot = _write_png(tmp_path / "s.png", _make_png(4, 4, _gradient(4, 4)))
+    shot_payload = tools.compare(str(shot), str(shot), what="screenshots")
+    assert shot_payload["what"] == "screenshots"
+    assert shot_payload["identical"] is True
+    assert shot_payload["evidence"]["source"] == "compare.screenshots"
+    har_path = _write_har(tmp_path / "m.har", [_har_entry("GET", "https://h.test/x", 200)])
+    har_payload = tools.compare(str(har_path), str(har_path), what="har")
+    assert har_payload["what"] == "har"
+    assert har_payload["identical"] is True
+    assert har_payload["evidence"]["source"] == "compare.har"
 
