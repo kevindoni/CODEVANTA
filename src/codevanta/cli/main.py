@@ -124,8 +124,12 @@ from codevanta.analysis.type_recovery import (
 )
 from codevanta.analysis.vtables import find_vtables
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
+from codevanta.cli.bridges import bridges_apps
 from codevanta.cli.containers import app as containers_app
 from codevanta.cli.crash import app as crash_app
+from codevanta.cli.depth import apk_app as apk_app
+from codevanta.cli.depth import certs_app as certs_app
+from codevanta.cli.depth import js_app as js_app
 from codevanta.cli.meta import meta_app
 from codevanta.cli.mobile import app as mobile_app
 from codevanta.cli.nav import app as nav_app
@@ -2694,6 +2698,15 @@ app.add_typer(signal_app)
 app.add_typer(crash_app, name="crash")
 app.add_typer(mobile_app, name="mobile")
 app.add_typer(nav_app, name="nav")  # lane-nav: ONE registration line for the navigation sub-app
+# lane-bridge-a: ONE registration block for the bridges lane (capability report
+# plus firmware/pcap/wasm/objdump sub-apps, one loop, deterministic order).
+for _bridges_name, _bridges_sub_app in bridges_apps:
+    app.add_typer(_bridges_sub_app, name=_bridges_name)
+# lane-bridge-b: ONE registration block for the depth-bridges lane
+# (apktool decode / Wakaru recovery / pure-Python PE certificate table).
+app.add_typer(apk_app, name="apk")
+app.add_typer(js_app, name="js")
+app.add_typer(certs_app, name="certs")
 app.add_typer(web_app, name="web")
 app.command("asar", help="List an Electron ASAR archive; optionally extract one entry")(asar)
 

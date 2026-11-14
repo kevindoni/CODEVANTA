@@ -92,6 +92,7 @@ from codevanta.analysis.trace import (
     parse_frida_trace,
     parse_gdb_trace,
 )
+from codevanta.analysis.tshark_bridge import DEFAULT_PACKET_LIMIT as DEFAULT_TSHARK_PACKET_LIMIT  # noqa: F401 -- re-exported for the server wrapper default
 from codevanta.analysis.type_recovery import (
     DEFAULT_MAX_FIELDS,
     DEFAULT_MAX_INSTRUCTIONS,
@@ -133,7 +134,21 @@ from codevanta.core.unknowns import (
 )
 from codevanta.mcp_server.ext_bin import codevanta_binmeta as codevanta_binmeta
 from codevanta.mcp_server.ext_bin import codevanta_sqlite as codevanta_sqlite
+from codevanta.mcp_server.ext_bridges import (  # lane-bridge-a: ONE MCP registration import line
+    codevanta_bridges,  # noqa: F401
+    codevanta_firmware_extract,  # noqa: F401
+    codevanta_pcap_fields,  # noqa: F401
+)
 from codevanta.mcp_server.ext_crash import codevanta_crash as codevanta_crash
+from codevanta.mcp_server.ext_depth import (  # lane-bridge-b: ONE MCP registration line
+    codevanta_apk_decode as codevanta_apk_decode,
+)
+from codevanta.mcp_server.ext_depth import (
+    codevanta_certs as codevanta_certs,
+)
+from codevanta.mcp_server.ext_depth import (
+    codevanta_js_recover as codevanta_js_recover,
+)
 from codevanta.mcp_server.ext_meta import (
     codevanta_metadata as codevanta_metadata,  # lane-meta: ONE MCP registration line
 )
