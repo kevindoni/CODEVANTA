@@ -590,16 +590,26 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
-            "Compare two offline CODEVANTA JSON artifacts: analyze report "
-            "payloads (an evidence bundle is unwrapped to its 'report' entry "
-            "automatically) or two evidence-bundle documents. what='functions' "
-            "reports added/removed functions plus matches by name and by "
-            "function_hash fingerprint (shapes, not proof of identity, "
-            "medium confidence); what='strings' reports added/removed string "
-            "texts; what='bundles' diffs bundles by record kind and payload "
-            "digest membership (exact, high confidence). Never loads or "
-            "executes a binary: the comparison is reproducible from the two "
-            "documents alone."
+            "Compare two offline CODEVANTA artifacts. what='functions' or "
+            "'strings' diff analyze report payloads (an evidence bundle is "
+            "unwrapped to its 'report' entry automatically): functions "
+            "match by name and function_hash fingerprint (shapes, not "
+            "proof of identity, medium confidence), strings are exact set "
+            "diffs. what='bundles' diffs evidence bundles by record kind "
+            "and payload digest membership (exact, high confidence). "
+            "what='reports' diffs two report payloads structurally by "
+            "canonical-JSON sha256 per section plus element counts. "
+            "what='metadata' diffs two binmeta MetadataReport documents by "
+            "format kind and detail keys. Path-backed kinds take non-JSON "
+            "files: what='wasm' (two WASM modules: section sets, bounded "
+            "import/export name diffs, byte-size deltas), what='crash' "
+            "(two ELF core dumps: signal, faulting module, bounded "
+            "register deltas, same_crash_site verdict with confidence), "
+            "what='sessions' (two session DBs: annotation count deltas, "
+            "addresses only on one side), what='nav' (bookmark/comment/"
+            "cursor diffs via NavStore), what='firmware' (magic-scan hits "
+            "appeared/disappeared, heuristic provenance). Never loads or "
+            "executes a binary for comparison."
         )
     )
     def codevanta_compare(
@@ -608,6 +618,9 @@ def build_server() -> MCPServer:
         what: str = "functions",
         max_functions: int = tools.COMPARE_MAX_FUNCTIONS,
         max_strings: int = tools.COMPARE_MAX_STRINGS,
+        max_changed_sections: int = tools.COMPARE_MAX_CHANGED_SECTIONS,
+        max_detail_keys: int = tools.COMPARE_MAX_DETAIL_KEYS,
+        max_rows: int = tools.COMPARE_MAX_ROWS,
     ) -> dict:
         return tools.compare(
             a,
@@ -615,6 +628,9 @@ def build_server() -> MCPServer:
             what=what,
             max_functions=max_functions,
             max_strings=max_strings,
+            max_changed_sections=max_changed_sections,
+            max_detail_keys=max_detail_keys,
+            max_rows=max_rows,
         )
 
     @server.tool(
@@ -639,6 +655,7 @@ def build_server() -> MCPServer:
         evidence_refs: list[str] | None = None,
         note: str | None = None,
         status: str | None = None,
+        expected_revision: int | None = None,
     ) -> dict:
         return tools.unknowns(
             action,
@@ -650,7 +667,64 @@ def build_server() -> MCPServer:
             evidence_refs=evidence_refs,
             note=note,
             status=status,
+            expected_revision=expected_revision,
         )
+
+    @server.tool(
+        description=(
+            "Manage the obligation ledger (ledger v2): typed records for the "
+            "evidence an analysis still owes, each with a required authority "
+            "(parsed/computed/verified), confidence (low/medium/high), "
+            "environment (host/device/network), recommended probes and "
+            "evidence refs. action='list' (optionally status-filtered), "
+            "'get' (one record with its immutable revision trail), 'add' "
+            "(question required), 'discharge'/'waive' (close one open id, "
+            "CAS via expected_revision), 'remove'. Deterministic content ids; "
+            "the ledger is a JSON payload embeddable in an evidence bundle "
+            "as its 'obligations' entry."
+        )
+    )
+    def codevanta_obligations(
+        action: str,
+        ledger: str,
+        obligation_id: str | None = None,
+        question: str | None = None,
+        required_authority: str = tools.DEFAULT_OBLIGATION_AUTHORITY,
+        required_confidence: str = tools.DEFAULT_OBLIGATION_CONFIDENCE,
+        required_environment: str = tools.DEFAULT_OBLIGATION_ENVIRONMENT,
+        recommended_probes: list[str] | None = None,
+        evidence_refs: list[str] | None = None,
+        note: str | None = None,
+        status: str | None = None,
+        expected_revision: int | None = None,
+    ) -> dict:
+        return tools.codevanta_obligations(
+            action,
+            ledger,
+            obligation_id=obligation_id,
+            question=question,
+            required_authority=required_authority,
+            required_confidence=required_confidence,
+            required_environment=required_environment,
+            recommended_probes=recommended_probes,
+            evidence_refs=evidence_refs,
+            note=note,
+            status=status,
+            expected_revision=expected_revision,
+        )
+
+    @server.tool(
+        description=(
+            "Evaluate obligation coverage (ledger v2): match every "
+            "obligation's evidence_refs in an obligations ledger against one "
+            "evidence bundle's entry names (kinds), entry digests and payload "
+            "record ids, and report a complete/partial/uncovered verdict per "
+            "obligation plus overall counts. Deterministic ordering, fully "
+            "offline."
+        )
+    )
+    def codevanta_coverage(obligations_ledger: str, evidence_bundle: str) -> dict:
+        return tools.codevanta_coverage(obligations_ledger, evidence_bundle)
 
     @server.tool(
         description=(
@@ -689,6 +763,20 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Summarise a Mach-O's embedded code signature (structure only, "
+            "offline): the LC_CODE_SIGNATURE offset, the SuperBlob slot table "
+            "(bounded), the code-directory identifier, the entitlements key "
+            "list (bounded) and a certificate count from the CMS blob. No "
+            "trust verification - hashes, chains and signatures are never "
+            "checked. Unsigned files and malformed signatures surface as "
+            "typed errors, never tracebacks."
+        )
+    )
+    def codevanta_codesign(path: str) -> dict:
+        return tools.codevanta_codesign(path)
+
+    @server.tool(
+        description=(
             "Introspect a SQLite database strictly read-only through the "
             "mode=ro&immutable=1 URI: a bounded table list with row counts, "
             "and with `table` that table's columns plus up to 10 sample rows "
@@ -704,17 +792,51 @@ def build_server() -> MCPServer:
         description=(
             "Read-only Android device queries over adb: action='devices' "
             "lists attached devices/emulators; action='props'/'packages'/"
-            "'processes' inspect the device named by `device`. Requires adb "
-            "on PATH - its absence surfaces as a typed error naming the "
-            "platform-tools install step, never a traceback. Mutating actions "
-            "(install, screencap, bugreport) are deliberately not exposed."
+            "'processes'/'setting' inspect the device named by `device`; "
+            "action='logcat' dumps recent log rows (bounded 200, optional "
+            "pid/count). Device-mutating actions are limited to the app "
+            "lifecycle: action='start'/'stop' launch or force-stop "
+            "`package`, action='pull'/'push' move one bounded file (512 "
+            "MiB) between `local_path` and `remote_path` with a host-side "
+            "sha256. Requires adb on PATH - its absence surfaces as a typed "
+            "error naming the platform-tools install step, never a "
+            "traceback. Mutating actions (install, screencap, bugreport) "
+            "are deliberately not exposed."
         )
     )
     def codevanta_adb(
-        action: Literal["devices", "props", "packages", "processes"],
+        action: Literal[
+            "devices",
+            "props",
+            "packages",
+            "processes",
+            "logcat",
+            "pull",
+            "push",
+            "start",
+            "stop",
+            "setting",
+        ],
         device: str | None = None,
+        pid: int | None = None,
+        count: int = 50,
+        local_path: str | None = None,
+        remote_path: str | None = None,
+        package: str | None = None,
+        namespace: str | None = None,
+        key: str | None = None,
     ) -> dict:
-        return tools.codevanta_adb(action, device)
+        return tools.codevanta_adb(
+            action,
+            device,
+            pid=pid,
+            count=count,
+            local_path=local_path,
+            remote_path=remote_path,
+            package=package,
+            namespace=namespace,
+            key=key,
+        )
 
     @server.tool(
         description=(
@@ -945,6 +1067,63 @@ def build_server() -> MCPServer:
     )
     def codevanta_certs(path: str) -> dict:
         return tools.codevanta_certs(path)
+
+    # lane-live2: live instrumentation bridges (frida / lldb / rizin).
+    @server.tool(
+        description=(
+            "Live Frida bridge. action='devices' lists Frida devices "
+            "(frida-ls-devices); action='ps' lists processes, optionally on a "
+            "named device (frida-ps -D); action='script' attaches to pid and "
+            "runs script_path for a bounded duration (1..60s, default 10), "
+            "returning the captured send()/console messages (max 200). "
+            "Skip-gated on the frida CLI tools and/or the frida Python "
+            "module - absence surfaces as a typed error with the "
+            "`pip install frida-tools` install hint."
+        )
+    )
+    def codevanta_frida(
+        action: Literal["devices", "ps", "script"],
+        device_id: str | None = None,
+        pid: int | None = None,
+        script_path: str | None = None,
+        duration: float = tools.DEFAULT_FRIDA_DURATION,
+    ) -> dict:
+        return tools.codevanta_frida(
+            action,
+            device_id=device_id,
+            pid=pid,
+            script_path=script_path,
+            duration=duration,
+        )
+
+    @server.tool(
+        description=(
+            "Run a target under one bounded batch LLDB session (lldb -b): "
+            "target create, optional breakpoint (function name or 0x "
+            "address), run, register read, backtrace, quit. Returns the "
+            "typed stop reason, register values (max 64), frames (max 32) "
+            "and a bounded raw transcript tail. Requires lldb on PATH - its "
+            "absence surfaces as a typed error with the install hint."
+        )
+    )
+    def codevanta_lldb_run(
+        target: str,
+        break_at: str | None = None,
+        timeout_s: float = tools.DEFAULT_LLDB_TIMEOUT,
+    ) -> dict:
+        return tools.codevanta_lldb_run(target, break_at=break_at, timeout_s=timeout_s)
+
+    @server.tool(
+        description=(
+            "List functions of a binary with batch rizin analysis (rizin "
+            "-q -c 'aaa; afl'): bounded 256-entry list of address, size and "
+            "name, junk rows reported as warnings. Requires rizin on PATH - "
+            "its absence surfaces as a typed error with the install hint "
+            "and a pointer to the offline `codevanta functions` fallback."
+        )
+    )
+    def codevanta_rizin_functions(path: str) -> dict:
+        return tools.codevanta_rizin_functions(path)
 
     return server
 

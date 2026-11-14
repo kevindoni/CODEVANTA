@@ -647,6 +647,86 @@ _BODY = """
         <button type="button" id="sym-run" data-action="symbolic">Explore paths</button>
       </div>
 
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">br</span><b>Tool bridges</b></div>
+        <p class="desc">Which external tools (binwalk, tshark, objdump and friends) are installed and usable on this machine right now.</p>
+        <button type="button" data-action="bridges">Check bridges</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">uk</span><b>Unknowns</b></div>
+        <p class="desc">The open questions a run recorded in its unknowns ledger &mdash; what is still unexplained.</p>
+        <div class="tool-opts">
+          <div class="full mono">
+            <label for="uk-ledger">Ledger JSON</label>
+            <input id="uk-ledger" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path to an unknowns ledger file">
+          </div>
+          <div>
+            <label for="uk-limit">Max rows</label>
+            <input id="uk-limit" type="number" min="0" max="4096" step="1" value="200">
+          </div>
+        </div>
+        <button type="button" data-action="unknowns">List unknowns</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">ob</span><b>Obligations</b></div>
+        <p class="desc">The obligations a ledger still demands &mdash; what must be parsed, computed or verified before a claim counts.</p>
+        <div class="tool-opts">
+          <div class="full mono">
+            <label for="ob-ledger">Ledger JSON</label>
+            <input id="ob-ledger" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path to an obligations ledger file">
+          </div>
+        </div>
+        <button type="button" data-action="obligations">List obligations</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">cm</span><b>Compare reports</b></div>
+        <p class="desc">Diffs two JSON artifacts &mdash; function inventories, string sets or evidence bundles. Uses the Baseline and Candidate paths from the Advanced box below.</p>
+        <div class="tool-opts single">
+          <div>
+            <label for="cmp-what">What to compare</label>
+            <div class="selwrap">
+              <select id="cmp-what">
+                <option value="functions">functions</option>
+                <option value="strings">strings</option>
+                <option value="bundles">bundles</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <button type="button" data-action="compare">Compare reports</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">nv</span><b>Session nav</b></div>
+        <p class="desc">The bookmarks, comments and reading cursor one session carries in its navigation database.</p>
+        <div class="tool-opts">
+          <div class="full mono">
+            <label for="nv-db">Database</label>
+            <input id="nv-db" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path to a sessions database">
+          </div>
+          <div class="full mono">
+            <label for="nv-session">Session id</label>
+            <input id="nv-session" type="text" spellcheck="false" autocomplete="off" placeholder="e.g. the id a saved session printed">
+          </div>
+        </div>
+        <button type="button" data-action="nav">Show navigation</button>
+      </div>
+
+      <div class="tool">
+        <div class="tool-top"><span class="glyph">md</span><b>Metadata</b></div>
+        <p class="desc">Auto-detects what a file or folder is &mdash; .pyc, APK signing, Go build info, Electron fuses and more. Any path, not only the one above.</p>
+        <div class="tool-opts single">
+          <div class="full mono">
+            <label for="md-path">Target path</label>
+            <input id="md-path" type="text" spellcheck="false" autocomplete="off" placeholder="absolute path to any file or folder">
+          </div>
+        </div>
+        <button type="button" data-action="metadata">Detect metadata</button>
+      </div>
+
     </div>
   </section>
 
@@ -746,7 +826,13 @@ _SCRIPT = """
     emulate: "/api/emulate",
     symbolic: "/api/symbolic",
     session_save: "/api/session_save",
-    session_list: "/api/session_list"
+    session_list: "/api/session_list",
+    bridges: "/bridges",
+    unknowns: "/unknowns",
+    obligations: "/obligations",
+    compare: "/compare",
+    nav: "/nav",
+    metadata: "/metadata"
   };
 
   var MAX_TABLE_ROWS = 200;
@@ -819,6 +905,36 @@ _SCRIPT = """
     }
     if (action === "session_list") {
       addParam(parts, "limit", fieldValue("session-limit"));
+      return parts;
+    }
+    // The lane routes have their own parameter sets and return before the
+    // generic "path" line below, so the main binary input never leaks into
+    // a request that does not use it.
+    if (action === "bridges") {
+      return parts;
+    }
+    if (action === "unknowns") {
+      addParam(parts, "ledger", fieldValue("uk-ledger"));
+      addParam(parts, "limit", fieldValue("uk-limit"));
+      return parts;
+    }
+    if (action === "obligations") {
+      addParam(parts, "ledger", fieldValue("ob-ledger"));
+      return parts;
+    }
+    if (action === "compare") {
+      addParam(parts, "left", fieldValue("left"));
+      addParam(parts, "right", fieldValue("right"));
+      addParam(parts, "what", fieldValue("cmp-what") || "functions");
+      return parts;
+    }
+    if (action === "nav") {
+      addParam(parts, "db", fieldValue("nv-db"));
+      addParam(parts, "session", fieldValue("nv-session"));
+      return parts;
+    }
+    if (action === "metadata") {
+      addParam(parts, "path", fieldValue("md-path"));
       return parts;
     }
     addParam(parts, "path", fieldValue("path"));

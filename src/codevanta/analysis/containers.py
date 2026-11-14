@@ -12,7 +12,9 @@ Inspectors
 ``inspect_wasm``
     ``\\0asm`` WebAssembly modules: version, the section table (id, known
     name, offset, size) and the import/export vector counts read from the
-    section 2 / 7 payload headers -- shallowly, never walking the entries.
+    section 2 / 7 payload headers and a bounded ``module.field`` name list per
+    vector (at most :data:`MAX_WASM_NAMES` each; deeper entries stay unwalked).
+
 ``inspect_evm``
     EVM bytecode: a linear ``PUSH``-aware sweep over the documented opcode
     table producing a bounded ``pc``/mnemonic/operand listing, the set of
@@ -69,6 +71,7 @@ __all__ = [
     "MAX_MAGIC_HITS",
     "MAX_PCAP_PACKETS",
     "MAX_ST_TENSORS",
+    "MAX_WASM_NAMES",
     "MAX_WASM_SECTIONS",
     "BinmetaSummary",
     "EvmOp",
@@ -93,6 +96,12 @@ __all__ = [
 
 #: Hard ceiling on the bytes one inspection will read (files are refused above).
 MAX_FILE_BYTES = 256 * 1024 * 1024
+
+#: Import/export names kept per WASM module before the rest are dropped.
+MAX_WASM_NAMES = 64
+
+#: Import/export names kept per WASM module before the rest are dropped.
+MAX_WASM_NAMES = 64
 
 #: Sections kept per WASM module before the rest are summarised away.
 MAX_WASM_SECTIONS = 64
@@ -256,6 +265,9 @@ class WasmSummary:
     truncated: bool
     import_count: int | None
     export_count: int | None
+    import_names: tuple[str, ...] = ()
+    export_names: tuple[str, ...] = ()
+
     warnings: tuple[str, ...] = ()
     evidence: Evidence | None = None
 
@@ -267,6 +279,8 @@ class WasmSummary:
             "truncated": self.truncated,
             "import_count": self.import_count,
             "export_count": self.export_count,
+            "import_names": list(self.import_names),
+            "export_names": list(self.export_names),
         }
         if self.warnings:
             data["warnings"] = list(self.warnings)
@@ -279,6 +293,9 @@ def inspect_wasm(data: bytes) -> WasmSummary | None:
     """Summarise a WASM module, or ``None`` when the leading magic disagrees."""
     if len(data) < 8 or data[:4] != _WASM_MAGIC:
         return None
+    import_names: list[str] = []
+    export_names: list[str] = []
+
     version = int.from_bytes(data[4:8], "little")
     warnings: list[str] = []
     reader = _Reader(data, 8)
@@ -302,12 +319,22 @@ def inspect_wasm(data: bytes) -> WasmSummary | None:
                 except _TruncatedError:
                     import_count = None
                     warnings.append("import section: vector count unreadable")
+                import_names, note = _wasm_vector_names(
+                    data, payload_start, payload_start + size, imports=True
+                )
+                if note:
+                    warnings.append(note)
             elif section_id == 7 and export_count is None:
                 try:
                     export_count = _Reader(data, payload_start).leb128()
                 except _TruncatedError:
                     export_count = None
                     warnings.append("export section: vector count unreadable")
+                export_names, note = _wasm_vector_names(
+                    data, payload_start, payload_start + size, imports=False
+                )
+                if note:
+                    warnings.append(note)
             if len(sections) < MAX_WASM_SECTIONS:
                 sections.append(
                     WasmSection(
@@ -333,6 +360,8 @@ def inspect_wasm(data: bytes) -> WasmSummary | None:
         truncated=truncated,
         import_count=import_count,
         export_count=export_count,
+        import_names=tuple(import_names),
+        export_names=tuple(export_names),
         warnings=tuple(warnings),
         evidence=Evidence(
             source="bin.wasm",
@@ -341,6 +370,80 @@ def inspect_wasm(data: bytes) -> WasmSummary | None:
             detail=f"{len(sections)} sections in view",
         ),
     )
+
+
+def _wasm_vector_names(
+    data: bytes, payload_start: int, section_end: int, imports: bool
+) -> tuple[list[str], str | None]:
+    """Walk one WASM import/export vector, returning bounded names.
+
+    Imports render as ``module.field`` (every import starts with those two
+    name vectors, followed by a kind byte and its type descriptor); exports
+    are a single name followed by kind and bound index. The walk is bounded
+    at :data:`MAX_WASM_NAMES` names and never reads past ``section_end``:
+    anything malformed or oversized degrades to a warning note, never an
+    exception.
+    """
+    kind_word = "import" if imports else "export"
+    reader = _Reader(data[:section_end], payload_start)
+    names: list[str] = []
+    try:
+        count = reader.leb128()
+    except (_TruncatedError, AnalysisError):
+        return [], f"{kind_word} names: vector count unreadable"
+    for _ in range(count):
+        try:
+            if imports:
+                module = _wasm_name_bytes(reader)
+                field = _wasm_name_bytes(reader)
+                names.append(f"{module}.{field}")
+                import_kind = reader.u8()
+                if import_kind not in (0, 1, 2, 3, 4):
+                    return (
+                        names,
+                        f"{kind_word} names: unknown import kind {import_kind}; stopped early",
+                    )
+                _skip_import_descriptor(reader, import_kind)
+            else:
+                names.append(_wasm_name_bytes(reader))
+                reader.u8()  # external kind (func/table/memory/global)
+                reader.leb128()  # bound index
+        except (_TruncatedError, AnalysisError):
+            return names, f"{kind_word} names: section payload ends mid-entry"
+        if len(names) >= MAX_WASM_NAMES:
+            return names, f"{kind_word} names: kept {MAX_WASM_NAMES} of {count}"
+    return names, None
+
+
+def _wasm_name_bytes(reader: _Reader) -> str:
+    """One length-prefixed WASM name, decoded lossily for JSON safety."""
+    length = reader.leb128()
+    return reader.take(length).decode("utf-8", errors="replace")
+
+
+def _skip_import_descriptor(reader: _Reader, import_kind: int) -> None:
+    """Skip the type descriptor that follows an import's name pair."""
+    if import_kind == 0:  # func: type index
+        reader.leb128()
+    elif import_kind == 1:  # table: elemtype byte + limits
+        reader.u8()
+        _skip_limits(reader)
+    elif import_kind == 2:  # memory: limits
+        _skip_limits(reader)
+    elif import_kind == 3:  # global: valtype + mutability bytes
+        reader.u8()
+        reader.u8()
+    else:  # exception tag (4): attribute byte + type index
+        reader.u8()
+        reader.leb128()
+
+
+def _skip_limits(reader: _Reader) -> None:
+    """Skip one WASM limits block: flags byte, min, optional max."""
+    flags = reader.u8()
+    reader.leb128()
+    if flags & 0x01:
+        reader.leb128()
 
 
 # ---------------------------------------------------------------------------

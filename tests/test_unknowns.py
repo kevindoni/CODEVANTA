@@ -24,9 +24,11 @@ from codevanta.cli.main import app
 from codevanta.core.report import AnalysisError
 from codevanta.core.unknowns import (
     DEFAULT_UNKNOWN_SEVERITY,
+    MAX_REVISIONS_PER_RECORD,
     UNKNOWN_ENTRY_NAME,
     UNKNOWN_SEVERITIES,
     UNKNOWN_STATUSES,
+    LedgerConflictError,
     make_open_unknown,
     open_unknowns,
     records_from_payload,
@@ -36,6 +38,7 @@ from codevanta.core.unknowns import (
     unknown_id,
     unknowns_from_bundle,
 )
+from codevanta.mcp_server import tools as mcp_tools
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "samples"
@@ -358,3 +361,231 @@ def test_cli_unknowns_json_format_and_errors(tmp_path: Path) -> None:
     )
     assert dup.exit_code == 2
     assert "duplicate" in dup.output
+
+
+# ---- ledger v2: CLI history and CAS resolve -----------------------------------
+
+
+def test_cli_history_prints_the_revision_trail(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.json"
+    opened = runner.invoke(
+        app,
+        ["unknowns", "open", str(ledger), "--domain", "cfg", "--summary", "trail test"],
+    )
+    assert opened.exit_code == 0, opened.output
+    record_id = json.loads(ledger.read_text(encoding="utf-8"))["items"][0]["id"]
+
+    as_json = runner.invoke(
+        app, ["unknowns", "history", str(ledger), "--id", record_id, "--format", "json"]
+    )
+    assert as_json.exit_code == 0, as_json.output
+    payload = json.loads(as_json.output)
+    assert payload["id"] == record_id
+    assert payload["count"] == 1
+    assert payload["revisions"][0]["action"] == "open"
+    assert payload["revisions"][0]["revision"] == 1
+    assert payload["evidence"]["source"] == "ledger.revision"
+
+    as_text = runner.invoke(app, ["unknowns", "history", str(ledger), "--id", record_id])
+    assert as_text.exit_code == 0
+    assert "open" in as_text.output
+    assert "revision" in as_text.output.lower()
+
+    missing = runner.invoke(app, ["unknowns", "history", str(ledger)])
+    assert missing.exit_code == 2
+    unknown_id_arg = runner.invoke(app, ["unknowns", "history", str(ledger), "--id", "unk-nope"])
+    assert unknown_id_arg.exit_code == 2
+
+
+def test_cli_resolve_expected_revision_cas(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.json"
+    opened = runner.invoke(
+        app,
+        ["unknowns", "open", str(ledger), "--domain", "cfg", "--summary", "cas test"],
+    )
+    assert opened.exit_code == 0, opened.output
+    record_id = json.loads(ledger.read_text(encoding="utf-8"))["items"][0]["id"]
+
+    # A stale expectation exits 2 and leaves the ledger untouched.
+    before = ledger.read_text(encoding="utf-8")
+    conflict = runner.invoke(
+        app,
+        [
+            "unknowns",
+            "resolve",
+            str(ledger),
+            "--id",
+            record_id,
+            "--expected-revision",
+            "7",
+        ],
+    )
+    assert conflict.exit_code == 2
+    assert "current revision 1" in conflict.output
+    assert ledger.read_text(encoding="utf-8") == before
+
+    # The matching expectation resolves and the trail grows to two revisions.
+    resolved = runner.invoke(
+        app,
+        [
+            "unknowns",
+            "resolve",
+            str(ledger),
+            "--id",
+            record_id,
+            "--note",
+            "done",
+            "--expected-revision",
+            "1",
+        ],
+    )
+    assert resolved.exit_code == 0, resolved.output
+    payload = json.loads(ledger.read_text(encoding="utf-8"))
+    assert payload["items"][0]["status"] == "resolved"
+    assert [rev["revision"] for rev in payload["items"][0]["revisions"]] == [1, 2]
+
+
+def test_mcp_unknowns_history_and_cas(tmp_path: Path) -> None:
+    ledger = str(tmp_path / "ledger.json")
+    opened = mcp_tools.unknowns("open", ledger, domain="cfg", summary="mcp history")
+    record_id = opened["record"]["id"]
+
+    history = mcp_tools.unknowns("history", ledger, unknown_id=record_id)
+    assert history["action"] == "history"
+    assert history["count"] == 1
+    assert history["revisions"][0]["action"] == "open"
+
+    with pytest.raises(LedgerConflictError):
+        mcp_tools.unknowns("resolve", ledger, unknown_id=record_id, expected_revision=3)
+    resolved = mcp_tools.unknowns(
+        "resolve", ledger, unknown_id=record_id, expected_revision=1, note="ok"
+    )
+    assert resolved["revision"] == 2
+    with pytest.raises(AnalysisError):
+        mcp_tools.unknowns("explode", ledger)
+
+
+# ---- ledger v2: payload validation matrix -------------------------------------
+
+
+def _bad_unknown(**mutation: Any) -> dict[str, Any]:
+    """A one-record ledger with one field replaced by a malformed value."""
+    record = make_open_unknown(domain="cfg", summary="malformed matrix")
+    payload = json.loads(json.dumps(records_to_payload([record])))
+    payload["items"][0].update(mutation)
+    return payload
+
+
+def test_parse_rejects_malformed_revision_trails() -> None:
+    with pytest.raises(AnalysisError):
+        records_from_payload(_bad_unknown(revisions="not-a-list"))
+    with pytest.raises(AnalysisError):
+        records_from_payload(_bad_unknown(revisions=["not-an-object"]))
+    with pytest.raises(AnalysisError):
+        records_from_payload(
+            _bad_unknown(revisions=[{"revision": 0, "at": "t", "action": "open", "state": {}}])
+        )
+    with pytest.raises(AnalysisError):
+        records_from_payload(
+            _bad_unknown(
+                revisions=[{"revision": True, "at": "t", "action": "open", "state": {}}]
+            )
+        )
+    with pytest.raises(AnalysisError):
+        records_from_payload(
+            _bad_unknown(
+                revisions=[
+                    {"revision": 1, "at": "t", "action": "open", "state": {}},
+                    {"revision": 1, "at": "t", "action": "resolve", "state": {}},
+                ]
+            )
+        )
+    with pytest.raises(AnalysisError):
+        records_from_payload(
+            _bad_unknown(revisions=[{"revision": 1, "at": "  ", "action": "open", "state": {}}])
+        )
+    with pytest.raises(AnalysisError):
+        records_from_payload(
+            _bad_unknown(revisions=[{"revision": 1, "at": "t", "action": "explode", "state": {}}])
+        )
+    with pytest.raises(AnalysisError):
+        records_from_payload(
+            _bad_unknown(revisions=[{"revision": 1, "at": "t", "action": "open"}])
+        )
+    with pytest.raises(AnalysisError):
+        records_from_payload(
+            _bad_unknown(
+                revisions=[{"revision": 1, "at": "t", "action": "open", "state": {}, "note": "n" * 501}]
+            )
+        )
+    with pytest.raises(AnalysisError):
+        records_from_payload(_bad_unknown(revisions_truncated="many"))
+    with pytest.raises(AnalysisError):
+        records_from_payload(_bad_unknown(revisions_truncated=-1))
+    with pytest.raises(AnalysisError):
+        records_from_payload(
+            _bad_unknown(revisions=[{"revision": 3, "at": "t", "action": "open", "state": {}}])
+        )
+
+
+def test_resolve_refuses_over_long_notes_and_over_sized_trails() -> None:
+    record = make_open_unknown(domain="cfg", summary="bounds")
+    ledger = records_to_payload([record])
+    with pytest.raises(AnalysisError):
+        resolve_unknowns(ledger, [record.id], note="n" * 501)
+    too_many = [
+        {"revision": i + 1, "at": "t", "action": "open", "state": {}}
+        for i in range(MAX_REVISIONS_PER_RECORD + 1)
+    ]
+    with pytest.raises(AnalysisError):
+        records_from_payload(_bad_unknown(revisions=too_many))
+
+
+def test_parse_rejects_malformed_unknown_items() -> None:
+    with pytest.raises(AnalysisError):
+        records_from_payload({"count": 1, "items": [42]})
+    with pytest.raises(AnalysisError):
+        records_from_payload({"count": 257, "items": [1] * 257})
+    assert records_from_payload({"count": 0, "items": []}) == ()
+
+
+def test_unknown_ledger_over_budget_is_refused() -> None:
+    records = [make_open_unknown(domain="cfg", summary=f"question {i}") for i in range(257)]
+    with pytest.raises(AnalysisError):
+        records_to_payload(records)
+
+
+def test_find_record_and_truncated_marker_round_trip() -> None:
+    from codevanta.core.unknowns import MAX_REVISIONS_PER_RECORD, find_record
+
+    record = make_open_unknown(domain="cfg", summary="marker round trip")
+    ledger = records_to_payload([record])
+    payload = ledger
+    for _ in range(MAX_REVISIONS_PER_RECORD + 1):
+        record_id = record.id
+        payload = resolve_unknowns(payload, [record_id])
+        parsed = records_from_payload(payload)
+        payload = records_to_payload(
+            [
+                item
+                if item.id != record_id
+                else type(item)(
+                    id=item.id,
+                    domain=item.domain,
+                    severity=item.severity,
+                    status="open",
+                    summary=item.summary,
+                    evidence_refs=item.evidence_refs,
+                    resolution=None,
+                    revisions=item.revisions,
+                    revisions_truncated=item.revisions_truncated,
+                )
+                for item in parsed
+            ]
+        )
+    final = find_record(payload, record.id)
+    assert final.revisions_truncated >= 1
+    assert len(final.revisions) == MAX_REVISIONS_PER_RECORD
+    # The marker round-trips through JSON exactly.
+    reread = records_from_payload(json.loads(json.dumps(payload)))
+    assert reread == records_from_payload(payload)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 
@@ -40,15 +40,21 @@ from codevanta.analysis.callgraph import (
 from codevanta.analysis.cfg import FunctionCFG, build_cfg, build_recursive_cfg
 from codevanta.analysis.compare import (
     COMPARE_WHATS,
-    compare_bundles,
-    compare_inventories,
-    compare_strings,
+    compare_artifacts,
     is_bundle_document,
     load_document,
-    load_report_payload,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_CHANGED_SECTIONS as COMPARE_MAX_CHANGED_SECTIONS,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_DETAIL_KEYS as COMPARE_MAX_DETAIL_KEYS,
 )
 from codevanta.analysis.compare import (
     DEFAULT_MAX_FUNCTIONS as COMPARE_MAX_FUNCTIONS,
+)
+from codevanta.analysis.compare import (
+    DEFAULT_MAX_ROWS as COMPARE_MAX_ROWS,
 )
 from codevanta.analysis.compare import (
     DEFAULT_MAX_STRINGS as COMPARE_MAX_STRINGS,
@@ -130,9 +136,13 @@ from codevanta.cli.crash import app as crash_app
 from codevanta.cli.depth import apk_app as apk_app
 from codevanta.cli.depth import certs_app as certs_app
 from codevanta.cli.depth import js_app as js_app
-from codevanta.cli.meta import meta_app
+from codevanta.cli.live import frida_app as frida_app  # lane-live2: ONE import block
+from codevanta.cli.live import lldb_app as lldb_app
+from codevanta.cli.live import rizin_app as rizin_app
+from codevanta.cli.meta import codesign, meta_app  # codesign: lane-format2, registered below
 from codevanta.cli.mobile import app as mobile_app
 from codevanta.cli.nav import app as nav_app
+from codevanta.cli.obligations import app as obligations_app  # lane-ledger2: ONE import
 from codevanta.cli.signal import app as signal_app
 from codevanta.cli.web import asar, web_app
 from codevanta.core.disassembler import DisassemblyError
@@ -150,6 +160,7 @@ from codevanta.core.strings import StringExtractor
 from codevanta.core.unknowns import (
     DEFAULT_UNKNOWN_SEVERITY,
     UNKNOWN_STATUSES,
+    find_record,
     make_open_unknown,
     records_from_payload,
     records_to_payload,
@@ -2698,6 +2709,7 @@ app.add_typer(signal_app)
 app.add_typer(crash_app, name="crash")
 app.add_typer(mobile_app, name="mobile")
 app.add_typer(nav_app, name="nav")  # lane-nav: ONE registration line for the navigation sub-app
+app.add_typer(obligations_app, name="obligations")  # lane-ledger2: ONE registration line
 # lane-bridge-a: ONE registration block for the bridges lane (capability report
 # plus firmware/pcap/wasm/objdump sub-apps, one loop, deterministic order).
 for _bridges_name, _bridges_sub_app in bridges_apps:
@@ -2708,7 +2720,13 @@ app.add_typer(apk_app, name="apk")
 app.add_typer(js_app, name="js")
 app.add_typer(certs_app, name="certs")
 app.add_typer(web_app, name="web")
+# lane-live2: ONE registration block for the live-bridges lane
+# (frida devices/ps/script, lldb batch run, rizin functions/info).
+app.add_typer(frida_app, name="frida")
+app.add_typer(lldb_app, name="lldb")
+app.add_typer(rizin_app, name="rizin")
 app.command("asar", help="List an Electron ASAR archive; optionally extract one entry")(asar)
+app.command("codesign", help="Summarise a Mach-O's embedded code signature (structure only)")(codesign)  # lane-format2
 
 
 @plugins_app.command("list")
@@ -3301,11 +3319,23 @@ def session_notes(
 # ---- phase 8: typed comparators and the residual-unknown ledger --------------
 
 #: ``bundles`` is the documented extra beyond the required ``functions`` and
-#: ``strings``: it reaches :func:`compare_bundles` offline as well.
-CompareWhat = Literal["functions", "strings", "bundles"]
+#: ``strings``: the registry grew to ten offline comparators (JSON document
+#: kinds and file-path kinds) reached through :func:`compare_artifacts`.
+CompareWhat = Literal[
+    "functions",
+    "strings",
+    "bundles",
+    "reports",
+    "metadata",
+    "wasm",
+    "crash",
+    "sessions",
+    "nav",
+    "firmware",
+]
 CompareFormat = Literal["text", "json"]
 
-UnknownsAction = Literal["list", "open", "resolve"]
+UnknownsAction = Literal["list", "open", "resolve", "history"]
 UnknownsStatus = Literal["open", "resolved"]
 UnknownsSeverity = Literal["low", "medium", "high"]
 UnknownsFormat = Literal["text", "json"]
@@ -3399,6 +3429,275 @@ def _print_bundle_compare(result: Any) -> None:
     )
 
 
+def _print_reports_compare(result: Any) -> None:
+    """Render a :class:`ReportsCompare` result as text tables."""
+    if result.changed:
+        table = Table(title="Changed sections (canonical-JSON sha mismatch)")
+        table.add_column("Section")
+        table.add_column("Left sha256")
+        table.add_column("Right sha256")
+        for change in result.changed:
+            table.add_row(
+                escape(change.name),
+                escape(f"{change.left_sha256[:16]}..."),
+                escape(f"{change.right_sha256[:16]}..."),
+            )
+        console.print(table)
+    for title, sections in (
+        ("Added sections (right-only)", result.added_sections),
+        ("Removed sections (left-only)", result.removed_sections),
+    ):
+        if sections:
+            table = Table(title=title)
+            table.add_column("Section")
+            for name in sections:
+                table.add_row(escape(name))
+            console.print(table)
+    if result.section_counts:
+        table = Table(title="Element counts")
+        table.add_column("Path")
+        table.add_column("Left", justify="right")
+        table.add_column("Right", justify="right")
+        table.add_column("Delta", justify="right")
+        for count in result.section_counts:
+            delta = (
+                str(count.right - count.left)
+                if count.left is not None and count.right is not None
+                else "-"
+            )
+            table.add_row(escape(count.path), str(count.left), str(count.right), delta)
+        console.print(table)
+    console.print(
+        f"[dim]left sections: {result.left_sections}"
+        f" · right sections: {result.right_sections}"
+        f" · added: {len(result.added_sections)}"
+        f" · removed: {len(result.removed_sections)}"
+        f" · changed: {len(result.changed)}"
+        f" · identical: {result.identical}[/]"
+    )
+
+
+def _print_metadata_compare(result: Any) -> None:
+    """Render a :class:`MetadataCompare` result as text tables."""
+    if result.changed:
+        table = Table(title="Changed detail keys")
+        table.add_column("Key")
+        table.add_column("Left")
+        table.add_column("Right")
+        for change in result.changed:
+            table.add_row(
+                escape(change.key),
+                escape(str(change.left))[:40],
+                escape(str(change.right))[:40],
+            )
+        console.print(table)
+    for title, keys in (
+        ("Added detail keys (right-only)", result.added_keys),
+        ("Removed detail keys (left-only)", result.removed_keys),
+    ):
+        if keys:
+            table = Table(title=title)
+            table.add_column("Key")
+            for key in keys:
+                table.add_row(escape(key))
+            console.print(table)
+    console.print(
+        f"[dim]kinds: {result.left_kind} -> {result.right_kind}"
+        f" · same kind: {result.same_kind}"
+        f" · added: {len(result.added_keys)}"
+        f" · removed: {len(result.removed_keys)}"
+        f" · changed: {len(result.changed)}"
+        f" · unchanged: {len(result.unchanged_keys)}[/]"
+    )
+
+
+def _print_wasm_compare(result: Any) -> None:
+    """Render a :class:`WasmCompare` result as text tables."""
+    for title, sections in (
+        ("Added sections (right-only)", result.added_sections),
+        ("Removed sections (left-only)", result.removed_sections),
+    ):
+        if sections:
+            table = Table(title=title)
+            table.add_column("id:name")
+            for name in sections:
+                table.add_row(escape(name))
+            console.print(table)
+    if result.section_deltas:
+        table = Table(title="Section size deltas (bytes)")
+        table.add_column("id")
+        table.add_column("Name")
+        table.add_column("Left", justify="right")
+        table.add_column("Right", justify="right")
+        table.add_column("Delta", justify="right")
+        for delta in result.section_deltas:
+            table.add_row(
+                str(delta.id),
+                escape(delta.name),
+                str(delta.left_size),
+                str(delta.right_size),
+                str(delta.right_size - delta.left_size),
+            )
+        console.print(table)
+    for title, added_names, removed_names in (
+        ("Import name diff", result.imports_added, result.imports_removed),
+        ("Export name diff", result.exports_added, result.exports_removed),
+    ):
+        if added_names or removed_names:
+            table = Table(title=title)
+            table.add_column("Added (right-only)")
+            table.add_column("Removed (left-only)")
+            for index in range(max(len(added_names), len(removed_names))):
+                left_name = added_names[index] if index < len(added_names) else "-"
+                right_name = removed_names[index] if index < len(removed_names) else "-"
+                table.add_row(escape(left_name), escape(right_name))
+            console.print(table)
+    console.print(
+        f"[dim]left: {result.left_bytes} bytes (wasm v{result.left_version})"
+        f" · right: {result.right_bytes} bytes (wasm v{result.right_version})"
+        f" · size delta: {result.size_delta}"
+        f" · identical: {result.identical}[/]"
+    )
+
+
+def _print_crash_compare(result: Any) -> None:
+    """Render a :class:`CrashCompare` result as text tables."""
+    table = Table(title="Crash-site checks")
+    table.add_column("Check")
+    table.add_column("Left")
+    table.add_column("Right")
+    table.add_column("Same", justify="center")
+    rows = (
+        ("arch", result.left_arch, result.right_arch, result.same_arch),
+        ("signal", result.left_signal, result.right_signal, result.same_signal),
+        (
+            "fault module",
+            result.left_fault_module,
+            result.right_fault_module,
+            result.same_fault_module,
+        ),
+        ("fault addr", "-", "-", result.fault_addr_same),
+        ("instruction ptr", "-", "-", result.rip_same),
+        ("stack ptr", "-", "-", result.sp_same),
+    )
+    for label, left_value, right_value, same in rows:
+        table.add_row(
+            label,
+            escape("-" if left_value is None else str(left_value)),
+            escape("-" if right_value is None else str(right_value)),
+            "-" if same is None else str(same),
+        )
+    console.print(table)
+    if result.register_deltas:
+        table = Table(title="Register deltas")
+        table.add_column("Register")
+        table.add_column("Left")
+        table.add_column("Right")
+        table.add_column("Changed", justify="center")
+        for delta in result.register_deltas:
+            table.add_row(
+                delta.register, delta.left, delta.right, "yes" if delta.changed else "no"
+            )
+        console.print(table)
+    console.print(
+        f"[dim]rip delta: {result.rip_delta} · sp delta: {result.sp_delta}"
+        f" · same_crash_site: {result.same_crash_site}"
+        f" · confidence: {result.verdict_confidence}[/]"
+    )
+
+
+def _print_sessions_compare(result: Any) -> None:
+    """Render a :class:`SessionsCompare` result as text tables."""
+    for title, addresses in (
+        ("Annotated addresses only in left", result.addresses_only_left),
+        ("Annotated addresses only in right", result.addresses_only_right),
+    ):
+        if addresses:
+            table = Table(title=title)
+            table.add_column("Address")
+            for address in addresses:
+                table.add_row(escape(address))
+            console.print(table)
+    console.print(
+        f"[dim]sessions: {result.left_sessions} vs {result.right_sessions}"
+        f" · annotations: {result.left_annotations} vs {result.right_annotations}"
+        f" · delta: {result.annotation_delta}"
+        f" · identical: {result.identical}[/]"
+    )
+
+
+def _print_nav_compare(result: Any) -> None:
+    """Render a :class:`NavCompare` result as text tables."""
+    if result.bookmarks_added or result.bookmarks_removed or result.bookmarks_moved:
+        table = Table(title="Bookmark diff")
+        table.add_column("Added (right-only)")
+        table.add_column("Removed (left-only)")
+        table.add_column("Moved")
+        moves = {move.name: move for move in result.bookmarks_moved}
+        names = sorted(
+            set(result.bookmarks_added) | set(result.bookmarks_removed) | set(moves)
+        )
+        for name in names:
+            move = moves.get(name)
+            moved = (
+                f"{move.left_address} -> {move.right_address}" if move is not None else "-"
+            )
+            table.add_row(
+                escape(name if name in result.bookmarks_added else "-"),
+                escape(name if name in result.bookmarks_removed else "-"),
+                escape(moved),
+            )
+        console.print(table)
+    if result.comments_changed:
+        table = Table(title="Changed comments")
+        table.add_column("Address")
+        table.add_column("Left text")
+        table.add_column("Right text")
+        for change in result.comments_changed:
+            table.add_row(
+                escape(change.address),
+                escape(change.left_text)[:40],
+                escape(change.right_text)[:40],
+            )
+        console.print(table)
+    console.print(
+        f"[dim]session {result.session_id}"
+        f" · bookmarks: {result.left_bookmarks} vs {result.right_bookmarks}"
+        f" · comments: {result.left_comments} vs {result.right_comments}"
+        f" · cursor: {result.cursor_left} -> {result.cursor_right}"
+        f" · identical: {result.identical}[/]"
+    )
+
+
+def _print_firmware_compare(result: Any) -> None:
+    """Render a :class:`FirmwareCompare` result as text tables."""
+    if result.hits_added or result.hits_removed:
+        table = Table(title="Firmware magic hits (offset, kind)")
+        table.add_column("Added (right-only)")
+        table.add_column("Removed (left-only)")
+        for index in range(max(len(result.hits_added), len(result.hits_removed))):
+            added = (
+                f"0x{result.hits_added[index]['offset']:x}"
+                f" {result.hits_added[index]['kind']}"
+                if index < len(result.hits_added)
+                else "-"
+            )
+            removed = (
+                f"0x{result.hits_removed[index]['offset']:x}"
+                f" {result.hits_removed[index]['kind']}"
+                if index < len(result.hits_removed)
+                else "-"
+            )
+            table.add_row(escape(added), escape(removed))
+        console.print(table)
+    console.print(
+        f"[dim]left: {result.left_bytes} bytes / {result.left_hits} hits"
+        f" · right: {result.right_bytes} bytes / {result.right_hits} hits"
+        f" · unchanged hits: {result.unchanged_hit_count}"
+        f" · identical: {result.identical}[/]"
+    )
+
+
 def _print_compare_warnings(result: Any) -> None:
     """Print warnings and the evidence footer shared by compare results."""
     for warning in result.warnings:
@@ -3411,19 +3710,46 @@ def _print_compare_warnings(result: Any) -> None:
     )
 
 
+#: Comparator kind -> text renderer for ``codevanta compare`` output.
+_COMPARE_RENDERERS: dict[str, Callable[[Any], None]] = {
+    "functions": _print_inventory_compare,
+    "strings": _print_strings_compare,
+    "bundles": _print_bundle_compare,
+    "reports": _print_reports_compare,
+    "metadata": _print_metadata_compare,
+    "wasm": _print_wasm_compare,
+    "crash": _print_crash_compare,
+    "sessions": _print_sessions_compare,
+    "nav": _print_nav_compare,
+    "firmware": _print_firmware_compare,
+}
+
+
 @app.command("compare")
 def compare(
     a: Annotated[
         Path,
-        typer.Argument(help="Left artifact: an analyze report or evidence bundle (JSON)"),
+        typer.Argument(
+            help=(
+                "Left artifact: a JSON document (analyze report, evidence "
+                "bundle, MetadataReport) or, for wasm/crash/sessions/nav/"
+                "firmware, the file itself"
+            )
+        ),
     ],
     b: Annotated[
         Path,
-        typer.Argument(help="Right artifact: an analyze report or evidence bundle (JSON)"),
+        typer.Argument(
+            help=(
+                "Right artifact: a JSON document (analyze report, evidence "
+                "bundle, MetadataReport) or, for wasm/crash/sessions/nav/"
+                "firmware, the file itself"
+            )
+        ),
     ],
     what: Annotated[
         CompareWhat,
-        typer.Option("--what", help="Which sections to compare"),
+        typer.Option("--what", help="Which comparator to run"),
     ] = "functions",
     output_format: Annotated[
         CompareFormat, typer.Option("--format", "-f", help="Output format")
@@ -3436,43 +3762,56 @@ def compare(
         int,
         typer.Option("--max-strings", help="Unique string texts kept per delta"),
     ] = COMPARE_MAX_STRINGS,
+    max_changed_sections: Annotated[
+        int,
+        typer.Option(
+            "--max-changed",
+            help="Changed-section/detail-key rows kept by reports/metadata",
+        ),
+    ] = COMPARE_MAX_CHANGED_SECTIONS,
+    max_detail_keys: Annotated[
+        int,
+        typer.Option(
+            "--max-detail-keys", help="Changed detail keys kept by metadata"
+        ),
+    ] = COMPARE_MAX_DETAIL_KEYS,
+    max_rows: Annotated[
+        int,
+        typer.Option(
+            "--max-rows", help="Per-delta row budget for wasm/sessions/nav"
+        ),
+    ] = COMPARE_MAX_ROWS,
 ) -> None:
-    """Compare two offline JSON artifacts (never loads a binary).
+    """Compare two offline artifacts (never executes anything).
 
-    The arguments are ``codevanta analyze`` report payloads, e.g.
-    ``samples/report_elf64.json`` and ``samples/report_bundle.json`` (a bundle
-    is unwrapped to its ``report`` entry automatically), so the comparison is
-    reproducible from the documents alone.
+    JSON kinds: ``functions``/``strings`` take analyze report payloads
+    (``samples/report_elf64.json`` and friends; a bundle is unwrapped to
+    its ``report`` entry automatically), ``bundles`` takes two evidence
+    bundles, ``reports`` diffs two report payloads structurally, and
+    ``metadata`` diffs two binmeta MetadataReport documents. Path kinds
+    take non-JSON files directly: ``wasm`` (WASM modules), ``crash`` (ELF
+    core dumps with a same_crash_site verdict), ``sessions``/``nav``
+    (CODEVANTA session databases) and ``firmware`` (raw firmware images).
     """
     if what not in COMPARE_WHATS:
         _fail(f"invalid --what {what!r}; expected one of {', '.join(COMPARE_WHATS)}", 2)
-    result: Any
     try:
-        if what == "functions":
-            result = compare_inventories(
-                load_report_payload(a),
-                load_report_payload(b),
-                max_functions=max_functions,
-            )
-        elif what == "strings":
-            result = compare_strings(
-                load_report_payload(a),
-                load_report_payload(b),
-                max_strings=max_strings,
-            )
-        else:
-            result = compare_bundles(load_document(a), load_document(b))
+        result = compare_artifacts(
+            what,
+            a,
+            b,
+            max_functions=max_functions,
+            max_strings=max_strings,
+            max_changed_sections=max_changed_sections,
+            max_detail_keys=max_detail_keys,
+            max_rows=max_rows,
+        )
     except AnalysisError as exc:
         _fail(str(exc), 2)
     if output_format == "json":
         console.print_json(json.dumps(result.to_dict()))
         return
-    if what == "functions":
-        _print_inventory_compare(result)
-    elif what == "strings":
-        _print_strings_compare(result)
-    else:
-        _print_bundle_compare(result)
+    _COMPARE_RENDERERS[what](result)
     _print_compare_warnings(result)
 
 
@@ -3503,7 +3842,10 @@ def _write_unknowns_ledger(path: Path, payload: dict[str, Any]) -> None:
 def unknowns(
     action: Annotated[
         UnknownsAction,
-        typer.Argument(help="list: show records · open: add a record · resolve: close one"),
+        typer.Argument(
+            help="list: show records · open: add a record · resolve: close one · "
+            "history: print one record's revision trail"
+        ),
     ],
     ledger: Annotated[
         Path, typer.Argument(help="Ledger JSON file (or a bundle carrying an 'unknowns' entry)")
@@ -3526,6 +3868,13 @@ def unknowns(
     ] = None,
     note: Annotated[
         str | None, typer.Option("--note", help="Resolution note (resolve)")
+    ] = None,
+    expected_revision: Annotated[
+        int | None,
+        typer.Option(
+            "--expected-revision",
+            help="CAS guard (resolve): fail unless every named record is at this revision",
+        ),
     ] = None,
     status: Annotated[
         UnknownsStatus | None, typer.Option("--status", help="Filter by status (list)")
@@ -3599,8 +3948,52 @@ def unknowns(
         else:
             console.print(
                 f"[green]unknown opened:[/] {escape(record.id)} · "
-                f"domain: {escape(record.domain)} · severity: {record.severity}"
+                f"domain: {escape(record.domain)} · severity: {record.severity} · "
+                f"revision: {record.revisions[-1].revision}"
             )
+        return
+
+    if action == "history":
+        if not unknown_id:
+            _fail("printing history requires --id", 2)
+        try:
+            record = find_record(_load_unknowns_ledger(ledger), unknown_id)
+        except AnalysisError as exc:
+            _fail(str(exc), 2)
+        if output_format == "json":
+            console.print_json(
+                json.dumps(
+                    {
+                        "id": record.id,
+                        "count": len(record.revisions),
+                        "revisions": [revision.to_dict() for revision in record.revisions],
+                        "revisions_truncated": record.revisions_truncated,
+                        "evidence": {"source": "ledger.revision", "method": "revision_history"},
+                    }
+                )
+            )
+            return
+        table = Table(title=f"Revisions of {escape(record.id)}")
+        table.add_column("Revision", justify="right")
+        table.add_column("At")
+        table.add_column("Action")
+        table.add_column("Status")
+        table.add_column("Note")
+        for revision in record.revisions:
+            table.add_row(
+                str(revision.revision),
+                escape(revision.at),
+                escape(revision.action),
+                escape(str(revision.state.get("status", "-"))),
+                escape(revision.note) if revision.note else "-",
+            )
+        console.print(table)
+        marker = (
+            f" · truncated: {record.revisions_truncated} oldest pruned"
+            if record.revisions_truncated
+            else ""
+        )
+        console.print(f"[dim]evidence: ledger.revision · revisions: {len(record.revisions)}{marker}[/]")
         return
 
     # action == "resolve"
@@ -3611,6 +4004,7 @@ def unknowns(
             _load_unknowns_ledger(ledger),
             [unknown_id],
             note=note or "",
+            expected_revision=expected_revision,
         )
     except AnalysisError as exc:
         _fail(str(exc), 2)
@@ -3618,7 +4012,11 @@ def unknowns(
     if output_format == "json":
         console.print_json(json.dumps({"action": "resolve", "resolved": unknown_id}))
     else:
-        console.print(f"[green]unknown resolved:[/] {escape(unknown_id)}")
+        resolved = find_record(payload, unknown_id)
+        console.print(
+            f"[green]unknown resolved:[/] {escape(unknown_id)} · "
+            f"revision: {resolved.revisions[-1].revision}"
+        )
 
 
 def main() -> None:

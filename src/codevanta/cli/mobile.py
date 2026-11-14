@@ -1,8 +1,11 @@
 """CODEVANTA mobile commands: ``codevanta mobile`` -- Android over adb.
 
-Seven commands, one per lane wrapper: ``devices``, ``props <serial>``,
+Thirteen commands, one per lane wrapper: ``devices``, ``props <serial>``,
 ``packages <serial>``, ``processes <serial>``, ``install <serial> <apk>
-[--yes]``, ``screencap <serial> <out>`` and ``bugreport <serial> <outdir>``.
+[--yes]``, ``screencap <serial> <out>``, ``bugreport <serial> <outdir>``,
+``logcat <serial> [--pid N] [--count N]``, ``pull <serial> <device> <out>``,
+``push <serial> <local> <device>``, ``start <serial> <package>``,
+``stop <serial> <package>`` and ``setting <serial> <namespace> <key>``.
 Each prints the decoded rows as a table with a dim totals footer, every
 surprise as a ``warning:`` line and an ``evidence:`` footer naming the adb
 source and confidence; ``--json`` prints the unchanged ``to_dict()`` payload.
@@ -26,18 +29,29 @@ from rich.table import Table
 from codevanta.analysis.adb import (
     AdbBugreportResult,
     AdbDevicesResult,
+    AdbFileTransferResult,
     AdbInstallResult,
+    AdbLogcatResult,
     AdbPackagesResult,
     AdbProcessesResult,
     AdbPropsResult,
     AdbScreencapResult,
+    AdbSettingResult,
+    AdbStartResult,
+    AdbStopResult,
     bugreport,
     inspect_device,
     install_apk,
     list_devices,
     list_packages,
     list_processes,
+    pull_file,
+    push_file,
+    read_logcat,
+    read_setting,
     screencap,
+    start_app,
+    stop_app,
 )
 from codevanta.core.report import AnalysisError
 
@@ -305,6 +319,154 @@ def install(
     _evidence_footer(result.evidence.to_dict())
 
 
+@app.command("push")
+def push(
+    serial: Annotated[str, typer.Argument(help="Device serial (see `mobile devices`)")],
+    local: Annotated[str, typer.Argument(help="File path on this host")],
+    device_path: Annotated[str, typer.Argument(help="Destination path on the device")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit AdbFileTransferResult.to_dict() instead of a summary"),
+    ] = False,
+) -> None:
+    """Push one host file to the device; the sha256 is recorded before adb runs.
+
+    Transfers over 512 MiB are refused pre-flight with a typed error.
+    """
+    result = _run_push(serial, local, device_path)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    console.print(
+        f"[bold]Pushed[/] {escape(result.host_path)} -> {escape(result.device_path)}"
+        f" · size: {result.size} bytes · sha256: {result.sha256}"
+    )
+    _print_warnings(result.warnings)
+    _evidence_footer(result.evidence.to_dict())
+
+
+@app.command("start")
+def start(
+    serial: Annotated[str, typer.Argument(help="Device serial (see `mobile devices`)")],
+    package: Annotated[str, typer.Argument(help="Package to launch, e.g. com.example.app")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit AdbStartResult.to_dict() instead of a summary"),
+    ] = False,
+) -> None:
+    """Launch an app via ``am start -W`` and print Status/LaunchState/TotalTime."""
+    result = _run_start(serial, package)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    console.print(
+        f"[bold]Start[/] {escape(result.package)} on {escape(result.serial)}"
+        f" · status: {escape(result.status or '-')} · launch: {escape(result.launch_state or '-')}"
+        f" · total: {result.total_time_ms if result.total_time_ms is not None else '-'} ms"
+    )
+    if result.error:
+        console.print(f"[yellow]error:[/] {escape(result.error)}")
+    if result.component:
+        console.print(f"[dim]component: {escape(result.component)}[/]")
+    _print_warnings(result.warnings)
+    _evidence_footer(result.evidence.to_dict())
+
+
+@app.command("stop")
+def stop(
+    serial: Annotated[str, typer.Argument(help="Device serial (see `mobile devices`)")],
+    package: Annotated[str, typer.Argument(help="Package to force-stop")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit AdbStopResult.to_dict() instead of a summary"),
+    ] = False,
+) -> None:
+    """Force-stop an app via ``am force-stop``."""
+    result = _run_stop(serial, package)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    console.print(
+        f"[bold]Stop[/] {escape(result.package)} on {escape(result.serial)}"
+        f" · stopped: {'yes' if result.stopped else 'no'}"
+    )
+    _print_warnings(result.warnings)
+    _evidence_footer(result.evidence.to_dict())
+
+
+@app.command("setting")
+def setting(
+    serial: Annotated[str, typer.Argument(help="Device serial (see `mobile devices`)")],
+    namespace: Annotated[
+        str, typer.Argument(help="Settings table: system, secure or global")
+    ],
+    key: Annotated[str, typer.Argument(help="Setting key, e.g. screen_brightness")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit AdbSettingResult.to_dict() instead of a summary"),
+    ] = False,
+) -> None:
+    """Read one setting via ``settings get <namespace> <key>`` (an unset value prints null)."""
+    result = _run_setting(serial, namespace, key)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    console.print(
+        f"[bold]Setting[/] {escape(result.namespace)}/{escape(result.key)}"
+        f" on {escape(result.serial)} = {escape(result.value if result.value is not None else 'null')}"
+    )
+    _print_warnings(result.warnings)
+    _evidence_footer(result.evidence.to_dict())
+
+
+def _run_logcat(serial: str, *, pid: int | None, count: int) -> AdbLogcatResult:
+    """Dump recent log rows, mapping every failure to ``exit 2``."""
+    try:
+        return read_logcat(serial, pid=pid, count=count)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+
+
+def _run_pull(serial: str, device_path: str, out: str) -> AdbFileTransferResult:
+    """Pull a file, mapping every failure to ``exit 2``."""
+    try:
+        return pull_file(serial, device_path, out)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+
+
+def _run_push(serial: str, local: str, device_path: str) -> AdbFileTransferResult:
+    """Push a file, mapping every failure to ``exit 2``."""
+    try:
+        return push_file(serial, local, device_path)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+
+
+def _run_start(serial: str, package: str) -> AdbStartResult:
+    """Launch an app, mapping every failure to ``exit 2``."""
+    try:
+        return start_app(serial, package)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+
+
+def _run_stop(serial: str, package: str) -> AdbStopResult:
+    """Force-stop an app, mapping every failure to ``exit 2``."""
+    try:
+        return stop_app(serial, package)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+
+
+def _run_setting(serial: str, namespace: str, key: str) -> AdbSettingResult:
+    """Read one setting, mapping every failure to ``exit 2``."""
+    try:
+        return read_setting(serial, namespace, key)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+
+
 @app.command("screencap")
 def screencap_command(
     serial: Annotated[str, typer.Argument(help="Device serial (see `mobile devices`)")],
@@ -354,6 +516,81 @@ def bugreport_command(
     console.print(
         f"[bold]Bugreport[/] {escape(result.serial)} -> {escape(result.path)}"
         f" · size: {result.size} bytes"
+    )
+    _print_warnings(result.warnings)
+    _evidence_footer(result.evidence.to_dict())
+
+
+@app.command("logcat")
+def logcat(
+    serial: Annotated[str, typer.Argument(help="Device serial (see `mobile devices`)")],
+    pid: Annotated[
+        int | None,
+        typer.Option("--pid", help="Only rows from this PID (adb --pid=N)"),
+    ] = None,
+    count: Annotated[
+        int,
+        typer.Option("--count", help="How many recent rows to ask adb for"),
+    ] = 50,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit AdbLogcatResult.to_dict() instead of a table"),
+    ] = False,
+) -> None:
+    """Dump recent device log rows via ``adb logcat -d -t <count>``.
+
+    Rows decode as priority, tag, pid and message; unparsable rows become
+    ``warning:`` lines. The parser keeps at most 200 rows however large the
+    ``--count`` ask was.
+    """
+    result = _run_logcat(serial, pid=pid, count=count)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    table = Table(title=f"Logcat ({escape(serial)})")
+    table.add_column("Priority")
+    table.add_column("Tag")
+    table.add_column("PID", justify="right")
+    table.add_column("Message")
+    for line in result.lines:
+        table.add_row(
+            escape(line.priority),
+            escape(line.tag),
+            str(line.pid),
+            escape(line.message),
+        )
+    console.print(table)
+    if not result.lines:
+        console.print("[yellow]no logcat rows decoded[/]")
+    console.print(
+        f"[dim]rows: {len(result.lines)}"
+        f" · truncated: {'yes' if result.truncated else 'no'}[/]"
+    )
+    _print_warnings(result.warnings)
+    _evidence_footer(result.evidence.to_dict())
+
+
+@app.command("pull")
+def pull(
+    serial: Annotated[str, typer.Argument(help="Device serial (see `mobile devices`)")],
+    device_path: Annotated[str, typer.Argument(help="File path on the device")],
+    out: Annotated[str, typer.Argument(help="Destination path on this host")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit AdbFileTransferResult.to_dict() instead of a summary"),
+    ] = False,
+) -> None:
+    """Pull one file from the device; the host-side sha256 is recorded.
+
+    Transfers over 512 MiB are refused with a typed error.
+    """
+    result = _run_pull(serial, device_path, out)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    console.print(
+        f"[bold]Pulled[/] {escape(result.device_path)} -> {escape(result.host_path)}"
+        f" · size: {result.size} bytes · sha256: {result.sha256}"
     )
     _print_warnings(result.warnings)
     _evidence_footer(result.evidence.to_dict())
