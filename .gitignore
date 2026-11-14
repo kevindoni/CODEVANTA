@@ -29,3 +29,6 @@ samples/report_*.json
 Thumbs.db
 
 !samples/gdb_trace.log
+
+# Scratch scripts never belong at the repo root (repo Python lives in src/tests/scripts)
+/*.py
