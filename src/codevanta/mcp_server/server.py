@@ -28,6 +28,12 @@ from . import tools
 from .ext_expose import TOOL_DESCRIPTION_EMULATE as EXPOSE_EMULATE_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_TYPES as EXPOSE_TYPES_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_WASM as EXPOSE_WASM_DESCRIPTION
+from .ext_fridasession import DEFAULT_FRIDA_DURATION as FRIDA_DEFAULT_DURATION
+from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_CLOSE as FRIDA_CLOSE_DESCRIPTION
+from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_LOAD as FRIDA_LOAD_DESCRIPTION
+from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_SESSIONS as FRIDA_SESSIONS_DESCRIPTION
+from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_START as FRIDA_START_DESCRIPTION
+from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_STATUS as FRIDA_STATUS_DESCRIPTION
 from .ext_solver import TOOL_DESCRIPTION as SYMBOLIC_SOLVE_DESCRIPTION
 from .ext_webfw import TOOL_DESCRIPTION_SOURCEMAP as WEBFW_SOURCEMAP_DESCRIPTION
 from .ext_webfw import TOOL_DESCRIPTION_UNPACK as WEBFW_UNPACK_DESCRIPTION
@@ -1931,6 +1937,67 @@ def build_server() -> MCPServer:
     def codevanta_unpack(path: str, hashes: bool = True) -> dict:
         try:
             return tools.codevanta_unpack(path, hashes=hashes)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=FRIDA_START_DESCRIPTION)
+    def codevanta_frida_start(
+        mode: str = "attach",
+        target: str = "",
+        pid: int | None = None,
+        script: str | None = None,
+        script_path: str | None = None,
+        device_id: str | None = None,
+        duration: float = FRIDA_DEFAULT_DURATION,
+    ) -> dict:
+        try:
+            return tools.codevanta_frida_start(
+                mode,
+                target,
+                pid=pid,
+                script=script,
+                script_path=script_path,
+                device_id=device_id,
+                duration=duration,
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=FRIDA_LOAD_DESCRIPTION)
+    def codevanta_frida_load(
+        session_id: str,
+        source: str | None = None,
+        path: str | None = None,
+        duration: float = FRIDA_DEFAULT_DURATION,
+    ) -> dict:
+        try:
+            return tools.codevanta_frida_load(
+                session_id,
+                source=source,
+                path=path,
+                duration=duration,
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=FRIDA_STATUS_DESCRIPTION)
+    def codevanta_frida_status(session_id: str) -> dict:
+        try:
+            return tools.codevanta_frida_status(session_id)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=FRIDA_CLOSE_DESCRIPTION)
+    def codevanta_frida_close(session_id: str) -> dict:
+        try:
+            return tools.codevanta_frida_close(session_id)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=FRIDA_SESSIONS_DESCRIPTION)
+    def codevanta_frida_sessions() -> dict:
+        try:
+            return tools.codevanta_frida_sessions()
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
