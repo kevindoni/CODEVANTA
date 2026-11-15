@@ -240,7 +240,7 @@ def _validate_steps(steps: Any) -> list[dict[str, Any]]:
                 )
         else:  # wait
             ms = step.get("ms")
-            if not _is_int(ms):
+            if not isinstance(ms, int) or isinstance(ms, bool):
                 raise AnalysisError(
                     f"win_input: step {index} wait needs integer 'ms', got {ms!r}"
                 )
