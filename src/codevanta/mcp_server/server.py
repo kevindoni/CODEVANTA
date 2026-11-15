@@ -45,6 +45,12 @@ from .ext_webfw import TOOL_DESCRIPTION_UNPACK as WEBFW_UNPACK_DESCRIPTION
 from .ext_wingui import TOOL_DESCRIPTION_WIN_SHOT as WINGUI_SHOT_DESCRIPTION
 from .ext_wingui import TOOL_DESCRIPTION_WIN_TREE as WINGUI_TREE_DESCRIPTION
 from .ext_wingui import TOOL_DESCRIPTION_WIN_WINDOWS as WINGUI_WINDOWS_DESCRIPTION
+from .ext_wininput import TOOL_DESCRIPTION_WIN_CLICK as WININPUT_CLICK_DESCRIPTION
+from .ext_wininput import TOOL_DESCRIPTION_WIN_KEY as WININPUT_KEY_DESCRIPTION
+from .ext_wininput import TOOL_DESCRIPTION_WIN_TYPE as WININPUT_TYPE_DESCRIPTION
+from .ext_wininput import (
+    TOOL_DESCRIPTION_WIN_VISUAL_REGRESSION as WININPUT_VISUAL_REGRESSION_DESCRIPTION,
+)
 
 #: Upstream ``DEFAULT_PARITY`` is inferred plain ``str``; the MCP schema
 #: publishes the literal union the UART decoder actually accepts.
@@ -2096,6 +2102,39 @@ def build_server() -> MCPServer:
     def codevanta_win_shot(hwnd: int, output_directory: str) -> dict:
         try:
             return tools.codevanta_win_shot(hwnd, output_directory)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=WININPUT_CLICK_DESCRIPTION)
+    def codevanta_win_click(hwnd: int, x: int, y: int) -> dict:
+        try:
+            return tools.codevanta_win_click(hwnd, x, y)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=WININPUT_TYPE_DESCRIPTION)
+    def codevanta_win_type(hwnd: int, text: str) -> dict:
+        try:
+            return tools.codevanta_win_type(hwnd, text)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=WININPUT_KEY_DESCRIPTION)
+    def codevanta_win_key(hwnd: int, key: str) -> dict:
+        try:
+            return tools.codevanta_win_key(hwnd, key)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=WININPUT_VISUAL_REGRESSION_DESCRIPTION)
+    def codevanta_win_visual_regression(
+        hwnd: int, steps: list, reference_png: str, output_directory: str,
+        settle_ms: int = 250,
+    ) -> dict:
+        try:
+            return tools.codevanta_win_visual_regression(
+                hwnd, steps, reference_png, output_directory, settle_ms
+            )
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 

@@ -378,6 +378,30 @@ from codevanta.mcp_server.ext_wingui import (
 from codevanta.mcp_server.ext_wingui import (
     codevanta_win_windows as codevanta_win_windows,  # noqa: F401 -- lane-wingui
 )
+from codevanta.mcp_server.ext_wininput import (  # lane-wininput: ONE MCP registration import line
+    TOOL_DESCRIPTION_WIN_CLICK as TOOL_DESCRIPTION_WIN_CLICK,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_wininput import (
+    TOOL_DESCRIPTION_WIN_KEY as TOOL_DESCRIPTION_WIN_KEY,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_wininput import (
+    TOOL_DESCRIPTION_WIN_TYPE as TOOL_DESCRIPTION_WIN_TYPE,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_wininput import (
+    TOOL_DESCRIPTION_WIN_VISUAL_REGRESSION as TOOL_DESCRIPTION_WIN_VISUAL_REGRESSION,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_wininput import (
+    codevanta_win_click as codevanta_win_click,  # noqa: F401 -- lane-wininput
+)
+from codevanta.mcp_server.ext_wininput import (
+    codevanta_win_key as codevanta_win_key,  # noqa: F401 -- lane-wininput
+)
+from codevanta.mcp_server.ext_wininput import (
+    codevanta_win_type as codevanta_win_type,  # noqa: F401 -- lane-wininput
+)
+from codevanta.mcp_server.ext_wininput import (
+    codevanta_win_visual_regression as codevanta_win_visual_regression,  # noqa: F401 -- lane-wininput
+)
 from codevanta.mcp_server.ext_yara import codevanta_yara as codevanta_yara  # noqa: F401 -- lane-yara: ONE MCP registration line
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore
