@@ -225,6 +225,8 @@ from codevanta.mcp_server.ext_fridasession import (
 from codevanta.mcp_server.ext_fridasession import (
     codevanta_frida_status as codevanta_frida_status,  # noqa: F401
 )
+from codevanta.mcp_server.ext_fs import codevanta_fs_diff as codevanta_fs_diff  # noqa: F401 -- lane-fs: ONE MCP registration line
+from codevanta.mcp_server.ext_fs import codevanta_fs_snapshot as codevanta_fs_snapshot  # noqa: F401 -- lane-fs: ONE MCP registration line
 from codevanta.mcp_server.ext_gosymbols import codevanta_gosymbols as codevanta_gosymbols  # noqa: F401 -- lane-gosymbols: ONE MCP registration line
 from codevanta.mcp_server.ext_il2gpu import (  # lane-il2gpu: ONE MCP registration line
     codevanta_gpu,  # noqa: F401

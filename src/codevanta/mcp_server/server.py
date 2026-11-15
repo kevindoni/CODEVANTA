@@ -35,6 +35,8 @@ from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_LOAD as FRIDA_LOAD_DESCRIPT
 from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_SESSIONS as FRIDA_SESSIONS_DESCRIPTION
 from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_START as FRIDA_START_DESCRIPTION
 from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_STATUS as FRIDA_STATUS_DESCRIPTION
+from .ext_fs import TOOL_DESCRIPTION_FS_DIFF as FS_DIFF_DESCRIPTION
+from .ext_fs import TOOL_DESCRIPTION_FS_SNAPSHOT as FS_SNAPSHOT_DESCRIPTION
 from .ext_solver import TOOL_DESCRIPTION as SYMBOLIC_SOLVE_DESCRIPTION
 from .ext_uires import TOOL_DESCRIPTION_DIALOG_DECODE as UIRES_DIALOG_DESCRIPTION
 from .ext_uires import TOOL_DESCRIPTION_UI_PREVIEW as UIRES_PREVIEW_DESCRIPTION
@@ -2101,6 +2103,20 @@ def build_server() -> MCPServer:
     def codevanta_pe_assets(path: str, output_directory: str) -> dict:
         try:
             return tools.codevanta_pe_assets(path, output_directory)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=FS_SNAPSHOT_DESCRIPTION)
+    def codevanta_fs_snapshot(root: str, output_directory: str) -> dict:
+        try:
+            return tools.codevanta_fs_snapshot(root, output_directory)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=FS_DIFF_DESCRIPTION)
+    def codevanta_fs_diff(before: str, after: str) -> dict:
+        try:
+            return tools.codevanta_fs_diff(before, after)
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
