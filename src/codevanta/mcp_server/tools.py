@@ -162,6 +162,12 @@ from codevanta.mcp_server.ext_caps import codevanta_capabilities as codevanta_ca
 from codevanta.mcp_server.ext_caps import (
     codevanta_capability_profile as codevanta_capability_profile,  # noqa: F401 -- lane-cap2: ONE MCP registration line
 )
+from codevanta.mcp_server.ext_codegen import (  # lane-codegen: ONE MCP registration line
+    TOOL_DESCRIPTION_CODEGEN as TOOL_DESCRIPTION_CODEGEN,
+)
+from codevanta.mcp_server.ext_codegen import (
+    codevanta_rebuild_generate as codevanta_rebuild_generate,  # noqa: F401
+)
 from codevanta.mcp_server.ext_crash import codevanta_crash as codevanta_crash
 from codevanta.mcp_server.ext_demangle import codevanta_demangle as codevanta_demangle  # noqa: F401 -- lane-demangle: ONE MCP registration line
 from codevanta.mcp_server.ext_depth import (  # lane-bridge-b: ONE MCP registration line
