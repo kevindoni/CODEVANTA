@@ -173,14 +173,15 @@ def codevanta_wasm(
         raise AnalysisError(f"mode must be one of {list(WASM_MODES)}, not {mode!r}")
     target = _require_file(path)
     if action == "validate":
-        result = wabt_bridge.wasm_validate(
+        verdict = wabt_bridge.wasm_validate(
             target, timeout=timeout, runner=runner, which=which
         )
+        payload = verdict.to_dict()
     else:
-        result = wabt_bridge.wasm_objdump(
+        listing = wabt_bridge.wasm_objdump(
             target, timeout=timeout, runner=runner, which=which, out_dir=out_dir
         )
-    payload = result.to_dict()
+        payload = listing.to_dict()
     payload["mode"] = action
     payload["wabt_available"] = wabt_bridge.wasm_available()
     return payload
