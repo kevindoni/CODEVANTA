@@ -66,7 +66,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
 def test_server_lists_fifty_five_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
-    assert len(names) == 56
+    assert len(names) == 59
     assert names == [
     "codevanta_adb",
     "codevanta_analyze",
@@ -75,6 +75,7 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_binmeta",
     "codevanta_bridges",
     "codevanta_callgraph",
+    "codevanta_capabilities",
     "codevanta_certs",
     "codevanta_cfg",
     "codevanta_codesign",
@@ -88,6 +89,7 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_disasm",
     "codevanta_dtb",
     "codevanta_dwarf",
+    "codevanta_electron_audit",
     "codevanta_entropy",
     "codevanta_firmware_extract",
     "codevanta_frida",
@@ -108,6 +110,7 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_proto_decode",
     "codevanta_providers",
     "codevanta_rizin_functions",
+    "codevanta_sbom",
     "codevanta_session_list",
     "codevanta_session_save",
     "codevanta_signal_sr",
@@ -1784,3 +1787,65 @@ def test_server_call_tool_javascript(js_app_path: Path) -> None:
     payload = _payload(result)
     assert payload["kind"] == "directory"
     assert payload["package"]["name"] == "mcp-js"
+
+
+# ---------------------------------------------------------------------------
+# codevanta_electron_audit / codevanta_sbom / codevanta_capabilities
+
+
+def test_electron_audit_tool_reports_findings(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text('{"name": "vuln"}', encoding="utf-8")
+    (tmp_path / "main.js").write_text(
+        "new BrowserWindow({ webPreferences: { nodeIntegration: true } });\n",
+        encoding="utf-8",
+    )
+    payload = tools.codevanta_electron_audit(str(tmp_path))
+    ids = [f["rule_id"] for f in payload["findings"]]
+    assert "EA-001" in ids
+    assert payload["summary"]["critical"] >= 1
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_electron_audit_tool_rejects_bad_path(tmp_path: Path) -> None:
+    plain = tmp_path / "x.txt"
+    plain.write_text("hi", encoding="utf-8")
+    with pytest.raises(AnalysisError, match="neither a directory nor an .asar"):
+        tools.codevanta_electron_audit(str(plain))
+
+
+def test_sbom_tool_builds_cyclonedx_document(js_app_path: Path) -> None:
+    payload = tools.codevanta_sbom([str(js_app_path)])
+    assert payload["bomFormat"] == "CycloneDX"
+    assert payload["specVersion"] == "1.6"
+    names = [c["name"] for c in payload["components"]]
+    assert "electron" in names
+    assert payload["serialNumber"].startswith("urn:uuid:")
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_sbom_tool_rejects_missing_path(tmp_path: Path) -> None:
+    with pytest.raises(AnalysisError, match="cannot"):
+        tools.codevanta_sbom([str(tmp_path / "missing")])
+
+
+def test_server_call_tool_electron_audit_and_sbom(js_app_path: Path) -> None:
+    result = asyncio.run(
+        build_server().call_tool("codevanta_electron_audit", {"path": str(js_app_path)})
+    )
+    payload = _payload(result)
+    assert payload["kind"] == "directory"
+
+    result = asyncio.run(
+        build_server().call_tool("codevanta_sbom", {"paths": [str(js_app_path)]})
+    )
+    payload = _payload(result)
+    assert payload["bomFormat"] == "CycloneDX"
+
+
+def test_capabilities_tool_reports_no_false_matches(elf64_text_path: Path) -> None:
+    result = asyncio.run(
+        build_server().call_tool("codevanta_capabilities", {"path": str(elf64_text_path)})
+    )
+    payload = _payload(result)
+    assert payload["rule_count"] >= 14
+    assert payload["matches"] == []

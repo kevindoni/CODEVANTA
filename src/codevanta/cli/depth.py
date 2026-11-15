@@ -20,6 +20,9 @@ from rich.markup import escape
 from rich.table import Table
 
 from codevanta.analysis.apktool_bridge import apk_decode
+from codevanta.analysis.electron_audit import DEFAULT_MAX_FILES as AUDIT_DEFAULT_MAX_FILES
+from codevanta.analysis.electron_audit import MAX_FILES as AUDIT_MAX_FILES
+from codevanta.analysis.electron_audit import audit_electron_app
 from codevanta.analysis.javascript import DEFAULT_MAX_FILES as JS_DEFAULT_MAX_FILES
 from codevanta.analysis.javascript import MAX_FILES as JS_MAX_FILES
 from codevanta.analysis.javascript import analyze_javascript_app
@@ -224,6 +227,69 @@ def js_analyze_cmd(
         f" · large: {skipped['large_files']}"
         f" · truncated: {'yes' if payload['truncated'] else 'no'}[/]"
     )
+    _warnings_lines(payload["warnings"])
+    _evidence_footer(payload["evidence"])
+
+
+@js_app.command("audit")
+def js_audit_cmd(
+    app_path: Annotated[
+        Path,
+        typer.Argument(help="Extracted app directory or .asar archive"),
+    ],
+    max_files: Annotated[
+        int,
+        typer.Option(
+            "--max-files",
+            help=f"Ceiling on file rows kept (1..{AUDIT_MAX_FILES})",
+        ),
+    ] = AUDIT_DEFAULT_MAX_FILES,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of tables")
+    ] = False,
+) -> None:
+    """Audit an Electron app for security anti-patterns (offline, bounded)."""
+    try:
+        result = audit_electron_app(app_path, max_files=max_files)
+    except AnalysisError as exc:
+        _fail(str(exc))
+    payload = result.to_dict()
+    if json_output:
+        console.print_json(json.dumps(payload))
+        return
+    if payload["findings"]:
+        table = Table(title=f"electron audit · {escape(payload['root'])} ({payload['kind']})")
+        table.add_column("Severity", justify="right")
+        table.add_column("Rule")
+        table.add_column("File:Line")
+        table.add_column("Finding")
+        for finding in payload["findings"]:
+            table.add_row(
+                escape(str(finding["severity"])),
+                escape(str(finding["rule_id"])),
+                f"{escape(str(finding['file']))}:{finding['line']}",
+                escape(str(finding["title"])),
+            )
+        console.print(table)
+    else:
+        console.print(
+            f"[green]no findings[/] · {escape(payload['root'])} ({payload['kind']})"
+        )
+    summary = payload["summary"]
+    console.print(
+        f"[dim]findings: {payload['finding_count']}"
+        f" · critical: {summary.get('critical', 0)}"
+        f" · high: {summary.get('high', 0)}"
+        f" · medium: {summary.get('medium', 0)}"
+        f" · files scanned: {payload['scanned_files']}"
+        f" · truncated: {'yes' if payload['truncated'] else 'no'}[/]"
+    )
+    for finding in payload["findings"]:
+        recommendation = finding.get("recommendation")
+        if recommendation:
+            console.print(
+                f"[dim]fix {escape(str(finding['rule_id']))}: {escape(str(recommendation))}[/]"
+            )
     _warnings_lines(payload["warnings"])
     _evidence_footer(payload["evidence"])
 

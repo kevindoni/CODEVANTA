@@ -9,6 +9,9 @@ User-facing documentation for CODEVANTA.
 | [Architecture](architecture.md) | How the engine, CLI, GUI and MCP layers fit together |
 | [Samples](samples.md) | The committed analysis fixtures and how to reproduce them |
 | [JavaScript/Electron](javascript.md) | Static app inventory: modules, imports, IPC boundaries |
+| [Electron audit](electron-audit.md) | Security anti-pattern rules for Electron apps |
+| [SBOM](sbom.md) | CycloneDX 1.6 export from CODEVANTA inventories |
+| [Capabilities](capabilities.md) | File-scope capability rules (capa-style subset) |
 | [Assets](assets/) | Screenshots used by the README |
 | [Release checklist](release-checklist.md) | What the release workflow verifies |
 | [Repository settings](repository-settings.md) | Branch protection and CI gates |

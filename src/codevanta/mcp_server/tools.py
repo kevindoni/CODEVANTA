@@ -158,12 +158,16 @@ from codevanta.mcp_server.ext_bridges import (  # lane-bridge-a: ONE MCP registr
     codevanta_firmware_extract,  # noqa: F401
     codevanta_pcap_fields,  # noqa: F401
 )
+from codevanta.mcp_server.ext_caps import codevanta_capabilities as codevanta_capabilities  # noqa: F401 -- lane-caps: ONE MCP registration line
 from codevanta.mcp_server.ext_crash import codevanta_crash as codevanta_crash
 from codevanta.mcp_server.ext_depth import (  # lane-bridge-b: ONE MCP registration line
     codevanta_apk_decode as codevanta_apk_decode,
 )
 from codevanta.mcp_server.ext_depth import (
     codevanta_certs as codevanta_certs,
+)
+from codevanta.mcp_server.ext_depth import (
+    codevanta_electron_audit as codevanta_electron_audit,
 )
 from codevanta.mcp_server.ext_depth import (
     codevanta_javascript as codevanta_javascript,
@@ -193,6 +197,7 @@ from codevanta.mcp_server.ext_meta import (
 from codevanta.mcp_server.ext_mobile import codevanta_adb as codevanta_adb
 from codevanta.mcp_server.ext_nav import codevanta_nav, codevanta_nav_providers  # noqa: F401 -- registration of the ext_nav MCP tools
 from codevanta.mcp_server.ext_providers import codevanta_providers as codevanta_providers
+from codevanta.mcp_server.ext_sbom import codevanta_sbom as codevanta_sbom  # noqa: F401 -- lane-sbom: ONE MCP registration line
 from codevanta.mcp_server.ext_signal import (  # lane-signal: ONE MCP registration line
     codevanta_dtb,  # noqa: F401
     codevanta_signal_sr,  # noqa: F401
