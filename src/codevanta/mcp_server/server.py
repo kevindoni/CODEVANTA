@@ -613,8 +613,13 @@ def build_server() -> MCPServer:
             "pixel diff with changed-pixel ratio, per-channel mean deltas "
             "and an identical/minor/major verdict), what='har' (two HAR "
             "captures: entry-count delta, new/removed URL paths, "
-            "status-code and method histogram diffs). Never loads or "
-            "executes a binary for comparison."
+            "status-code and method histogram diffs), what='sections' "
+            "(two binaries' section tables: added/removed sections plus "
+            "size and entropy changes), what='imports' (two binaries' "
+            "import libraries: added/removed DLLs and function-count "
+            "changes) and what='bridges' (two bridges_report() JSON "
+            "snapshots: newly available/unavailable tools, version "
+            "changes). Offline structure only; nothing is ever executed."
         )
     )
     def codevanta_compare(
@@ -1183,6 +1188,30 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Profile a binary against eight fixed capability domains -- "
+            "network (socket/winsock/curl/reqwest markers), crypto "
+            "(bcrypt/crypt32/aes/rsa/sha), file_system (fopen/CreateFile/"
+            "read/write), process (CreateProcess/exec/ptrace), registry "
+            "(RegOpenKey/RegQueryValue), service (OpenSCManager/"
+            "StartService), gui (CreateWindow/user32/cairo) and "
+            "dynamic_loading (dlopen/GetProcAddress/lazy_static). Each "
+            "domain reports detected plus at most 8 evidence strings and a "
+            "high/medium confidence; the report carries a deterministic "
+            "0-100 overall_risk_score over dangerous domain combinations "
+            "and a bounded evidence list (<=16). Case-insensitive byte "
+            "scan, capped at 8 MiB with an honest truncation warning. The "
+            "markers are certain; the capability conclusion is medium "
+            "confidence. Nothing is executed."
+        )
+    )
+    def codevanta_capability_profile(path: str) -> dict:
+        try:
+            return tools.codevanta_capability_profile(path)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
             "Recover stack-constructed strings by bounded offline emulation "
             "(FLOSS-style). Each target function's bytes run on a private "
             "unicorn CPU -- nothing executes on the host; emulated stack "
@@ -1209,6 +1238,118 @@ def build_server() -> MCPServer:
                 max_instructions=max_instructions,
                 max_strings=max_strings,
             )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Normalize a HAR (HTTP Archive) recording into a bounded, "
+            "deterministic replay fixture: request/response records with "
+            "bodies as size + sha256 + a 128-byte preview (never inlined), "
+            "and an endpoint manifest that collapses paths into templates "
+            "(/api/items/42 -> /api/items/{n}) with counts and status "
+            "distributions -- the surface an agent could train or test "
+            "against. The offline half of a replay environment: nothing is "
+            "served, nothing is executed."
+        )
+    )
+    def codevanta_replay_fixture(
+        har_path: str,
+        max_entries: int = 500,
+        max_body_bytes: int = 262_144,
+    ) -> dict:
+        try:
+            return tools.codevanta_replay_fixture(
+                har_path, max_entries=max_entries, max_body_bytes=max_body_bytes
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Recover function names from a Go binary's embedded pclntab, "
+            "offline. strip leaves the pclntab behind because the runtime "
+            "needs it for stack traces; this walks the go1.2 / 1.16 / 1.18+ / "
+            "1.20+ layouts (located by section name, then a bounded magic "
+            "scan) and reports each function's name, address and - from 1.16 "
+            "on - file and line when the tables carry them. The Go version is "
+            "an evidence-backed guess; UPX-compressed and garble-obfuscated "
+            "tables are out of scope. Nothing is executed."
+        )
+    )
+    def codevanta_gosymbols(
+        path: str, max_functions: int = 65_536
+    ) -> dict:
+        try:
+            return tools.codevanta_gosymbols(path, max_functions=max_functions)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Match a bounded subset of real YARA rules against a file. "
+            "Provide the rules as text or a .yar path. Supported: text "
+            "strings (nocase / wide), hex strings with ?? nibble wildcards "
+            "and bounded [n-m] jumps, conditions from and/or/not, $a, "
+            "#a OP N, filesize OP N and all of / any of / N of; anything "
+            "else is a typed error naming the rule -- never silently "
+            "ignored. String hits are certain evidence (offsets recorded); "
+            "a satisfied rule is a medium-confidence conclusion. Nothing is "
+            "executed."
+        )
+    )
+    def codevanta_yara(
+        path: str,
+        rules_text: str | None = None,
+        rules_path: str | None = None,
+        max_strings: int = 200_000,
+        max_matches_per_string: int = 64,
+    ) -> dict:
+        try:
+            return tools.codevanta_yara(
+                path,
+                rules_text=rules_text,
+                rules_path=rules_path,
+                max_strings=max_strings,
+                max_matches_per_string=max_matches_per_string,
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Compute triage hashes for one file, optionally scoring a second "
+            "against it: sha256, the imphash (MD5 over the lowercase "
+            "dll.function import list, the Mandiant/VirusTotal convention; "
+            "refused with a warning for ELF/Mach-O where the loader has no "
+            "library pairing), and an ssdeep-shaped fuzzy signature "
+            "(piecewise hashing over the documented block ladder). With "
+            "'compare' set, adds a 0-100 fuzzy similarity score. Nothing is "
+            "executed."
+        )
+    )
+    def codevanta_triage(path: str, compare: str | None = None) -> dict:
+        try:
+            return tools.codevanta_triage(path, compare=compare)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Read PDB information offline. A .pdb input gets the bounded "
+            "MSF v7 walk: streams, the info stream's GUID/age/version, "
+            "named streams and the DBI module list. Any other input is "
+            "treated as a PE and returns its debug directory's CodeView "
+            "record -- the PDB path, GUID and age that identify the symbol "
+            "file. No symbol records, no type info (TPI/IPI), no download, "
+            "no network, ever. Nothing is executed."
+        )
+    )
+    def codevanta_pdb(
+        path: str, max_streams: int = 256, max_modules: int = 4096
+    ) -> dict:
+        try:
+            return tools.codevanta_pdb(path, max_streams=max_streams, max_modules=max_modules)
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
@@ -1314,6 +1455,165 @@ def build_server() -> MCPServer:
     )
     def codevanta_gpu(path: str) -> dict:
         return tools.codevanta_gpu(path)
+
+    # lane-search: binary search and navigation tools.
+    @server.tool(
+        description=(
+            "Search a file's raw bytes for a hex byte pattern with '??' "
+            "wildcards (e.g. '8B 44 ?? 24 ?? ??'; whitespace between bytes is "
+            "ignored). mask optionally overrides per pattern byte: 'x' keeps "
+            "it, '?' ignores it. start/end bound the scanned window; each hit "
+            "carries its offset and a hex context of up to 16 bytes on both "
+            "sides. 'total' counts every match even beyond 'limit' (max 4096), "
+            "and 'truncated' reports the cut. CERTAIN confidence: direct byte "
+            "equality over file bytes; files above 64 MiB are rejected."
+        )
+    )
+    def codevanta_search_bytes(
+        path: str,
+        pattern: str,
+        mask: str | None = None,
+        start: int = 0,
+        end: int | None = None,
+        limit: int = 64,
+    ) -> dict:
+        return tools.codevanta_search_bytes(
+            path, pattern, mask=mask, start=start, end=end, limit=limit
+        )
+
+    @server.tool(
+        description=(
+            "Search the printable strings extracted from a file (ASCII and "
+            "UTF-16LE runs of >= 4 chars) for a query. mode='literal' is a "
+            "substring test, mode='regex' applies the query with re.search "
+            "per string; case_sensitive controls both. Each match carries its "
+            "file offset, text (capped at 256 chars) and honest length. "
+            "'total' counts every match even beyond 'limit' (max 20000). "
+            "CERTAIN confidence over the extracted strings."
+        )
+    )
+    def codevanta_search_strings(
+        path: str,
+        query: str,
+        mode: Literal["literal", "regex"] = "literal",
+        case_sensitive: bool = True,
+        limit: int = 100,
+    ) -> dict:
+        return tools.codevanta_search_strings(
+            path, query, mode=mode, case_sensitive=case_sensitive, limit=limit
+        )
+
+    @server.tool(
+        description=(
+            "Search function names (symbol-table and export names plus the "
+            "entry point) for a pattern: mode='literal' is a case-sensitive "
+            "substring test, mode='regex' a re.search per name. Each match "
+            "carries address, name and best-known size. The match over the "
+            "inventory is exact, but every name is only as trustworthy as its "
+            "own discovery evidence - check each binary's function sources."
+        )
+    )
+    def codevanta_search_procs(
+        path: str,
+        pattern: str,
+        mode: Literal["literal", "regex"] = "literal",
+        limit: int = 100,
+    ) -> dict:
+        return tools.codevanta_search_procs(path, pattern, mode=mode, limit=limit)
+
+    @server.tool(
+        description=(
+            "BFS the shortest call path between two addresses using the "
+            "inter-function call graph (same direct-call / resolved-import "
+            "edges as codevanta_callgraph, bounded to 1000 candidates / 5000 "
+            "edges). Returns 'path' (address + name per hop), 'length' in "
+            "call edges and 'found'; missing endpoints or a disconnected "
+            "graph give found=false, never an error. MEDIUM confidence: "
+            "caller attribution in the graph is heuristic."
+        )
+    )
+    def codevanta_call_path(
+        path: str,
+        start_addr: int,
+        goal_addr: int,
+        max_depth: int = 8,
+    ) -> dict:
+        return tools.codevanta_call_path(path, start_addr, goal_addr, max_depth=max_depth)
+
+    @server.tool(
+        description=(
+            "Navigate to one address: the containing function (a known size "
+            "must span it; a size-less function extends to the next one), "
+            "the nearest previous and next functions, the covering section's "
+            "name, and a hex byte preview (default 32, max 256 bytes) mapped "
+            "through the section file offset. MEDIUM confidence: the preview "
+            "is direct file bytes, the function neighbourhood comes from the "
+            "heuristic discovery lane."
+        )
+    )
+    def codevanta_navigate(path: str, address: int, preview: int = 32) -> dict:
+        return tools.codevanta_navigate(path, address, preview=preview)
+
+    @server.tool(
+        description=(
+            "Collect the bounded call-graph neighbourhood of one address: "
+            "direction='callers' walks incoming edges towards the callers, "
+            "'callees' walks outgoing edges (depth 1..16, default 3). Nodes "
+            "carry their BFS depth from the root (depth 0) and edges are the "
+            "graph edges between collected nodes; 'truncated' reports a "
+            "10000-node cut. An address without edges in the direction gives "
+            "an empty subset. MEDIUM confidence, heuristic graph edges."
+        )
+    )
+    def codevanta_graph_subset(
+        path: str,
+        address: int,
+        direction: Literal["callers", "callees"] = "callers",
+        max_depth: int = 3,
+    ) -> dict:
+        return tools.codevanta_graph_subset(
+            path, address, direction=direction, max_depth=max_depth
+        )
+
+    # lane-depth2: TWO MCP wrappers for the deep format inspectors. Imports
+    # alone register nothing; these closures bind the tools to the server.
+    @server.tool(
+        description=(
+            "Deep-parse a PE's resource section and load config in one call, "
+            "pure Python and offline (nothing executed). Resources: bounded "
+            "type tree walk (type/name/language levels), entry list, "
+            "icon/cursor counts, shallow VS_VERSIONINFO key/value pairs with "
+            "the VS_FIXEDFILEINFO version, RT_MANIFEST preview and a hex raw "
+            "preview per type. Load config: TLS callback list (bounded 16), "
+            "Guard CF function-table count and flag names, DEP policy "
+            "(NX_COMPAT/ASLR/GuardCF from DllCharacteristics) and SE handler "
+            "count. Absent directories are reported as present:false, not "
+            "errors; malformed structures raise typed errors."
+        )
+    )
+    def codevanta_pe_deep(path: str) -> dict:
+        try:
+            return tools.codevanta_pe_deep(path)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Deep-parse an ELF's dynamic section or a Mach-O's dylib load "
+            "commands, auto-detected by magic, pure Python and offline. ELF: "
+            "DT_NEEDED libraries (bounded 32), DT_RPATH/RUNPATH/SONAME, "
+            "DT_INIT/FINI addresses and the init/fini pointer arrays "
+            "(bounded 8). Mach-O: LC_LOAD_DYLIB-family entries (bounded 32) "
+            "with install name, timestamp, current_version and "
+            "compatibility_version, plus LC_ID_DYLIB. Malformed structures "
+            "raise typed errors; nothing is executed."
+        )
+    )
+    def codevanta_elf_macho(path: str) -> dict:
+        try:
+            return tools.codevanta_elf_macho(path)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
 
     return server
 

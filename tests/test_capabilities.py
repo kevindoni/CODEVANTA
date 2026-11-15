@@ -9,6 +9,7 @@ entry points run end to end on the synthetic ELF64 fixtures from
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,13 @@ import pytest
 
 from codevanta.analysis.capabilities import (
     BUILTIN_RULES,
+    CAPABILITY_DOMAINS,
+    MAX_DOMAIN_EVIDENCE,
+    MAX_PROFILE_EVIDENCE,
     MAX_TREE_DEPTH,
     BinaryFeatureSet,
+    Capability,
+    CapabilityProfile,
     CapabilityReport,
     FeatureAnd,
     FeatureExport,
@@ -31,9 +37,12 @@ from codevanta.analysis.capabilities import (
     Rule,
     StringRef,
     _leaf_kinds,
+    _overall_risk_score,
+    _scan_domain_markers,
     detect_capabilities,
     evaluate_feature,
     load_rules,
+    profile_capabilities,
 )
 from codevanta.core.report import AnalysisError
 from conftest import make_elf64_with_text, make_minimal_elf64
@@ -538,3 +547,153 @@ def test_cli_capabilities_error_exit(tmp_path: Path) -> None:
     result = runner.invoke(cli, ["capabilities", str(tmp_path / "missing.bin")])
     assert result.exit_code == 2
     assert "no such binary file" in result.output
+
+
+# ---- domain capability profile (lane-cap2) -------------------------------------
+
+
+def _write_blob(path: Path, data: bytes) -> Path:
+    path.write_bytes(data)
+    return path
+
+
+def test_profile_clean_pe_sample_detects_no_domains() -> None:
+    sample = REPO_ROOT / "samples" / "pe64_text.bin"
+    if not sample.is_file():
+        pytest.skip("samples/pe64_text.bin not present")
+    profile = profile_capabilities(sample)
+    assert profile.format == "PE"
+    assert profile.sha256 == hashlib.sha256(sample.read_bytes()).hexdigest()
+    assert [capability.name for capability in profile.capabilities] == list(
+        CAPABILITY_DOMAINS
+    )
+    assert profile.detected_domains == ()
+    assert profile.overall_risk_score == 0
+    assert profile.evidence_strings == ()
+    assert profile.truncated is False
+    payload = profile.to_dict()
+    assert payload["detected_count"] == 0
+    assert json.dumps(payload, allow_nan=False)
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_profile_detects_dangerous_combo_and_caps_score(tmp_path: Path) -> None:
+    blob = _write_blob(
+        tmp_path / "implant.bin",
+        b"MZ"
+        + b"https://x.test\x00"
+        + b"ws2_32.dll\x00"
+        + b"bcrypt.dll\x00"
+        + b"CreateProcessW\x00"
+        + b"RegOpenKeyExW\x00"
+        + b"dlopen\x00",
+    )
+    profile = profile_capabilities(blob)
+    assert profile.format == "PE"
+    # domain order, not file order
+    assert profile.detected_domains == (
+        "network",
+        "crypto",
+        "process",
+        "registry",
+        "dynamic_loading",
+    )
+    by_name = {capability.name: capability for capability in profile.capabilities}
+    network = by_name["network"]
+    assert network.detected is True
+    assert network.confidence == "high"
+    assert network.evidence_strings == ("https://", "ws2_32.dll")  # file order
+    assert by_name["gui"].detected is False
+    assert by_name["gui"].confidence == "medium"
+    assert by_name["gui"].evidence_strings == ()
+    # base weights 15+10+18+10+10 = 63, dangerous combos add 61 -> capped at 100
+    assert profile.overall_risk_score == 100
+    # one first-hit marker per detected domain, in domain order
+    assert profile.evidence_strings == (
+        "https://",
+        "bcrypt.dll",
+        "createprocessw",
+        "regopenkeyexw",
+        "dlopen",
+    )
+    payload = profile.to_dict()
+    assert payload["detected_count"] == 5
+    assert json.dumps(payload, allow_nan=False)
+
+
+def test_profile_weak_markers_report_medium_confidence(tmp_path: Path) -> None:
+    blob = _write_blob(tmp_path / "weak.bin", b"MZ\x00socket\x00sha256\x00")
+    profile = profile_capabilities(blob)
+    by_name = {capability.name: capability for capability in profile.capabilities}
+    assert by_name["network"].evidence_strings == ("socket",)
+    assert by_name["network"].confidence == "medium"
+    assert by_name["crypto"].evidence_strings == ("sha256",)
+    assert by_name["crypto"].confidence == "medium"
+    # base 15 + 10 plus the network+crypto combo bonus 10
+    assert profile.overall_risk_score == 35
+
+
+def test_profile_evidence_caps(tmp_path: Path) -> None:
+    blob = _write_blob(
+        tmp_path / "many.bin",
+        b"MZ\x00"
+        + b"ws2_32.dll\x00wsastartup\x00wininet.dll\x00winhttp.dll\x00"
+        + b"libcurl\x00curl_easy\x00reqwest\x00hyper\x00socket\x00https://\x00",
+    )
+    profile = profile_capabilities(blob)
+    assert profile.detected_domains == ("network",)
+    network = profile.capabilities[0]
+    assert len(network.evidence_strings) == MAX_DOMAIN_EVIDENCE
+    assert len(profile.evidence_strings) <= MAX_PROFILE_EVIDENCE
+    assert profile.evidence_strings == ("ws2_32.dll",)
+
+
+def test_profile_scan_truncation_keeps_whole_file_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codevanta.analysis import capabilities as capabilities_module
+
+    monkeypatch.setattr(capabilities_module, "MAX_PROFILE_SCAN_BYTES", 8)
+    raw = b"MZdlopen\x00" + b"\x00" * 16
+    blob = _write_blob(tmp_path / "big.bin", raw)
+    profile = profile_capabilities(blob)
+    assert profile.truncated is True
+    assert any("truncated" in warning for warning in profile.warnings)
+    assert profile.sha256 == hashlib.sha256(raw).hexdigest()
+    assert profile.detected_domains == ("dynamic_loading",)
+
+
+def test_profile_unknown_format_and_missing_file(tmp_path: Path) -> None:
+    blob = _write_blob(tmp_path / "plain.txt", b"plain text with dlopen inside")
+    profile = profile_capabilities(blob)
+    assert profile.format == "unknown"
+    assert profile.detected_domains == ("dynamic_loading",)
+    with pytest.raises(AnalysisError):
+        profile_capabilities(tmp_path / "missing.bin")
+
+
+def test_profile_scan_rows_and_risk_score_table() -> None:
+    rows = _scan_domain_markers(b"\x7fELF\x00getprocaddress\x00")
+    assert rows["dynamic_loading"] == (["getprocaddress"], True)
+    assert rows["network"] == ([], False)
+    assert _overall_risk_score(set()) == 0
+    assert _overall_risk_score({"gui"}) == 4
+    assert _overall_risk_score(set(CAPABILITY_DOMAINS)) == 100
+    capability = Capability(
+        name="network", detected=True, evidence_strings=("socket",), confidence="medium"
+    )
+    assert capability.to_dict() == {
+        "name": "network",
+        "detected": True,
+        "evidence_strings": ["socket"],
+        "confidence": "medium",
+    }
+    assert CapabilityProfile(
+        path="x",
+        sha256="0" * 64,
+        format="unknown",
+        capabilities=(),
+        detected_domains=(),
+        overall_risk_score=0,
+        evidence_strings=(),
+    ).to_dict()["evidence"]["source"] == "codevanta.capability_profile"

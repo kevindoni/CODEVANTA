@@ -1,0 +1,135 @@
+Total ASCII strings (6+ chars): 102506
+
+=== API/URL (105) ===
+  http://*H
+  https://H
+  it.com/*I
+  https://H9
+  https://exodus.stockbit.com/__health
+  https://carina.stockbit.com/cdn-cgi/tracehttps://exodus.stockbit.com/cdn-cgi/tracehttps://api-sekuritas.stockbit.com/cdn-cgi/tracehttps://storage.stoc
+    // moves after the double click, it should be cancelled (see https://github.com/tauri-apps/tauri/issues/8306)
+        // https://github.com/tauri-apps/tauri/issues/2549#issuecomment-1250036908
+  Make sure it is installed or download it from <A href="https://developer.microsoft.com/en-us/microsoft-edge/webview2">https://developer.microsoft.com/
+  --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --proxy-server=http:// --proxy-server=socks5
+  Failed to pick cf proxy porthttp://127.0.0.1:
+        src="https://www.youtube-nocookie.com/embed/{{VIDEO_ID}}?autoplay={{AUTOPLAY}}&frameborder=0&mute={{MUTE}}"
+  Stockbit is loading longer than usual. Please check minimum requirements or contact customer service.Clear Data and Restartcf-clearance-gatehttp://loc
+  youA Tauri Appallow-read-imageallow-write-htmlallow-write-imageallow-write-textdeny-write-imagecore:path:defaultcore:event:defaultcore:window:defaultc
+  !function(){"use strict";async function e(e,t={},n){return window.__TAURI_INTERNALS__.invoke(e,t,n)}function t(){document.querySelector("body")?.addEv
+  https://iplocation.stockbit.com/8
+  https://f6bf6b8e701d411d8e15aea0fbad977a@sentry.stockbit.io/39core\src\monitoring.rs
+      // so that `structuredClone` would use, so until https://github.com/whatwg/html/issues/7428
+  /tradingview/charting_library/datafeed-api.d.ts
+  K/tradingview/charting_library/broker-api.d.ts[
+
+=== Auth (229) ===
+  AuthentiH1
+  open_cf_clearancis_debug_detectesession_store_gesession_store_secheck_for_updateauth_state_changopen_login_windoget_preview_stat
+  correlationIdbaseUrlimagePreviewtimeoutMspageoauthdefaultFileNamesentinelUrlreportUrlfeatureprevurlsclearanceoriginschrono.stockbit.com:123core\src\co
+  /mfa/v1/non-login/face-matching/sessions/
+  Authorizationfacematch-result
+  C:\Users\gitlab_runner\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tauri-2.12.1\src\ipc\authority.rs
+  ForbiddenPathwithForbiddenUrlUnsupportedPlatformWin32ErrorFailedToConvertPathToItemIdListFailedToConvertPathToFileUrlEmptyEndpointsSemverSerialization
+  HotKeyParseErrorUnrecognizedHotKeyCodeEmptyHotKeyTokenUnexpectedHotKeyFormatFailedToRegisterFailedToUnRegisterAlreadyRegisteredFailedToWatchMediaKeyEv
+  SOFTWARE\Microsoft\CryptographyMachineGuidloginevent core\src\window.rs:256app_lib::window
+  .pdfchunk_sizetokenNo save destination for this downloadThe save destination for this download has expiredcore\src\command\local_log.rs
+  BaseUrlRequiredBaseUrlWithInitTokenizerParserRegExpInvalidNameUnknownClientPidWriterProtocolErrorInvalidByteInvalidLengthInvalidLastSymbolInvalidPaddi
+  youA Tauri Appallow-read-imageallow-write-htmlallow-write-imageallow-write-textdeny-write-imagecore:path:defaultcore:event:defaultcore:window:defaultc
+  dangerous-insecure-transport-protocoldangerousInsecureTransportProtocoldangerousAcceptInvalidCertsdangerous-accept-invalid-hostnamesdangerousAcceptInv
+  InvalidArchiveUnsupportedArchiveFileNotFoundInvalidPassword
+  shortVersionauthorscommentscopyrightlicensewebsitewebsiteLabelcreditsstruct AboutMetadata with 11 elements
+  app_lib::panic_hookhttp_statusdns_resolution_timetcp_connection_timetls_handshake_timettfbtotal_timeresponse_size_bytescdn_coloevent core\src\oauth.rs
+  Stopping OAuth server
+  core\src\oauth.rs
+  event core\src\oauth.rs:98
+  Oauth error or cancelled0
+
+=== Trading (152) ===
+  stockbitH3
+  .stockbiH3D
+  StockbitL
+  Stockbit
+  Stockbitr}H
+  StockbitH
+  __m128i__m256iPatternsby_idordertotal_pattern_bytesMaskFatMaskBuilder
+  https://exodus.stockbit.com/__health
+  https://carina.stockbit.com/cdn-cgi/tracehttps://exodus.stockbit.com/cdn-cgi/tracehttps://api-sekuritas.stockbit.com/cdn-cgi/tracehttps://storage.stoc
+  correlationIdbaseUrlimagePreviewtimeoutMspageoauthdefaultFileNamesentinelUrlreportUrlfeatureprevurlsclearanceoriginschrono.stockbit.com:123core\src\co
+  supportStockbit Support
+  C:\GitLab-Runner\builds\glrt-X7k\0\stockbitgroup\stockbit\desktop\main-app\src-tauri\target\x86_64-pc-windows-msvc\release\build\app-2529d7198a4d4146\
+  RemoteReleasefuture still here when dropping__app-acl__assertion failed: prevC:\Users\gitlab_runner\.cargo\registry\src\index.crates.io-1949cf8c6b5b55
+  refused: gate url is not https on a stockbit host
+  gate url is not https on a stockbit hostevent core\src\cloudflare\clearance.rs:395
+  .stockbitsda-installation-idevent core\src\utils.rs:231
+      '#sda-retry{display:inline-flex;align-items:center;gap:6px;border:0;background:none;padding:0;',
+      'border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:14px 16px}',
+      '#sda-report{width:100%;max-width:500px;margin-top:auto;padding:14px 16px;border:0;',
+      'border-radius:4px;background:#0ba16b;color:#fff;cursor:pointer;',
+
+=== Infra (78) ===
+  google cH3
+  open_google_window
+  Unable to create UDP socket
+  Unable to set UDP socket read timeout
+  google-authevent core\src\oauth.rs:45
+  event core\src\oauth.rs:89google_user_name
+  sb-app://oauth/googlecore\src\netdiag\icmp\win.rs
+  /images/stockbit-download-google-play.svg
+  /images/google-play.png
+  /images/google.svg
+  screenshot_windowcf_statuscf_cookie_headercf_harvest_clearanceopen_cf_clearancepick_pdf_save_pathdownload_and_save_pdffetch_pdfopen_parent_pathset_env
+  .gif" onloadloaderOxfordsistersurvivlistenfemaleDesignsize="appealtext">levelsthankshigherforcedanimalanyoneAfricaagreedrecentPeople<br />wonderprices
+  /index.html"window.open( !important;application/independence//www.googleorganizationautocompleterequirementsconservative<form name="intellectualmargin
+  <link rel=" src='http://interested inconventional " alt="" /></are generallyhas also beenmost popular correspondingcredited withtyle="border:</a></spa
+  library\core\src\net\socket_addr.rs
+  failed to set open socket callback
+  pgRPcC
+  application/wasmapplication/x-executableelfapplication/vnd.microsoft.portable-executabledllapplication/javaclassapplication/x-llvmapplication/x-mach-b
+  failed to accept socket connection: 
+  client closed socket 
+
+=== Config (238) ===
+  -versionH
+  _versionH
+  -versionL
+  ppconfigL
+  $CONFIG/H
+  ppconfigH
+  -version
+  _versionH3P
+  emote-debugging---remote-debuggi
+  open_cf_clearancis_debug_detectesession_store_gesession_store_secheck_for_updateauth_state_changopen_login_windoget_preview_stat
+  C:\Users\gitlab_runner\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aho-corasick-1.1.4\src\util\debug.rs
+  __m128i__m256iPatternsby_idordertotal_pattern_bytesMaskFatMaskBuilder
+  SlimMaskBuilder
+  IncorrectOriginTimestampIncorrectModeIncorrectLeapIndicatorIncorrectResponseVersionIncorrectStratumHeadersIncorrectPayloadAddressResolveResponseAddres
+  version-updater
+  %7B%7Bcurrent_version%7D%7D%7B%7Btarget%7D%7D%7B%7Barch%7D%7D%7B%7Bbundle_type%7D%7D{{current_version}}{{target}}{{arch}}{{bundle_type}}checking for u
+  C:\GitLab-Runner\builds\glrt-X7k\0\stockbitgroup\stockbit\desktop\main-app\src-tauri\target\x86_64-pc-windows-msvc\release\build\app-2529d7198a4d4146\
+  struct WindowConfig with 63 elements
+  struct Config with 1 element
+  struct WindowEffectsConfig with 5 elements
+
+=== Stockbit (41) ===
+  stockbitH3
+  StockbitL
+  Stockbit
+  Stockbitr}H
+  StockbitH
+  https://exodus.stockbit.com/__health
+  https://carina.stockbit.com/cdn-cgi/tracehttps://exodus.stockbit.com/cdn-cgi/tracehttps://api-sekuritas.stockbit.com/cdn-cgi/tracehttps://storage.stoc
+  correlationIdbaseUrlimagePreviewtimeoutMspageoauthdefaultFileNamesentinelUrlreportUrlfeatureprevurlsclearanceoriginschrono.stockbit.com:123core\src\co
+  supportStockbit Support
+  C:\GitLab-Runner\builds\glrt-X7k\0\stockbitgroup\stockbit\desktop\main-app\src-tauri\target\x86_64-pc-windows-msvc\release\build\app-2529d7198a4d4146\
+  refused: gate url is not https on a stockbit host
+  gate url is not https on a stockbit hostevent core\src\cloudflare\clearance.rs:395
+  .stockbitsda-installation-idevent core\src\utils.rs:231
+        '" alt="Stockbit">' +
+  Stockbit is loading longer than usual. Please check minimum requirements or contact customer service.Clear Data and Restartcf-clearance-gatehttp://loc
+  youA Tauri Appallow-read-imageallow-write-htmlallow-write-imageallow-write-textdeny-write-imagecore:path:defaultcore:event:defaultcore:window:defaultc
+  https://iplocation.stockbit.com/8
+  persistence.jsonmigrated-from-v1Stockbitcom.stockbit.desktopMigrated  v1 persistence entries
+  https://f6bf6b8e701d411d8e15aea0fbad977a@sentry.stockbit.io/39core\src\monitoring.rs
+  /assets/virtual_mf___mfe_internal__host__loadRemote__stockbit_mf_1_tv_mf_2_utils__mf_owner__1__loadRemote__-Bs13KTPo.js
+
+=== DONE ===

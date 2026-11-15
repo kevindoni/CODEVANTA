@@ -8,7 +8,7 @@ read-only counterpart for *artifacts*: two ``codevanta analyze`` report payloads
 JSON. Nothing here reads a target binary, executes anything or touches the
 network, so a comparison is reproducible from the two documents alone.
 
-Twelve comparators, one per question:
+Fifteen comparators, one per question:
 
 * :func:`compare_inventories` -- two function inventories: which functions were
   added, removed, matched by name, and matched by fingerprint (a
@@ -46,6 +46,15 @@ Twelve comparators, one per question:
 * :func:`compare_har` -- two HAR capture files through
   :mod:`codevanta.analysis.har_capture`: entry-count delta, new/removed
   URL paths, status-code changes and method histogram deltas.
+* :func:`compare_sections` -- two binaries' section tables through the
+  loader: added/removed sections plus size and Shannon-entropy changes for
+  same-named sections (PE section extraction included).
+* :func:`compare_imports` -- two binaries' import tables: added/removed
+  import libraries (PE DLL lists) and per-library imported-function count
+  changes.
+* :func:`compare_bridges` -- two ``bridges_report()`` snapshots saved as
+  JSON: tools that became newly available or newly unavailable and version
+  changes for probes available on both sides.
 
 Evidence discipline
 -------------------
@@ -82,6 +91,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from codevanta.analysis.bridge import BridgeCapability
 from codevanta.analysis.containers import (
     WasmSummary,
     inspect_wasm,
@@ -92,7 +102,9 @@ from codevanta.analysis.crash_core import CoreDumpSummary, parse_core_dump
 from codevanta.analysis.nav import NavStore
 from codevanta.analysis.png_diff import ScreenshotDiff, pixel_diff
 from codevanta.analysis.sqlite_view import inspect_sqlite
-from codevanta.core.report import AnalysisError
+from codevanta.core.entropy import shannon_entropy
+from codevanta.core.loader import BinaryInfo, BinaryLoadError, ImportInfo
+from codevanta.core.report import AnalysisError, load_binary
 from codevanta.evidence.confidence import Confidence
 from codevanta.evidence.models import Evidence
 
@@ -116,12 +128,16 @@ __all__ = [
     "REPORT_COUNT_PATHS",
     "BundleCompare",
     "BundleEntryChange",
+    "BridgeChange",
+    "BridgesCompare",
     "CrashCompare",
     "DigestMatch",
+    "DllDelta",
     "FirmwareCompare",
     "HarCompare",
     "HarMethodDelta",
     "HarStatusChange",
+    "ImportsCompare",
     "InventoryCompare",
     "InventoryEntry",
     "MetadataCompare",
@@ -133,20 +149,25 @@ __all__ = [
     "ReportsSectionChange",
     "ScreenshotCompare",
     "SectionCount",
+    "SectionDelta",
+    "SectionsCompare",
     "SessionsCompare",
     "StringsCompare",
     "WasmCompare",
     "WasmSectionDelta",
     "compare_artifacts",
+    "compare_bridges",
     "compare_bundles",
     "compare_crash",
     "compare_firmware",
     "compare_har",
+    "compare_imports",
     "compare_inventories",
     "compare_metadata",
     "compare_nav",
     "compare_reports",
     "compare_screenshots",
+    "compare_sections",
     "compare_sessions",
     "compare_strings",
     "compare_wasm",
@@ -192,6 +213,9 @@ COMPARE_WHATS: tuple[str, ...] = (
     "firmware",
     "screenshots",
     "har",
+    "sections",
+    "imports",
+    "bridges",
 )
 
 #: The members of :data:`COMPARE_WHATS` whose inputs are JSON documents.
@@ -205,7 +229,7 @@ JSON_COMPARE_WHATS: tuple[str, ...] = (
 
 #: The members of :data:`COMPARE_WHATS` whose inputs are file paths
 #: (WASM modules, core dumps, session databases, firmware images,
-#: screenshots, HAR captures).
+#: screenshots, HAR captures, binaries, bridges snapshots).
 PATH_COMPARE_WHATS: tuple[str, ...] = (
     "wasm",
     "crash",
@@ -214,6 +238,9 @@ PATH_COMPARE_WHATS: tuple[str, ...] = (
     "firmware",
     "screenshots",
     "har",
+    "sections",
+    "imports",
+    "bridges",
 )
 
 #: Default number of changed report sections kept as detail rows by
@@ -266,6 +293,18 @@ _EVIDENCE_NAV_SOURCE = "compare.nav"
 _EVIDENCE_FIRMWARE_SOURCE = "compare.firmware"
 _EVIDENCE_SCREENSHOT_SOURCE = "compare.screenshots"
 _EVIDENCE_HAR_SOURCE = "compare.har"
+_EVIDENCE_SECTIONS_SOURCE = "compare.sections"
+_EVIDENCE_IMPORTS_SOURCE = "compare.imports"
+_EVIDENCE_BRIDGES_SOURCE = "compare.bridges"
+
+#: Byte cap on the file slice hashed for the Shannon-entropy fallback when a
+#: section row carries no loader-computed entropy.
+MAX_SECTION_ENTROPY_BYTES = 1 << 20
+
+#: Two same-named sections count as entropy-changed when their Shannon
+#: entropies differ by more than this epsilon (loader entropies are rounded
+#: to three decimals, so tiny deltas are noise).
+SECTION_ENTROPY_EPSILON = 0.05
 
 
 @dataclass(frozen=True)
@@ -2539,6 +2578,621 @@ def compare_har(
 # --- compare_har appended below ---
 
 
+# ---------------------------------------------------------------------------
+# compare_sections / compare_imports -- binary tables via the loader (cap2)
+# ---------------------------------------------------------------------------
+
+
+def _load_binary_info(path: str | Path, side: str) -> BinaryInfo:
+    """Load one binary's structural info, mapping loader errors to AnalysisError."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise AnalysisError(f"{side}: no such binary file: {file_path}")
+    try:
+        return load_binary(file_path)
+    except BinaryLoadError as exc:
+        raise AnalysisError(f"{side}: cannot load {file_path}: {exc}") from exc
+
+
+def _section_entropy(info: BinaryInfo, offset: int, mapped: int) -> float | None:
+    """Shannon entropy over at most :data:`MAX_SECTION_ENTROPY_BYTES` bytes."""
+    if mapped <= 0:
+        return None
+    try:
+        with Path(info.path).open("rb") as handle:
+            handle.seek(offset)
+            data = handle.read(min(mapped, MAX_SECTION_ENTROPY_BYTES))
+    except OSError:
+        return None
+    if not data:
+        return None
+    return round(shannon_entropy(data), 3)
+
+
+def _section_rows(
+    info: BinaryInfo, side: str, warnings: list[str]
+) -> dict[str, tuple[int, float | None]]:
+    """Map section name -> (mapped byte size, entropy) for one side.
+
+    The mapped size is the raw file size when the loader reports one and the
+    virtual size otherwise (ELF ``.bss``-style sections occupy no file bytes).
+    Entropy comes from the loader when present; the fallback hashes the file
+    slice directly.
+    """
+    rows: dict[str, tuple[int, float | None]] = {}
+    for section in info.sections:
+        name = section.name or f"section_{len(rows)}"
+        if name in rows:
+            warnings.append(f"{side}: duplicate section name {name!r}; keeping the first")
+            continue
+        mapped = section.raw_size if section.raw_size > 0 else section.size
+        entropy = section.entropy
+        if entropy is None:
+            entropy = _section_entropy(info, section.offset, mapped)
+        rows[name] = (mapped, entropy)
+    if not info.sections:
+        warnings.append(f"{side}: binary exposes no section table")
+    return rows
+
+
+@dataclass(frozen=True)
+class SectionDelta:
+    """One same-named section whose byte size or entropy changed."""
+
+    name: str
+    left_size: int
+    right_size: int
+    left_entropy: float | None
+    right_entropy: float | None
+    entropy_changed: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe projection with the size delta."""
+        return {
+            "name": self.name,
+            "left_size": self.left_size,
+            "right_size": self.right_size,
+            "size_delta": self.right_size - self.left_size,
+            "left_entropy": self.left_entropy,
+            "right_entropy": self.right_entropy,
+            "entropy_changed": self.entropy_changed,
+        }
+
+
+@dataclass(frozen=True)
+class SectionsCompare:
+    """Outcome of :func:`compare_sections`; frozen and JSON-safe."""
+
+    left_sections: int
+    right_sections: int
+    added: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+    added_count: int = 0
+    removed_count: int = 0
+    changed: tuple[SectionDelta, ...] = ()
+    changed_count: int = 0
+    verdict: str = "identical"
+    identical: bool = False
+    warnings: tuple[str, ...] = ()
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise as a JSON-safe dict with per-list counts."""
+        return {
+            "what": "sections",
+            "left_sections": self.left_sections,
+            "right_sections": self.right_sections,
+            "added": list(self.added),
+            "added_count": self.added_count,
+            "removed": list(self.removed),
+            "removed_count": self.removed_count,
+            "changed": [delta.to_dict() for delta in self.changed],
+            "changed_count": self.changed_count,
+            "verdict": self.verdict,
+            "identical": self.identical,
+            "warnings": list(self.warnings),
+            "evidence": dict(self.evidence),
+        }
+
+
+def compare_sections(
+    left: str | Path,
+    right: str | Path,
+    *,
+    max_rows: int = DEFAULT_MAX_ROWS,
+) -> SectionsCompare:
+    """Diff two binaries' section tables (loader-based, PE tables included).
+
+    Sections match by name. One-sided names are ``added`` (right only) or
+    ``removed`` (left only); same-named sections with different mapped byte
+    sizes or Shannon entropies (delta greater than
+    :data:`SECTION_ENTROPY_EPSILON`) become ``changed`` rows. Both binaries
+    are parsed with :func:`codevanta.core.report.load_binary` -- nothing is
+    executed.
+
+    Args:
+        left: The left (baseline) binary path.
+        right: The right (comparison) binary path.
+        max_rows: Detail-row budget per delta list (``1`` ..
+            :data:`MAX_COMPARE_ROWS`); excess rows are counted, summarised in
+            ``warnings`` and dropped from the detail lists.
+
+    Returns:
+        A frozen :class:`SectionsCompare`; ``identical`` is ``True`` when no
+        section was added, removed or changed.
+
+    Raises:
+        AnalysisError: When a path is missing, a binary cannot be loaded or
+            the budget is out of range.
+    """
+    if max_rows < 1 or max_rows > MAX_COMPARE_ROWS:
+        raise AnalysisError(f"max_rows must be between 1 and {MAX_COMPARE_ROWS}")
+    warnings: list[str] = []
+    left_info = _load_binary_info(left, "left")
+    right_info = _load_binary_info(right, "right")
+    left_rows = _section_rows(left_info, "left", warnings)
+    right_rows = _section_rows(right_info, "right", warnings)
+
+    added = sorted(set(right_rows) - set(left_rows))
+    removed = sorted(set(left_rows) - set(right_rows))
+    changed_rows: list[SectionDelta] = []
+    for name in sorted(set(left_rows) & set(right_rows)):
+        left_size, left_entropy = left_rows[name]
+        right_size, right_entropy = right_rows[name]
+        entropy_changed = (
+            left_entropy is not None
+            and right_entropy is not None
+            and abs(left_entropy - right_entropy) > SECTION_ENTROPY_EPSILON
+        )
+        if left_size == right_size and not entropy_changed:
+            continue
+        changed_rows.append(
+            SectionDelta(
+                name=name,
+                left_size=left_size,
+                right_size=right_size,
+                left_entropy=left_entropy,
+                right_entropy=right_entropy,
+                entropy_changed=entropy_changed,
+            )
+        )
+    identical = not added and not removed and not changed_rows
+    if len(added) > max_rows:
+        warnings.append(
+            f"added sections truncated to the first {max_rows} of {len(added)}"
+        )
+    if len(removed) > max_rows:
+        warnings.append(
+            f"removed sections truncated to the first {max_rows} of {len(removed)}"
+        )
+    changed_count = len(changed_rows)
+    if changed_count > max_rows:
+        warnings.append(
+            f"changed sections truncated to the first {max_rows} of {changed_count}"
+        )
+    evidence = Evidence(
+        source=_EVIDENCE_SECTIONS_SOURCE,
+        method="section_table_diff",
+        confidence=Confidence.HIGH,
+        detail=(
+            f"{left_info.format} vs {right_info.format}: exact diff over the "
+            "loaded section tables; entropy deltas above "
+            f"{SECTION_ENTROPY_EPSILON} count as entropy changes"
+        ),
+        extra={
+            "left_sha256": left_info.sha256,
+            "right_sha256": right_info.sha256,
+            "entropy_epsilon": SECTION_ENTROPY_EPSILON,
+        },
+    )
+    return SectionsCompare(
+        left_sections=len(left_rows),
+        right_sections=len(right_rows),
+        added=tuple(added[:max_rows]),
+        removed=tuple(removed[:max_rows]),
+        added_count=len(added),
+        removed_count=len(removed),
+        changed=tuple(changed_rows[:max_rows]),
+        changed_count=changed_count,
+        verdict="identical" if identical else "changed",
+        identical=identical,
+        warnings=_dedupe_warnings(warnings),
+        evidence=evidence.to_dict(),
+    )
+
+
+@dataclass(frozen=True)
+class DllDelta:
+    """One import library present on both sides with a changed function count."""
+
+    library: str
+    left_functions: int
+    right_functions: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe projection with the function-count delta."""
+        return {
+            "library": self.library,
+            "left_functions": self.left_functions,
+            "right_functions": self.right_functions,
+            "function_delta": self.right_functions - self.left_functions,
+        }
+
+
+@dataclass(frozen=True)
+class ImportsCompare:
+    """Outcome of :func:`compare_imports`; frozen and JSON-safe."""
+
+    left_dlls: int
+    right_dlls: int
+    left_functions: int
+    right_functions: int
+    added_dlls: tuple[str, ...] = ()
+    removed_dlls: tuple[str, ...] = ()
+    added_count: int = 0
+    removed_count: int = 0
+    changed: tuple[DllDelta, ...] = ()
+    changed_count: int = 0
+    verdict: str = "identical"
+    identical: bool = False
+    warnings: tuple[str, ...] = ()
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise as a JSON-safe dict with per-list counts."""
+        return {
+            "what": "imports",
+            "left_dlls": self.left_dlls,
+            "right_dlls": self.right_dlls,
+            "left_functions": self.left_functions,
+            "right_functions": self.right_functions,
+            "added_dlls": list(self.added_dlls),
+            "added_count": self.added_count,
+            "removed_dlls": list(self.removed_dlls),
+            "removed_count": self.removed_count,
+            "changed": [delta.to_dict() for delta in self.changed],
+            "changed_count": self.changed_count,
+            "verdict": self.verdict,
+            "identical": self.identical,
+            "warnings": list(self.warnings),
+            "evidence": dict(self.evidence),
+        }
+
+
+def _dll_rows(imports: list[ImportInfo]) -> dict[str, tuple[str, int]]:
+    """Map lower-cased library name -> (display name, imported function count).
+
+    Library matching is case-insensitive (Windows DLL names are
+    case-insensitive); entries without a library row are grouped under
+    ``unknown`` so they still surface in the diff.
+    """
+    rows: dict[str, tuple[str, int]] = {}
+    for entry in imports:
+        library = entry.library or "unknown"
+        key = library.lower()
+        previous = rows.get(key, (library, 0))
+        rows[key] = (previous[0], previous[1] + 1)
+    return rows
+
+
+def compare_imports(
+    left: str | Path,
+    right: str | Path,
+    *,
+    max_rows: int = DEFAULT_MAX_ROWS,
+) -> ImportsCompare:
+    """Diff two binaries' import libraries (PE DLL lists included).
+
+    Libraries match by lower-cased name; the per-library count of imported
+    functions is compared for shared libraries. One-sided libraries are
+    ``added_dlls`` (right only) or ``removed_dlls`` (left only); shared
+    libraries with a changed function count become ``changed`` rows. Both
+    binaries are parsed with :func:`codevanta.core.report.load_binary` --
+    nothing is executed.
+
+    Args:
+        left: The left (baseline) binary path.
+        right: The right (comparison) binary path.
+        max_rows: Detail-row budget per delta list (``1`` ..
+            :data:`MAX_COMPARE_ROWS`); excess rows are counted, summarised in
+            ``warnings`` and dropped from the detail lists.
+
+    Returns:
+        A frozen :class:`ImportsCompare`; ``identical`` is ``True`` when no
+        library was added, removed or changed.
+
+    Raises:
+        AnalysisError: When a path is missing, a binary cannot be loaded or
+            the budget is out of range.
+    """
+    if max_rows < 1 or max_rows > MAX_COMPARE_ROWS:
+        raise AnalysisError(f"max_rows must be between 1 and {MAX_COMPARE_ROWS}")
+    warnings: list[str] = []
+    left_info = _load_binary_info(left, "left")
+    right_info = _load_binary_info(right, "right")
+    left_rows = _dll_rows(left_info.imports)
+    right_rows = _dll_rows(right_info.imports)
+
+    added = sorted(set(right_rows) - set(left_rows))
+    removed = sorted(set(left_rows) - set(right_rows))
+    changed_rows: list[DllDelta] = []
+    for key in sorted(set(left_rows) & set(right_rows)):
+        left_name, left_count = left_rows[key]
+        _, right_count = right_rows[key]
+        if left_count == right_count:
+            continue
+        changed_rows.append(
+            DllDelta(
+                library=left_name,
+                left_functions=left_count,
+                right_functions=right_count,
+            )
+        )
+    identical = not added and not removed and not changed_rows
+    if len(added) > max_rows:
+        warnings.append(
+            f"added DLLs truncated to the first {max_rows} of {len(added)}"
+        )
+    if len(removed) > max_rows:
+        warnings.append(
+            f"removed DLLs truncated to the first {max_rows} of {len(removed)}"
+        )
+    changed_count = len(changed_rows)
+    if changed_count > max_rows:
+        warnings.append(
+            f"changed DLLs truncated to the first {max_rows} of {changed_count}"
+        )
+    evidence = Evidence(
+        source=_EVIDENCE_IMPORTS_SOURCE,
+        method="import_table_diff",
+        confidence=Confidence.HIGH,
+        detail=(
+            "exact diff over the loaded import tables; libraries match by "
+            "lower-cased name and function counts are compared per library"
+        ),
+        extra={
+            "left_sha256": left_info.sha256,
+            "right_sha256": right_info.sha256,
+        },
+    )
+    return ImportsCompare(
+        left_dlls=len(left_rows),
+        right_dlls=len(right_rows),
+        left_functions=len(left_info.imports),
+        right_functions=len(right_info.imports),
+        added_dlls=tuple(right_rows[key][0] for key in added[:max_rows]),
+        removed_dlls=tuple(left_rows[key][0] for key in removed[:max_rows]),
+        added_count=len(added),
+        removed_count=len(removed),
+        changed=tuple(changed_rows[:max_rows]),
+        changed_count=changed_count,
+        verdict="identical" if identical else "changed",
+        identical=identical,
+        warnings=_dedupe_warnings(warnings),
+        evidence=evidence.to_dict(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# compare_bridges -- two bridges_report() snapshots (cap2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BridgeChange:
+    """One bridge whose availability or version changed between snapshots.
+
+    ``left_available``/``right_available`` are ``None`` when the tool is
+    absent from that snapshot; a missing tool counts as unavailable when
+    classifying the change kind.
+    """
+
+    tool: str
+    kind: str
+    left_available: bool | None
+    right_available: bool | None
+    left_version: str | None
+    right_version: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe projection."""
+        return {
+            "tool": self.tool,
+            "kind": self.kind,
+            "left_available": self.left_available,
+            "right_available": self.right_available,
+            "left_version": self.left_version,
+            "right_version": self.right_version,
+        }
+
+
+@dataclass(frozen=True)
+class BridgesCompare:
+    """Outcome of :func:`compare_bridges`; frozen and JSON-safe."""
+
+    left_tools: int
+    right_tools: int
+    left_available: int
+    right_available: int
+    changes: tuple[BridgeChange, ...] = ()
+    change_count: int = 0
+    verdict: str = "identical"
+    identical: bool = False
+    warnings: tuple[str, ...] = ()
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise as a JSON-safe dict with per-list counts."""
+        return {
+            "what": "bridges",
+            "left_tools": self.left_tools,
+            "right_tools": self.right_tools,
+            "left_available": self.left_available,
+            "right_available": self.right_available,
+            "changes": [change.to_dict() for change in self.changes],
+            "change_count": self.change_count,
+            "verdict": self.verdict,
+            "identical": self.identical,
+            "warnings": list(self.warnings),
+            "evidence": dict(self.evidence),
+        }
+
+
+def _load_bridges_snapshot(path: str | Path) -> list[BridgeCapability]:
+    """Read one ``bridges_report()`` snapshot (a JSON list of bridge rows).
+
+    A ``{"bridges": [...]}`` wrapper (as embedded in evidence bundles) is
+    unwrapped automatically. Every entry must carry a string ``tool`` and a
+    boolean ``available``; ``version`` and ``reason`` are optional strings.
+
+    Raises:
+        AnalysisError: When the file cannot be read, is not valid JSON, is
+            not a snapshot shape or carries malformed entries.
+    """
+    target = Path(path)
+    try:
+        with target.open(encoding="utf-8") as handle:
+            document: Any = json.load(handle)
+    except UnicodeDecodeError as exc:
+        raise AnalysisError(f"{target} is not UTF-8 text: {exc}") from exc
+    except OSError as exc:
+        raise AnalysisError(f"cannot read {target}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise AnalysisError(f"{target} is not valid JSON: {exc}") from exc
+    if isinstance(document, Mapping) and isinstance(document.get("bridges"), list):
+        document = document["bridges"]
+    if not isinstance(document, list):
+        raise AnalysisError(
+            f"{target} is not a bridges_report() snapshot (expected a JSON list)"
+        )
+    if len(document) > MAX_COMPARE_ENTRIES:
+        raise AnalysisError(
+            f"{target}: snapshot exceeds the {MAX_COMPARE_ENTRIES}-entry cap"
+        )
+    rows: list[BridgeCapability] = []
+    for entry in document:
+        if (
+            not isinstance(entry, Mapping)
+            or not isinstance(entry.get("tool"), str)
+            or not isinstance(entry.get("available"), bool)
+        ):
+            raise AnalysisError(
+                f"{target}: snapshot entries need 'tool' (string) and "
+                "'available' (boolean)"
+            )
+        version = entry.get("version")
+        reason = entry.get("reason")
+        rows.append(
+            BridgeCapability(
+                tool=entry["tool"],
+                available=entry["available"],
+                version=version if isinstance(version, str) else None,
+                reason=reason if isinstance(reason, str) else None,
+            )
+        )
+    return rows
+
+
+def compare_bridges(
+    left: str | Path,
+    right: str | Path,
+    *,
+    max_rows: int = DEFAULT_MAX_ROWS,
+) -> BridgesCompare:
+    """Diff two ``bridges_report()`` snapshots saved as JSON.
+
+    Tools match by exact ``tool`` name. A tool absent from a snapshot counts
+    as unavailable: it became ``newly_available`` when the right side probes
+    available, ``newly_unavailable`` when only the left side does, and tools
+    available on both sides with different ``version`` strings are
+    ``version_changed``. Snapshots are pure input documents -- nothing is
+    probed or executed here.
+
+    Args:
+        left: The left (baseline) snapshot path (JSON list or a
+            ``{"bridges": [...]}`` wrapper).
+        right: The right (comparison) snapshot path.
+        max_rows: Detail-row budget for the change list (``1`` ..
+            :data:`MAX_COMPARE_ROWS`); excess rows are counted, summarised in
+            ``warnings`` and dropped from the detail list.
+
+    Returns:
+        A frozen :class:`BridgesCompare`; ``identical`` is ``True`` when no
+        tool changed availability or version.
+
+    Raises:
+        AnalysisError: When a snapshot cannot be read or is malformed, or
+            the budget is out of range.
+    """
+    if max_rows < 1 or max_rows > MAX_COMPARE_ROWS:
+        raise AnalysisError(f"max_rows must be between 1 and {MAX_COMPARE_ROWS}")
+    left_rows = _load_bridges_snapshot(left)
+    right_rows = _load_bridges_snapshot(right)
+    left_by_tool = {row.tool: row for row in left_rows}
+    right_by_tool = {row.tool: row for row in right_rows}
+
+    changes: list[BridgeChange] = []
+    for tool in sorted(set(left_by_tool) | set(right_by_tool)):
+        left_row = left_by_tool.get(tool)
+        right_row = right_by_tool.get(tool)
+        left_available = None if left_row is None else left_row.available
+        right_available = None if right_row is None else right_row.available
+        if left_available is not right_available:
+            kind = "newly_available" if right_available else "newly_unavailable"
+            changes.append(
+                BridgeChange(
+                    tool=tool,
+                    kind=kind,
+                    left_available=left_available,
+                    right_available=right_available,
+                    left_version=None if left_row is None else left_row.version,
+                    right_version=None if right_row is None else right_row.version,
+                )
+            )
+            continue
+        if left_row is not None and right_row is not None and left_row.version != right_row.version:
+            changes.append(
+                BridgeChange(
+                    tool=tool,
+                    kind="version_changed",
+                    left_available=left_available,
+                    right_available=right_available,
+                    left_version=left_row.version,
+                    right_version=right_row.version,
+                )
+            )
+    identical = not changes
+    change_count = len(changes)
+    if change_count > max_rows:
+        warnings = [
+            f"bridge changes truncated to the first {max_rows} of {change_count}"
+        ]
+    else:
+        warnings = []
+    evidence = Evidence(
+        source=_EVIDENCE_BRIDGES_SOURCE,
+        method="bridge_snapshot_diff",
+        confidence=Confidence.HIGH,
+        detail=(
+            "exact diff over two saved bridges_report() snapshots; a tool "
+            "missing from one snapshot counts as unavailable there"
+        ),
+        extra={"left_snapshot_rows": len(left_rows), "right_snapshot_rows": len(right_rows)},
+    )
+    return BridgesCompare(
+        left_tools=len(left_rows),
+        right_tools=len(right_rows),
+        left_available=sum(1 for row in left_rows if row.available),
+        right_available=sum(1 for row in right_rows if row.available),
+        changes=tuple(changes[:max_rows]),
+        change_count=change_count,
+        verdict="identical" if identical else "changed",
+        identical=identical,
+        warnings=_dedupe_warnings(warnings),
+        evidence=evidence.to_dict(),
+    )
+
+
 def compare_artifacts(
     what: str,
     left: str | Path,
@@ -2556,8 +3210,8 @@ def compare_artifacts(
     the JSON-backed kinds (``functions``, ``strings``, ``bundles``,
     ``reports``, ``metadata``) load their documents from the two paths, the
     path-backed kinds (``wasm``, ``crash``, ``sessions``, ``nav``,
-    ``firmware``, ``screenshots``, ``har``) hand the paths straight to
-    their typed loaders. Bundles
+    ``firmware``, ``screenshots``, ``har``, ``sections``, ``imports``,
+    ``bridges``) hand the paths straight to their typed loaders. Bundles
     must be evidence-bundle documents; reports unwrap an evidence bundle to
     its ``report`` entry automatically.
 
@@ -2617,4 +3271,10 @@ def compare_artifacts(
         return compare_screenshots(left, right)
     if what == "har":
         return compare_har(left, right)
+    if what == "sections":
+        return compare_sections(left, right, max_rows=max_rows)
+    if what == "imports":
+        return compare_imports(left, right, max_rows=max_rows)
+    if what == "bridges":
+        return compare_bridges(left, right, max_rows=max_rows)
     return compare_firmware(left, right)

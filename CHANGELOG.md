@@ -8,6 +8,24 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- **Capability domain profile lane** (`profile_capabilities`, MCP
+  `codevanta_capability_profile`): the second, deliberately coarse detector
+  next to the capa-style rule engine - eight fixed domains (network, crypto,
+  file_system, process, registry, service, gui, dynamic_loading) scanned
+  case-insensitively from raw bytes, each reporting `detected` plus at most
+  8 evidence strings and high/medium confidence, with a deterministic 0-100
+  `overall_risk_score` over dangerous domain combinations and a bounded
+  report-level evidence list (<=16). Scan capped at 8 MiB with an honest
+  truncation warning; nothing is executed.
+- **Three comparators (12 -> 15)**: `compare_sections` (two binaries'
+  section tables: added/removed sections, size and Shannon-entropy changes),
+  `compare_imports` (two binaries' import libraries: added/removed DLLs,
+  per-library function-count changes, case-insensitive matching) and
+  `compare_bridges` (two saved `bridges_report()` JSON snapshots: newly
+  available/unavailable tools, version changes). All path-backed kinds,
+  bounded by `max_rows` with truncation warnings, wired through
+  `COMPARE_WHATS`, `compare_artifacts`, the CLI `CompareWhat` Literal,
+  renderers and the MCP `codevanta_compare` tool.
 - **JavaScript/Electron static analysis lane**: offline, pure-Python
   inventory of an app directory or `.asar` archive - modules, imports
   (require/import/export-from/dynamic, classified relative/bare/builtin,
@@ -36,10 +54,35 @@ All notable changes to CODEVANTA are documented here. The format follows
   `codevanta_stackstrings`, GUI `/api/stackstrings`): FLOSS-style recovery
   of stack-constructed strings via the bounded offline unicorn emulator,
   with per-record evidence (medium confidence).
+- **Triage hashing lane** (`codevanta triage`, MCP `codevanta_triage`):
+  the imphash (MD5 over the lowercase dll.function import list, the
+  Mandiant/VirusTotal convention -- refused with a typed error where the
+  loader has no library pairing) plus an ssdeep-shaped piecewise fuzzy hash
+  with a 0-100 similarity score (`--compare`), pure stdlib.
+- **Go symbol recovery lane** (`codevanta gosymbols`, MCP
+  `codevanta_gosymbols`): function names, addresses and (1.16+) file/line
+  recovered from a stripped Go binary's pclntab -- go1.2 / 1.16 / 1.18+ /
+  1.20+ layouts, located by section name then a bounded magic scan;
+  UPX-compressed and garble tables documented out of scope.
+- **YARA subset lane** (`codevanta yara --rules`, MCP `codevanta_yara`):
+  parse and evaluate a bounded subset of real YARA rule syntax (text
+  strings with nocase/wide, hex strings with nibble wildcards and bounded
+  jumps, and/or/not, `#a OP N`, `filesize OP N`, all of / any of / N of) --
+  unsupported grammar fails with a typed error naming the rule, never
+  silently.
+- **Replay fixture lane** (`codevanta replay-fixture`, MCP
+  `codevanta_replay_fixture`): a recorded HAR normalized into a
+  deterministic, bounded replay fixture (bodies as size + sha256 + preview
+  only) with an endpoint manifest that collapses paths into templates --
+  the offline half of a replay environment; nothing is served or executed.
+- **PDB info lane** (`codevanta pdb`, MCP `codevanta_pdb`): a bounded
+  MSF v7 walk of a local .pdb (streams, info stream GUID/age/version,
+  named streams, DBI modules) plus the PE debug directory's CodeView
+  reference (RSDS/NB10) -- no symbol records, no TPI/IPI, no downloads.
 
 ### Changed
 
-- MCP server registers **60 tools** (from 55 at v0.3.0); the dashboard
+- MCP server registers **73 tools** (from 55 at v0.3.0); the dashboard
   grows to **25 routes** (from 20).
 
 ## [0.3.0] - 2026-11-14

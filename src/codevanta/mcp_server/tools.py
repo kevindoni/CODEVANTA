@@ -159,6 +159,9 @@ from codevanta.mcp_server.ext_bridges import (  # lane-bridge-a: ONE MCP registr
     codevanta_pcap_fields,  # noqa: F401
 )
 from codevanta.mcp_server.ext_caps import codevanta_capabilities as codevanta_capabilities  # noqa: F401 -- lane-caps: ONE MCP registration line
+from codevanta.mcp_server.ext_caps import (
+    codevanta_capability_profile as codevanta_capability_profile,  # noqa: F401 -- lane-cap2: ONE MCP registration line
+)
 from codevanta.mcp_server.ext_crash import codevanta_crash as codevanta_crash
 from codevanta.mcp_server.ext_depth import (  # lane-bridge-b: ONE MCP registration line
     codevanta_apk_decode as codevanta_apk_decode,
@@ -175,9 +178,14 @@ from codevanta.mcp_server.ext_depth import (
 from codevanta.mcp_server.ext_depth import (
     codevanta_js_recover as codevanta_js_recover,
 )
+from codevanta.mcp_server.ext_depth2 import (  # lane-depth2: ONE MCP registration line
+    codevanta_elf_macho,  # noqa: F401
+    codevanta_pe_deep,  # noqa: F401
+)
 from codevanta.mcp_server.ext_format2 import (  # lane-format2: ONE MCP registration import line
     codevanta_codesign,  # noqa: F401
 )
+from codevanta.mcp_server.ext_gosymbols import codevanta_gosymbols as codevanta_gosymbols  # noqa: F401 -- lane-gosymbols: ONE MCP registration line
 from codevanta.mcp_server.ext_il2gpu import (  # lane-il2gpu: ONE MCP registration line
     codevanta_gpu,  # noqa: F401
     codevanta_il2cpp,  # noqa: F401
@@ -196,8 +204,18 @@ from codevanta.mcp_server.ext_meta import (
 )
 from codevanta.mcp_server.ext_mobile import codevanta_adb as codevanta_adb
 from codevanta.mcp_server.ext_nav import codevanta_nav, codevanta_nav_providers  # noqa: F401 -- registration of the ext_nav MCP tools
+from codevanta.mcp_server.ext_pdb import codevanta_pdb as codevanta_pdb  # noqa: F401 -- lane-pdb: ONE MCP registration line
 from codevanta.mcp_server.ext_providers import codevanta_providers as codevanta_providers
+from codevanta.mcp_server.ext_replay import codevanta_replay_fixture as codevanta_replay_fixture  # noqa: F401 -- lane-replay: ONE MCP registration line
 from codevanta.mcp_server.ext_sbom import codevanta_sbom as codevanta_sbom  # noqa: F401 -- lane-sbom: ONE MCP registration line
+from codevanta.mcp_server.ext_search import (  # lane-search: ONE MCP registration import line
+    codevanta_call_path,  # noqa: F401
+    codevanta_graph_subset,  # noqa: F401
+    codevanta_navigate,  # noqa: F401
+    codevanta_search_bytes,  # noqa: F401
+    codevanta_search_procs,  # noqa: F401
+    codevanta_search_strings,  # noqa: F401
+)
 from codevanta.mcp_server.ext_signal import (  # lane-signal: ONE MCP registration line
     codevanta_dtb,  # noqa: F401
     codevanta_signal_sr,  # noqa: F401
@@ -205,11 +223,13 @@ from codevanta.mcp_server.ext_signal import (  # lane-signal: ONE MCP registrati
 )
 from codevanta.mcp_server.ext_solver import codevanta_symbolic_solve  # noqa: F401 -- one-line registration of the ext solver MCP tool
 from codevanta.mcp_server.ext_stackstrings import codevanta_stackstrings as codevanta_stackstrings  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
+from codevanta.mcp_server.ext_triage import codevanta_triage as codevanta_triage  # noqa: F401 -- lane-triage: ONE MCP registration line
 from codevanta.mcp_server.ext_web import codevanta_asar, codevanta_web_inspect  # noqa: F401 - registration of the ext_web MCP tools
 from codevanta.mcp_server.ext_webcap import (  # lane-webcap: ONE MCP registration line
     codevanta_proto_decode,  # noqa: F401
     codevanta_web_capture,  # noqa: F401
 )
+from codevanta.mcp_server.ext_yara import codevanta_yara as codevanta_yara  # noqa: F401 -- lane-yara: ONE MCP registration line
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore
 
@@ -1576,8 +1596,12 @@ def compare(
     counts; ``metadata`` diffs two binmeta MetadataReport documents; the
     path-backed kinds take non-JSON files directly -- ``wasm`` (two WASM
     modules), ``crash`` (two ELF core dumps with a same_crash_site
-    verdict), ``sessions``/``nav`` (two session databases) and ``firmware``
-    (two firmware images' magic-scan hits). Nothing is executed or
+    verdict), ``sessions``/``nav`` (two session databases), ``firmware``
+    (two firmware images' magic-scan hits), ``sections`` (two binaries'
+    section tables: added/removed, size and entropy changes), ``imports``
+    (two binaries' import libraries: added/removed DLLs, function-count
+    changes) and ``bridges`` (two bridges_report() JSON snapshots: newly
+    available/unavailable tools, version changes). Nothing is executed or
     disassembled, and every result carries an evidence record stating how
     far the claim reaches.
     """

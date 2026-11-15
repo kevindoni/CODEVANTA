@@ -342,6 +342,11 @@ codevanta js audit        path\to\app           # security anti-patterns (EA-001
 codevanta sbom            path\to\app samples\pe64_text.bin -o sbom.json   # CycloneDX 1.6
 codevanta capabilities    samples\pe64_text.bin # capa-style rule matching
 codevanta stackstrings    samples\pe64_text.bin # FLOSS-style stack-built strings
+codevanta triage          samples\pe64_text.bin --compare other.bin   # imphash + fuzzy score
+codevanta gosymbols       app.exe               # pclntab names from stripped Go
+codevanta yara            file.bin --rules rules.yar                   # YARA subset matching
+codevanta replay-fixture  capture.har -o fixture.json                  # replay environment
+codevanta pdb             app.pdb               # MSF walk or PE CodeView ref
 ```
 
 `diff --semantic` prints one dim
@@ -511,7 +516,8 @@ MCP tools: `codevanta_info`, `codevanta_functions`,
 `codevanta_dwarf`, `codevanta_vtable`, `codevanta_trace`,
 `codevanta_symbolic`, `codevanta_dataflow`, `codevanta_javascript`,
 `codevanta_electron_audit`, `codevanta_sbom`, `codevanta_capabilities`,
-`codevanta_stackstrings`,
+`codevanta_stackstrings`, `codevanta_gosymbols`, `codevanta_yara`,
+`codevanta_triage`, `codevanta_replay_fixture`, `codevanta_pdb`,
 `codevanta_session_save`, `codevanta_session_list`.
 `codevanta_analyze` mirrors
 the CLI flags (`include_xrefs` / `include_cfg` / `include_callgraph`, default off)

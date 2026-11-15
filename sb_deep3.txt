@@ -1,0 +1,172 @@
+=== PE SECURITY FEATURES ===
+  DLL Characteristics: 0x8160
+    YES HIGH_ENTROPY_VA                High entropy ASLR
+    YES DYNAMIC_BASE                   ASLR
+    YES NX_COMPAT                      DEP
+    NO  NO_SEH                         SEH disabled
+    NO  APPCONTAINER                   AppContainer
+    NO  GUARD_CF                       Control Flow Guard
+    YES TERMINAL_SERVER_AWARE          TS aware
+
+=== OVERLAY ===
+  Last section ends: 29,230,080
+  File size: 29,240,608
+  Overlay: 10,528 bytes
+  Overlay entropy: 7.48
+
+=== AUTHENTICODE ===
+  Security Dir: RVA=0x0 Size=0
+
+=== VERSION INFO ===
+
+=== WEB ASSETS ===
+  JS functions: 68
+  HTML divs: 119
+  CSS blocks: 101
+  MF references: 80
+
+=== SUBDOMAINS ===
+
+  [api-sekuritas.stockbit] (1)
+    https://api-sekuritas.stockbit.com
+
+  [carina.stockbit] (1)
+    https://carina.stockbit.com
+
+  [codeberg] (1)
+    https://codeberg.org
+
+  [curl] (1)
+    https://curl.se
+
+  [developer.microsoft] (1)
+    https://developer.microsoft.com
+
+  [docs] (1)
+    https://docs.rs
+
+  [dummy] (1)
+    http://dummy.testC
+
+  [exodus.stockbit] (1)
+    https://exodus.stockbit.com
+
+  [github] (1)
+    https://github.com
+
+  [iplocation.stockbit] (1)
+    https://iplocation.stockbit.com
+
+  [ns.adobe] (1)
+    http://ns.adobe.com
+
+  [sda-updater.stockbit] (1)
+    https://sda-updater.stockbit.com
+
+  [storage.stockbit] (1)
+    https://storage.stockbit.com
+
+  [www] (11)
+    http://www.css
+    http://www.hortcut
+    http://www.icon
+    http://www.interpretation
+    http://www.language
+    http://www.style
+    http://www.text
+    http://www.wencodeURIComponent
+
+  [www.w3] (1)
+    http://www.w3.org
+
+  [www.youtube-nocookie] (1)
+    https://www.youtube-nocookie.com
+
+=== RUST STRUCTS ===
+  struct LogicalSize (2 fields)
+  struct PhysicalSize (2 fields)
+  struct LogicalPosition (2 fields)
+  struct PhysicalPosition (2 fields)
+  struct ProgressBarState (2 fields)
+  struct NewOptions (8 fields)
+  struct WindowConfig (63 fields)
+  struct Config (1 fields)
+  struct LoadStoreOptions (6 fields)
+  struct RunOptions (8 fields)
+  struct WindowEffectsConfig (5 fields)
+  struct EndpointSpec (4 fields)
+  struct BaseOptions (1 fields)
+  struct RenameOptions (2 fields)
+  struct WindowSizeConstraints (4 fields)
+  struct CopyFileOptions (2 fields)
+  struct DialogFilter (2 fields)
+  struct CommandOptions (4 fields)
+  struct EntryRaw (4 fields)
+  struct OpenDialogOptions (9 fields)
+  struct SaveDialogOptions (4 fields)
+  struct ReleaseManifestPlatform (2 fields)
+  struct Config (6 fields)
+  struct InnerRemoteRelease (6 fields)
+  struct IpInfo (2 fields)
+  struct Message (6 fields)
+  struct AboutMetadata (11 fields)
+  struct SubmenuPayload (5 fields)
+  struct MenuItemPayload (5 fields)
+  struct IconMenuItemPayload (6 fields)
+  struct CheckMenuItemPayload (6 fields)
+  struct PredefinedMenuItemPayload (2 fields)
+  struct PreventOverflowMargin (2 fields)
+
+=== CLOUDFLARE ===
+  cloudflare.comchallenges.cloud
+  cloudflare::clearancecore\src\cloudflare\clearance.rs
+  cloudflare::proxycore\src\cloudflare\proxy.rs
+  cloudflare\clearance.rs
+  cloudflare\clearance.rs:214
+  cloudflare\clearance.rs:289left
+  cloudflare\clearance.rs:291purged1yA
+  cloudflare\clearance.rs:301
+  cloudflare\clearance.rs:314
+  cloudflare\clearance.rs:345
+  cloudflare\clearance.rs:354
+  cloudflare\clearance.rs:363
+  cloudflare\clearance.rs:372
+  cloudflare\clearance.rs:395
+  cloudflare\clearance.rs:401
+  cloudflare\clearance.rs:415
+  cloudflare\clearance.rs:422
+  cloudflare\clearance.rs:441
+  cloudflare\proxy.rs
+  cloudflare\proxy.rs:118
+  cloudflare\proxy.rs:145
+  cloudflare\proxy.rs:158
+  cloudflare\proxy.rs:175
+  cloudflare\proxy.rs:191
+  cloudflare\proxy.rs:86cf_proxy
+  cloudflare\proxy.rs:91
+  cloudflare\proxy.rs:99
+
+=== NETDIAG ===
+  dns_resolution_timetcp_connection_timetls_handshake_timettfbtotal_timeresponse_size_bytescdn_c
+  icmp_echo_apiicmp echo api unavailableicmp echo api: IPv6 not supported
+  netdiag already running
+  netdiag-signal-icon.svg
+  netdiag::run::Netdiag<tauri_runtime_wry::Wry<tauri::EventLoopMessage>>>tauri_plugin_cli
+  netdiagHL
+  netdiagH3QH	e
+  netdiagNetwork Diagnostic
+  netdiag\curl.rs
+  netdiag\icmp\mod.rs
+  netdiag\icmp\win.rs
+  netdiag\meta.rs
+  netdiag\run.rs
+  netdiag\trace.rs
+  netdiag_H3H_runningH3QH	&
+  netdiag_traceroute
+  netdiag_windowopen_netdiag_winn_preview_windowopen_preview_winvironment_windowopen_envi
+  netdiagnetdiag_tracerouteprobe_network_timingssession_store_getsession_store_setsession
+  probe_network_tipick_pdf_save_path
+  traceroute is not supported
+  ttfb_mscurl_codeprimary_iprtt_mstarget_iphopsicmp_methodopen_errorsentreplieshopip
+
+=== DONE ===

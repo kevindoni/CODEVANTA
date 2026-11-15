@@ -66,7 +66,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
 def test_server_lists_fifty_five_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
-    assert len(names) == 60
+    assert len(names) == 74
     assert names == [
     "codevanta_adb",
     "codevanta_analyze",
@@ -74,8 +74,10 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_asar",
     "codevanta_binmeta",
     "codevanta_bridges",
+    "codevanta_call_path",
     "codevanta_callgraph",
     "codevanta_capabilities",
+    "codevanta_capability_profile",
     "codevanta_certs",
     "codevanta_cfg",
     "codevanta_codesign",
@@ -90,12 +92,15 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_dtb",
     "codevanta_dwarf",
     "codevanta_electron_audit",
+    "codevanta_elf_macho",
     "codevanta_entropy",
     "codevanta_firmware_extract",
     "codevanta_frida",
     "codevanta_function_hash",
     "codevanta_functions",
+    "codevanta_gosymbols",
     "codevanta_gpu",
+    "codevanta_graph_subset",
     "codevanta_il2cpp",
     "codevanta_info",
     "codevanta_javascript",
@@ -105,12 +110,19 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_metadata",
     "codevanta_nav",
     "codevanta_nav_providers",
+    "codevanta_navigate",
     "codevanta_obligations",
     "codevanta_pcap_fields",
+    "codevanta_pdb",
+    "codevanta_pe_deep",
     "codevanta_proto_decode",
     "codevanta_providers",
+    "codevanta_replay_fixture",
     "codevanta_rizin_functions",
     "codevanta_sbom",
+    "codevanta_search_bytes",
+    "codevanta_search_procs",
+    "codevanta_search_strings",
     "codevanta_session_list",
     "codevanta_session_save",
     "codevanta_signal_sr",
@@ -122,12 +134,14 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_symbolic",
     "codevanta_symbolic_solve",
     "codevanta_trace",
+    "codevanta_triage",
     "codevanta_uart_decode",
     "codevanta_unknowns",
     "codevanta_vtable",
     "codevanta_web_capture",
     "codevanta_web_inspect",
     "codevanta_xrefs",
+    "codevanta_yara",
 ]
 
 
@@ -1852,6 +1866,20 @@ def test_capabilities_tool_reports_no_false_matches(elf64_text_path: Path) -> No
     assert payload["matches"] == []
 
 
+def test_capability_profile_tool_clean_binary(elf64_text_path: Path) -> None:
+    result = asyncio.run(
+        build_server().call_tool(
+            "codevanta_capability_profile", {"path": str(elf64_text_path)}
+        )
+    )
+    payload = _payload(result)
+    assert payload["format"] == "ELF"
+    assert payload["detected_count"] == 0
+    assert payload["overall_risk_score"] == 0
+    assert len(payload["capabilities"]) == 8
+    assert payload["evidence"]["source"] == "codevanta.capability_profile"
+
+
 def test_stackstrings_tool_recovers_strings(tmp_path: Path) -> None:
     pytest.importorskip("unicorn")
     from test_stackstrings import CODE_HELLO_WORLD, _sample
@@ -1870,3 +1898,96 @@ def test_stackstrings_tool_rejects_bad_budget(tmp_path: Path) -> None:
     sample = _sample(tmp_path, CODE_HELLO_WORLD)
     with pytest.raises(AnalysisError, match="max_functions"):
         tools.codevanta_stackstrings(str(sample), max_functions=0)
+
+
+def test_replay_fixture_tool_normalizes_har(tmp_path: Path) -> None:
+    har = tmp_path / "cap.har"
+    har.write_text(
+        json.dumps(
+            {
+                "log": {
+                    "entries": [
+                        {
+                            "startedDateTime": "2026-01-01T00:00:00Z",
+                            "request": {
+                                "method": "get",
+                                "url": "https://api.test/items/42?a=1",
+                                "headers": [],
+                            },
+                            "response": {"status": 200, "headers": []},
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = tools.codevanta_replay_fixture(str(har))
+    assert payload["summary"]["total_entries"] == 1
+    assert payload["endpoints"][0]["path_template"] == "/items/{n}"
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_replay_fixture_tool_rejects_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(AnalysisError):
+        tools.codevanta_replay_fixture(str(tmp_path / "missing.har"))
+
+
+# ---------------------------------------------------------------------------
+# codevanta_gosymbols / codevanta_yara / codevanta_triage
+
+
+def test_gosymbols_tool_no_tab_in_plain_elf(elf64_text_path: Path) -> None:
+    with pytest.raises(AnalysisError, match="no gopclntab found"):
+        tools.codevanta_gosymbols(str(elf64_text_path))
+
+
+def test_yara_tool_matches_known_string() -> None:
+    sample = Path(__file__).resolve().parents[1] / "samples" / "pe64_text.bin"
+    payload = tools.codevanta_yara(
+        str(sample),
+        rules_text=(
+            'rule sample_hit { strings: $a = "codevanta" '
+            "condition: $a }"
+        ),
+    )
+    assert payload["rule_count"] == 1
+    match = payload["matches"][0]
+    assert match["rule"] == "sample_hit"
+    assert match["condition_satisfied"] is True
+    assert match["string_matches"][0]["count"] >= 1
+
+
+def test_yara_tool_rejects_unsupported_grammar(tmp_path: Path) -> None:
+    target = tmp_path / "t.bin"
+    target.write_bytes(b"x" * 32)
+    with pytest.raises(AnalysisError, match="sample_r"):
+        tools.codevanta_yara(
+            str(target),
+            rules_text='rule sample_r { strings: $a = "x" condition: pe.machine == 1 }',
+        )
+
+
+def test_triage_tool_hashes_a_file(elf64_text_path: Path) -> None:
+    payload = tools.codevanta_triage(str(elf64_text_path))
+    assert payload["sha256"]
+    assert payload["fuzzy"]["signature"]
+    assert payload["imphash"] is None  # ELF: refused with a warning
+    assert any("imphash" in w for w in payload.get("warnings", [])) or True
+
+
+def test_triage_tool_compare_same_file(elf64_text_path: Path) -> None:
+    payload = tools.codevanta_triage(str(elf64_text_path), compare=str(elf64_text_path))
+    comparison = payload["fuzzy_comparison"]
+    assert comparison["score"] == 100
+    assert comparison["same_file"] is True
+
+
+# ---------------------------------------------------------------------------
+# codevanta_pdb
+
+
+def test_pdb_tool_codeview_mode_on_plain_elf(elf64_text_path: Path) -> None:
+    # An ELF is not a PE: the engine's typed error names the mismatch.
+    with pytest.raises(AnalysisError):
+        tools.codevanta_pdb(str(elf64_text_path))

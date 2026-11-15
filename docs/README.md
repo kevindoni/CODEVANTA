@@ -13,6 +13,11 @@ User-facing documentation for CODEVANTA.
 | [SBOM](sbom.md) | CycloneDX 1.6 export from CODEVANTA inventories |
 | [Capabilities](capabilities.md) | File-scope capability rules (capa-style subset) |
 | [Stackstrings](stackstrings.md) | Stack-built string recovery via bounded emulation |
+| [Triage hashes](triage-hash.md) | imphash (Mandiant convention) + ssdeep-shaped fuzzy hash |
+| [Go symbols](go-symbols.md) | pclntab function-name recovery from stripped Go binaries |
+| [YARA subset](yara-subset.md) | Bounded YARA rule parsing and matching |
+| [Replay fixture](replay-fixture.md) | HAR recordings as deterministic replay fixtures |
+| [PDB info](pdb-info.md) | MSF v7 structure and PE CodeView references, offline |
 | [Assets](assets/) | Screenshots used by the README |
 | [Release checklist](release-checklist.md) | What the release workflow verifies |
 | [Repository settings](repository-settings.md) | Branch protection and CI gates |
