@@ -474,3 +474,161 @@ def test_mcp_ui_preview_tool(tmp_path: Path) -> None:
     assert layout["dialogs"][0]["title"] == "Main"
     with pytest.raises(AnalysisError, match="file not found"):
         tools.codevanta_ui_preview(str(tmp_path / "ghost.exe"), str(tmp_path / "c"))
+# ---- lane-uifid: full dialog fidelity (font + style flags) -----------------------
+
+DS_MODALFRAME = 0x80
+ES_PASSWORD = 0x20
+SS_ICON = 0x03
+CBS_DROPDOWNLIST = 0x03
+BS_GROUPBOX = 0x07
+
+
+def build_dialog_fidelity() -> bytes:
+    """DLGTEMPLATEEX: DS_MODALFRAME|DS_SETFONT, 'MS Shell Dlg 2' 9pt, six items.
+
+    Covers the per-class flag families: defpush button, password edit, icon
+    static, dropdown-list combo, group box and an auto checkbox.
+    """
+    blob = bytearray()
+    blob += struct.pack("<HH", 1, 0xFFFF)
+    blob += struct.pack("<III", 7, 0, WS_POPUP | WS_VISIBLE | DS_SETFONT | DS_MODALFRAME)
+    blob += struct.pack("<H", 6)  # cDlgItems
+    blob += struct.pack("<hhhh", 0, 0, 300, 180)
+    blob += struct.pack("<H", 0x0000)  # menu: none
+    blob += struct.pack("<H", 0x0000)  # class: none
+    blob += _u16("Fidelity")
+    blob += struct.pack("<HHBB", 9, 400, 0, 0)  # EX font: 9pt, weight 400
+    blob += _u16("MS Shell Dlg 2")
+
+    def item(style: int, ident: int, cls: int, title: bytes) -> None:
+        blob.extend(struct.pack("<IIIhhhhI", 0, 0, style, 0, 0, 0, 0, ident))
+        blob.extend(struct.pack("<HH", 0xFFFF, cls))
+        blob.extend(title)
+        blob.extend(struct.pack("<H", 0))
+        _align_blob(blob)
+
+    item(WS_CHILD | WS_VISIBLE | WS_TABSTOP | 0x1, 10, 0x80, _u16("OK"))
+    item(
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL,
+        20, 0x81, struct.pack("<H", 0),
+    )
+    item(WS_CHILD | WS_VISIBLE | SS_ICON, 30, 0x82, struct.pack("<H", 0))
+    item(
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+        40, 0x85, struct.pack("<H", 0),
+    )
+    item(WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 50, 0x80, _u16("Group"))
+    item(WS_CHILD | WS_VISIBLE | WS_TABSTOP | 0x3, 60, 0x80, _u16("Option"))
+    blob += struct.pack("<H", 0)  # template terminator
+    return bytes(blob)
+
+
+def fidelity_pe(path: Path) -> Path:
+    payload = build_resource_section({5: [(1, build_dialog_fidelity())]})
+    return make_pe(path, data_dirs={2: (SECTION_VA, len(payload))}, section_payload=payload)
+
+
+def test_fidelity_dialog_font_and_style_flags(tmp_path: Path) -> None:
+    summary = winres_ui.decode_ui_resources(fidelity_pe(tmp_path / "fid.exe"))
+    dialog = summary.dialogs[0]
+    # pre-existing keys keep their exact shape and semantics
+    assert dialog["font"] == {
+        "point_size": 9,
+        "weight": 400,
+        "italic": 0,
+        "charset": 0,
+        "typeface": "MS Shell Dlg 2",
+    }
+    # new normalized fidelity block
+    assert dialog["font_info"] == {
+        "name": "MS Shell Dlg 2",
+        "pointsize": 9,
+        "weight": 400,
+        "italic": False,
+        "charset": 0,
+    }
+    # DS_ and WS_ names mixed in one deterministic list
+    assert dialog["style_flags"] == ["DS_SETFONT", "DS_MODALFRAME", "WS_VISIBLE"]
+    button, edit, icon, combo, groupbox, checkbox = dialog["items"]
+    assert button["type"] == "button:defpushbutton"
+    assert button["style_flags"] == [
+        "WS_CHILD", "WS_VISIBLE", "WS_TABSTOP", "BS_DEFPUSHBUTTON",
+    ]
+    assert button["style_hex"] == "0x50010001"
+    assert edit["type"] == "edit:password"
+    for name in ("ES_PASSWORD", "ES_AUTOHSCROLL", "WS_CHILD", "WS_VISIBLE", "WS_TABSTOP"):
+        assert name in edit["style_flags"]
+    assert icon["type"] == "static:icon"
+    assert "SS_ICON" in icon["style_flags"]
+    assert combo["type"] == "combobox:dropdownlist"
+    assert "CBS_DROPDOWNLIST" in combo["style_flags"]
+    assert groupbox["type"] == "button:groupbox"
+    assert "BS_GROUPBOX" in groupbox["style_flags"]
+    assert checkbox["type"] == "button:autocheckbox"
+    assert "BS_AUTOCHECKBOX" in checkbox["style_flags"]
+
+
+def test_fidelity_classic_font_info_and_flags(tmp_path: Path) -> None:
+    payload = build_resource_section({5: [(1, build_dialog_classic())]})
+    target = make_pe(
+        tmp_path / "classicfid.exe",
+        data_dirs={2: (SECTION_VA, len(payload))},
+        section_payload=payload,
+    )
+    dialog = winres_ui.decode_ui_resources(target).dialogs[0]
+    # classic templates record only point size + typeface: the rest stays null
+    assert dialog["font_info"] == {
+        "name": "Arial",
+        "pointsize": 8,
+        "weight": None,
+        "italic": None,
+        "charset": None,
+    }
+    assert dialog["style_flags"] == ["DS_SETFONT", "WS_VISIBLE"]
+    item = dialog["items"][0]
+    assert item["type"] == "button:defpushbutton"  # WS_CHILD|WS_VISIBLE|0x1
+    assert item["style_flags"] == ["WS_CHILD", "WS_VISIBLE", "BS_DEFPUSHBUTTON"]
+
+
+def test_fidelity_preview_html_markers(tmp_path: Path) -> None:
+    summary = winres_ui.decode_ui_resources(fidelity_pe(tmp_path / "fidui.exe"))
+    first = winres_ui.render_preview_html(summary, title="Fid")
+    second = winres_ui.render_preview_html(summary, title="Fid")
+    assert first == second  # determinism unchanged
+    assert "px = pt * 96 / 72" in first  # honesty comment in the head
+    assert "font-family:'MS Shell Dlg 2'" in first  # dialog font face
+    assert "font-size:12px" in first  # 9 pt -> 12 px at 96 dpi
+    assert "font-weight:bold" in first  # default pushbutton marker
+    assert "border:2px solid #555" in first  # DS_MODALFRAME frame
+    assert "\u2022\u2022\u2022\u2022" in first  # password mask placeholder
+    assert 'class="legend"' in first  # group box title as legend
+    assert "placeholder" in first  # icon static placeholder box
+    assert "\u2610 Option" in first  # checkbox glyph prefix
+
+
+def test_fidelity_unknown_item_class_type_none(tmp_path: Path) -> None:
+    blob = bytearray()
+    blob += struct.pack("<HH", 1, 0xFFFF)
+    blob += struct.pack("<III", 0, 0, WS_POPUP | WS_VISIBLE)
+    blob += struct.pack("<H", 1)
+    blob += struct.pack("<hhhh", 0, 0, 100, 50)
+    blob += struct.pack("<H", 0x0000)
+    blob += struct.pack("<H", 0x0000)
+    blob += _u16("Custom")
+    _align_blob(blob)
+    blob += struct.pack("<IIIhhhhI", 0, 0, WS_CHILD | WS_VISIBLE, 0, 0, 40, 10, 5)
+    blob += _u16("SysLink")  # registered class string: not a known ordinal
+    blob += struct.pack("<H", 0x0000)  # empty title
+    blob += struct.pack("<H", 0)  # extraCount
+    blob += struct.pack("<H", 0)  # template terminator
+    payload = build_resource_section({5: [(1, bytes(blob))]})
+    target = make_pe(
+        tmp_path / "custom.exe",
+        data_dirs={2: (SECTION_VA, len(payload))},
+        section_payload=payload,
+    )
+    item = winres_ui.decode_ui_resources(target).dialogs[0]["items"][0]
+    assert item["class"] == "SysLink"
+    assert item["type"] is None  # no invented semantics for custom classes
+    assert item["style_flags"] == ["WS_CHILD", "WS_VISIBLE"]
+    assert item["style_hex"] == "0x50000000"
