@@ -198,6 +198,21 @@ from codevanta.mcp_server.ext_expose import codevanta_wasm as codevanta_wasm  # 
 from codevanta.mcp_server.ext_format2 import (  # lane-format2: ONE MCP registration import line
     codevanta_codesign,  # noqa: F401
 )
+from codevanta.mcp_server.ext_fridasession import (  # lane-frida: ONE MCP registration import line
+    codevanta_frida_close as codevanta_frida_close,  # noqa: F401
+)
+from codevanta.mcp_server.ext_fridasession import (
+    codevanta_frida_load as codevanta_frida_load,  # noqa: F401
+)
+from codevanta.mcp_server.ext_fridasession import (
+    codevanta_frida_sessions as codevanta_frida_sessions,  # noqa: F401
+)
+from codevanta.mcp_server.ext_fridasession import (
+    codevanta_frida_start as codevanta_frida_start,  # noqa: F401
+)
+from codevanta.mcp_server.ext_fridasession import (
+    codevanta_frida_status as codevanta_frida_status,  # noqa: F401
+)
 from codevanta.mcp_server.ext_gosymbols import codevanta_gosymbols as codevanta_gosymbols  # noqa: F401 -- lane-gosymbols: ONE MCP registration line
 from codevanta.mcp_server.ext_il2gpu import (  # lane-il2gpu: ONE MCP registration line
     codevanta_gpu,  # noqa: F401
