@@ -276,6 +276,12 @@ from codevanta.mcp_server.ext_meta import (
 )
 from codevanta.mcp_server.ext_mobile import codevanta_adb as codevanta_adb
 from codevanta.mcp_server.ext_nav import codevanta_nav, codevanta_nav_providers  # noqa: F401 -- registration of the ext_nav MCP tools
+from codevanta.mcp_server.ext_netcapture import (  # lane-net: ONE MCP registration import line
+    codevanta_net_capture as codevanta_net_capture,  # noqa: F401 -- lane-net
+)
+from codevanta.mcp_server.ext_netcapture import (  # lane-net: ONE MCP registration import line
+    codevanta_net_interfaces as codevanta_net_interfaces,  # noqa: F401 -- lane-net
+)
 from codevanta.mcp_server.ext_pdb import codevanta_pdb as codevanta_pdb  # noqa: F401 -- lane-pdb: ONE MCP registration line
 from codevanta.mcp_server.ext_proccapture import (  # lane-proccapture: ONE MCP registration import line
     DEFAULT_PROC_TIMEOUT as DEFAULT_PROC_TIMEOUT,  # noqa: F401 -- server wrapper default
