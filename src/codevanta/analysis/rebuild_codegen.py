@@ -529,11 +529,11 @@ def generate_starter(
         if not isinstance(body, str) or not body:
             continue
         name = _sanitize_component(str(extra.get("name") or f"sub_{extra.get('address', index)}"))
-        rel = ("app", _PSEUDO_C_DIR, f"{index:02d}_{name}.c")
+        rel_parts = ("app", _PSEUDO_C_DIR, f"{index:02d}_{name}.c")
         if len(written) >= MAX_FILES:
             break
-        _record(_resolve(rel), body if body.endswith("\n") else body + "\n")
-        pseudo_files.append({"path": "/".join(rel), "name": name})
+        _record(_resolve(rel_parts), body if body.endswith("\n") else body + "\n")
+        pseudo_files.append({"path": "/".join(rel_parts), "name": name})
     if len(pseudo_files) < len(decompiles):
         files_truncated = True
         warnings.append(
