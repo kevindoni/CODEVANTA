@@ -358,6 +358,7 @@ def _study_binary(
 
     # deep mode: read inside the file
     if mode == "deep":
+        functions: list[Any] = []
         # functions — reads executable sections
         try:
             functions = discover_functions(loaded)
@@ -418,6 +419,65 @@ def _study_binary(
                 )
             except (AnalysisError, DisassemblyError) as exc:
                 warnings.append(f"entry-point disassembly skipped: {exc}")
+
+        # imports detail — which OS APIs the app calls; the map for recreating
+        # behaviour in a rebuild
+        if loaded.imports:
+            by_library: dict[str, list[str]] = {}
+            for imp in loaded.imports:
+                lib = imp.library or "<unknown>"
+                by_library.setdefault(lib, []).append(imp.name)
+            add(
+                "imports",
+                "binary.imports",
+                Confidence.CERTAIN,
+                f"{len(loaded.imports)} imports across {len(by_library)} libraries",
+                extra={
+                    "count": len(loaded.imports),
+                    "libraries": {
+                        lib: names[:25] for lib, names in sorted(by_library.items())
+                    },
+                },
+            )
+
+        # decompile — pseudo-C of the entry point and the first named
+        # functions; the core evidence an agent translates into real code
+        try:
+            from codevanta.analysis.decompile import decompile_function
+
+            targets: list[int] = []
+            if loaded.entry_point is not None:
+                targets.append(loaded.entry_point)
+            named = [f.address for f in functions if f.name]
+            targets.extend(a for a in named if a not in targets)
+            decompiled = 0
+            for addr in targets[:3]:
+                try:
+                    pseudo = decompile_function(path, loaded, addr)
+                except (AnalysisError, DisassemblyError, ValueError):
+                    continue
+                body = pseudo.body
+                truncated = len(body) > 4000
+                if truncated:
+                    body = body[:4000] + "\n/* ... truncated ... */"
+                add(
+                    "decompile",
+                    "binary.decompile",
+                    Confidence.MEDIUM,
+                    f"pseudo-C of {pseudo.name or f'sub_{addr:x}'} "
+                    f"({pseudo.instruction_count} instructions)",
+                    extra={
+                        "address": f"0x{addr:x}",
+                        "name": pseudo.name,
+                        "body": body,
+                        "truncated": truncated,
+                    },
+                )
+                decompiled += 1
+            if decompiled == 0:
+                warnings.append("decompilation skipped: no decompilable function found")
+        except ImportError as exc:
+            warnings.append(f"decompilation skipped: {exc}")
 
     return entries, warnings
 

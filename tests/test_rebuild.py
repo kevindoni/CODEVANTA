@@ -80,6 +80,22 @@ def test_study_binary_deep_reads_inside(tmp_path: Path) -> None:
     assert len(kinds) >= 3
 
 
+def test_study_binary_deep_decompiles_for_rebuild(elf64_text_path: Path) -> None:
+    """Deep study must record pseudo-C evidence an agent can rebuild from."""
+    entries, warnings, loaded = study_target(str(elf64_text_path), mode="deep")
+    assert loaded is not None
+    kinds = {e.kind for e in entries}
+    # imports entry appears whenever the loader found an import table
+    if loaded.imports:
+        assert "imports" in kinds
+    # entry-point decompilation: the executable .text fixture is decodable
+    decomp = [e for e in entries if e.kind == "decompile"]
+    assert decomp, f"expected decompile evidence, kinds={kinds}, warnings={warnings}"
+    body = decomp[0].extra.get("body", "")
+    assert isinstance(body, str) and body
+    assert len(body) <= 4200  # truncated cap plus marker
+
+
 def test_study_rejects_bad_mode(tmp_path: Path) -> None:
     target = _write_sample(tmp_path / "sample.bin")
     with pytest.raises(typer.BadParameter):
