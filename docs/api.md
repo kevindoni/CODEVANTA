@@ -36,6 +36,7 @@ before you rely on it.
 - [`codevanta.analysis.evidence_bundle`: tamper-evident bundles](#codevantaanalysisevidence_bundle-tamper-evident-bundles)
 - [`codevanta.analysis.trace`: trace replay and attribution](#codevantaanalysistrace-trace-replay-and-attribution)
 - [`codevanta.analysis.dynamic`: provider probes and session scripts](#codevantaanalysisdynamic-provider-probes-and-session-scripts)
+- [`codevanta.analysis.javascript`: static JS/Electron inventory](#codevantaanalysisjavascript-static-jselectron-inventory)
 - [`codevanta.plugins`: the plugin SDK](#codevantaplugins-the-plugin-sdk)
 - [`codevanta.storage.session`: persisted sessions](#codevantastoragesession-persisted-sessions)
 - [`codevanta.gui`: local web dashboard](#codevantagui-local-web-dashboard)
@@ -1296,6 +1297,40 @@ print(script.entry_commands[:2])
 (Probe results are this Windows machine's answer.) The CLI surface is
 `codevanta attach`; replaying what such a session printed is
 [`codevanta.analysis.trace`](#codevantaanalysistrace-trace-replay-and-attribution).
+
+
+## `codevanta.analysis.javascript`: static JS/Electron inventory
+
+`analyze_javascript_app(path, *, max_files=512)` walks an extracted
+application directory or an `.asar` archive (through the same bounded parser
+as `codevanta asar`) and returns a `JsAppReport`. Per `.js`/`.cjs`/`.mjs`
+file: imports (`require`, `import`, `export-from`, `import-dynamic`)
+classified `relative`/`bare`/`builtin` and resolved Node-style against the
+scanned set when possible, `ipcMain.*`/`ipcRenderer.*` sites with literal
+channels, the referenced Electron APIs, and a heuristic process role
+(`main`/`renderer`/`preload`/`mixed`). Channels are paired across sides by
+exact name (`IpcPair`, medium confidence), with `main_only`/`renderer_only`
+leftovers reported instead of guessed. The root `package.json` contributes
+`name`, `main` and the declared `electron` version.
+
+Literal text findings are `certain`; classifications and pairings are
+`medium` and carry their own evidence. Bounds (rows, depth, per-file and
+whole-scan bytes, per-file import/IPC sites) all report through `truncated`
+flags, `skipped` counters and warnings. Nothing is executed and no Node.js is
+required. Malformed inputs raise `AnalysisError`.
+
+```python
+from codevanta.analysis.javascript import analyze_javascript_app
+
+report = analyze_javascript_app("path/to/app")
+payload = report.to_dict()
+print(payload["package"]["electron_version"])
+print([pair["channel"] for pair in payload["ipc"]["pairs"]])
+```
+
+CLI: `codevanta js analyze`; MCP: the `codevanta_javascript` tool; GUI: the
+`/api/js` route. See [docs/javascript.md](javascript.md) for the confidence
+table and the full bound list.
 
 
 ## `codevanta.storage.session`: persisted sessions

@@ -166,6 +166,9 @@ from codevanta.mcp_server.ext_depth import (
     codevanta_certs as codevanta_certs,
 )
 from codevanta.mcp_server.ext_depth import (
+    codevanta_javascript as codevanta_javascript,
+)
+from codevanta.mcp_server.ext_depth import (
     codevanta_js_recover as codevanta_js_recover,
 )
 from codevanta.mcp_server.ext_format2 import (  # lane-format2: ONE MCP registration import line

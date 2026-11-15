@@ -1,18 +1,20 @@
 """MCP tools exposing the depth bridges (no MCP imports).
 
-Three tools: ``codevanta_apk_decode`` (apktool, skip-gated),
-``codevanta_js_recover`` (Wakaru, skip-gated) and ``codevanta_certs``
-(pure-Python PE certificate table, always available offline). The
-registration import lives in :mod:`codevanta.mcp_server.tools`; the
-``@server.tool`` wrappers live inside :func:`codevanta.mcp_server.server.
+Four tools: ``codevanta_apk_decode`` (apktool, skip-gated),
+``codevanta_js_recover`` (Wakaru, skip-gated), ``codevanta_javascript``
+(pure-Python static app inventory, always available offline) and
+``codevanta_certs`` (pure-Python PE certificate table, always available
+offline). The registration import lives in :mod:`codevanta.mcp_server.tools`;
+the ``@server.tool`` wrappers live inside :func:`codevanta.mcp_server.server.
 build_server` -- imports alone do not register anything.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-from codevanta.analysis import apktool_bridge, pe_certs, wakaru_bridge
+from codevanta.analysis import apktool_bridge, javascript, pe_certs, wakaru_bridge
 
 
 def codevanta_apk_decode(apk_path: str, out_dir: str) -> dict[str, Any]:
@@ -26,6 +28,21 @@ def codevanta_apk_decode(apk_path: str, out_dir: str) -> dict[str, Any]:
     fallback pointer.
     """
     return apktool_bridge.apk_decode(apk_path, out_dir).to_dict()
+
+
+def codevanta_javascript(path: str, max_files: int = javascript.DEFAULT_MAX_FILES) -> dict[str, Any]:
+    """Statically inventory a JavaScript/Electron application (offline).
+
+    Accepts an extracted application directory or an ``.asar`` archive and
+    returns, bounded and read-only: the JavaScript files with their imports
+    (CommonJS/ESM/dynamic, classified relative/bare/builtin and resolved
+    against the scanned set when possible), the ``package.json`` facts, a
+    heuristic Electron process role per file, and the ``ipcMain`` /
+    ``ipcRenderer`` call sites with literal channels paired across sides by
+    exact name. Literal text matches are certain; roles and channel pairs are
+    medium confidence and say so in their evidence. Nothing is executed.
+    """
+    return javascript.analyze_javascript_app(Path(path), max_files=max_files).to_dict()
 
 
 def codevanta_js_recover(

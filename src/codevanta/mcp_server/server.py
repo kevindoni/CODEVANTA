@@ -1087,6 +1087,34 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Statically inventory a JavaScript/Electron application offline "
+            "(pure Python, nothing executed). Give it an extracted app "
+            "directory or an .asar archive and it returns bounded modules, "
+            "imports (require/import/export-from/dynamic, classified "
+            "relative/bare/builtin and resolved against the scanned set when "
+            "possible), package.json facts (name, main, electron version), a "
+            "heuristic per-file Electron process role "
+            "(main/renderer/preload/mixed), and ipcMain/ipcRenderer call "
+            "sites with literal channels paired across sides by exact name. "
+            "Literal text matches are certain; roles and channel pairs are "
+            "medium confidence and carry their own evidence. Bounds: file "
+            "rows, depth, per-file bytes and a whole-scan byte budget, every "
+            "cap reported through truncated flags and warnings."
+        )
+    )
+    def codevanta_javascript(
+        path: str, max_files: int = 512
+    ) -> dict:
+        try:
+            return tools.codevanta_javascript(path, max_files=max_files)
+        except AnalysisError as exc:
+            # A wrong path/kind or an out-of-range max_files is
+            # caller-correctable; surface the engine's typed message instead
+            # of the framework's generic error text.
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
             "Parse a PE file's certificate table offline with pure Python: "
             "WIN_CERTIFICATE entries and the PKCS#7 SignedData structure via "
             "a minimal hand-rolled DER walk - signer count, serial numbers "

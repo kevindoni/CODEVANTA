@@ -86,6 +86,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from codevanta.analysis import javascript
 from codevanta.analysis.binary_diff import (
     DEFAULT_SEMANTIC_THRESHOLD,
     MAX_SEMANTIC_THRESHOLD,
@@ -1183,6 +1184,22 @@ def _api_metadata(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
     return report.to_dict()
 
 
+def _api_javascript(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return the static JavaScript/Electron inventory for one app path.
+
+    :func:`~codevanta.analysis.javascript.analyze_javascript_app` accepts an
+    extracted application directory or an ``.asar`` archive and never executes
+    anything; wrong path kinds are the engine's typed ``AnalysisError``
+    (HTTP ``400``).
+    """
+    target = _query_path(params, "path", allow_paths)
+    max_files = _query_int(
+        params, "max_files", javascript.DEFAULT_MAX_FILES, 1, javascript.MAX_FILES
+    )
+    report = javascript.analyze_javascript_app(target, max_files=max_files)
+    return report.to_dict()
+
+
 #: Route table: request path -> payload builder. Builders take the query
 #: parameters and the handler's ``paths_allowed`` flag.
 ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
@@ -1206,6 +1223,7 @@ ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
     "/compare": _api_compare,
     "/nav": _api_nav,
     "/metadata": _api_metadata,
+    "/api/js": _api_javascript,
 }
 
 def _json_default(value: Any) -> Any:

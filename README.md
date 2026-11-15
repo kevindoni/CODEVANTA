@@ -334,6 +334,10 @@ codevanta dataflow        samples\elf64_text.bin                       # def-use
 codevanta evidence-bundle samples\elf64_text.bin --entry report=samples\report_elf64.json -o bundle.json
 codevanta plugins list
 codevanta plugins run     metrics samples\elf64_text.bin
+
+# JavaScript / Electron applications (static, offline, no Node required)
+codevanta js analyze      path\to\app           # directory or .asar archive
+codevanta js analyze      app.asar --json       # modules, imports, IPC boundaries
 ```
 
 `diff --semantic` prints one dim
@@ -501,7 +505,7 @@ MCP tools: `codevanta_info`, `codevanta_functions`,
 `codevanta_jump_table`, `codevanta_function_hash`, `codevanta_similarity`,
 `codevanta_struct`, `codevanta_entropy`, `codevanta_decompile`,
 `codevanta_dwarf`, `codevanta_vtable`, `codevanta_trace`,
-`codevanta_symbolic`, `codevanta_dataflow`,
+`codevanta_symbolic`, `codevanta_dataflow`, `codevanta_javascript`,
 `codevanta_session_save`, `codevanta_session_list`.
 `codevanta_analyze` mirrors
 the CLI flags (`include_xrefs` / `include_cfg` / `include_callgraph`, default off)

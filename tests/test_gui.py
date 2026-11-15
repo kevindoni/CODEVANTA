@@ -1285,8 +1285,8 @@ def test_lane_routes_are_registered_and_listed_by_health(
     assert set(payload["routes"]) == set(ROUTES)
     for route in LANE_ROUTES:
         assert route in payload["routes"]
-    # Fourteen established routes plus the six lane routes.
-    assert len(ROUTES) == 20
+    # Fourteen established routes plus /api/js plus the six lane routes.
+    assert len(ROUTES) == 21
     # A near-miss spelling stays an unknown route: 404, never a silent match.
     miss_status, miss_payload = _get(gui_server, "/bridge")
     assert miss_status == 404

@@ -66,7 +66,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
 def test_server_lists_fifty_five_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
-    assert len(names) == 55
+    assert len(names) == 56
     assert names == [
     "codevanta_adb",
     "codevanta_analyze",
@@ -96,6 +96,7 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_gpu",
     "codevanta_il2cpp",
     "codevanta_info",
+    "codevanta_javascript",
     "codevanta_js_recover",
     "codevanta_jump_table",
     "codevanta_lldb_run",
@@ -1733,3 +1734,53 @@ def test_dataflow_rejects_bad_addresses_and_zero_budgets(const_elf_path: Path) -
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# codevanta_javascript (static JS/Electron app inventory, offline)
+
+
+@pytest.fixture
+def js_app_path(tmp_path: Path) -> Path:
+    """A two-file Electron-shaped app: one main and one renderer file."""
+    (tmp_path / "package.json").write_text(
+        '{"name": "mcp-js", "main": "main.js"}', encoding="utf-8"
+    )
+    (tmp_path / "main.js").write_text(
+        "const { ipcMain } = require('electron');\n"
+        "ipcMain.handle('ping', () => 1);\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "renderer.js").write_text(
+        "const { ipcRenderer } = require('electron');\n"
+        "ipcRenderer.invoke('ping');\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_javascript_inventory_reports_modules_and_ipc(js_app_path: Path) -> None:
+    payload = tools.codevanta_javascript(str(js_app_path))
+    assert payload["kind"] == "directory"
+    assert payload["package"]["name"] == "mcp-js"
+    assert [p["channel"] for p in payload["ipc"]["pairs"]] == ["ping"]
+    # Every other tool returns JSON-safe values; so must this one.
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_javascript_rejects_wrong_kind_and_bad_cap(js_app_path: Path) -> None:
+    plain = js_app_path / "notes.txt"
+    plain.write_text("hi", encoding="utf-8")
+    with pytest.raises(AnalysisError, match="neither a directory nor an .asar"):
+        tools.codevanta_javascript(str(plain))
+    with pytest.raises(AnalysisError, match="max_files must be between 1 and"):
+        tools.codevanta_javascript(str(js_app_path), max_files=0)
+
+
+def test_server_call_tool_javascript(js_app_path: Path) -> None:
+    result = asyncio.run(
+        build_server().call_tool("codevanta_javascript", {"path": str(js_app_path)})
+    )
+    payload = _payload(result)
+    assert payload["kind"] == "directory"
+    assert payload["package"]["name"] == "mcp-js"
