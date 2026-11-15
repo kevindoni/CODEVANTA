@@ -66,7 +66,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
 def test_server_lists_fifty_five_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
-    assert len(names) == 59
+    assert len(names) == 60
     assert names == [
     "codevanta_adb",
     "codevanta_analyze",
@@ -116,6 +116,7 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_signal_sr",
     "codevanta_similarity",
     "codevanta_sqlite",
+    "codevanta_stackstrings",
     "codevanta_strings",
     "codevanta_struct",
     "codevanta_symbolic",
@@ -1849,3 +1850,23 @@ def test_capabilities_tool_reports_no_false_matches(elf64_text_path: Path) -> No
     payload = _payload(result)
     assert payload["rule_count"] >= 14
     assert payload["matches"] == []
+
+
+def test_stackstrings_tool_recovers_strings(tmp_path: Path) -> None:
+    pytest.importorskip("unicorn")
+    from test_stackstrings import CODE_HELLO_WORLD, _sample
+
+    sample = _sample(tmp_path, CODE_HELLO_WORLD)
+    payload = tools.codevanta_stackstrings(str(sample))
+    assert payload["functions_emulated"] >= 1
+    assert any(s["encoding"] == "ascii" for s in payload["strings"])
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_stackstrings_tool_rejects_bad_budget(tmp_path: Path) -> None:
+    pytest.importorskip("unicorn")
+    from test_stackstrings import CODE_HELLO_WORLD, _sample
+
+    sample = _sample(tmp_path, CODE_HELLO_WORLD)
+    with pytest.raises(AnalysisError, match="max_functions"):
+        tools.codevanta_stackstrings(str(sample), max_functions=0)

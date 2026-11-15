@@ -2961,6 +2961,92 @@ def capabilities(
     )
 
 
+@app.command(name="stackstrings")
+def stackstrings_cmd(
+    path: Annotated[Path, typer.Argument(help="Path to the binary to analyse")],
+    address: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--address",
+            "-a",
+            help="Function address to emulate (decimal or 0x hex); repeatable",
+        ),
+    ] = None,
+    max_functions: Annotated[
+        int, typer.Option("--max-functions", help="Function budget when no --address is given")
+    ] = 16,
+    max_instructions: Annotated[
+        int, typer.Option("--max-instructions", help="Instruction budget per function")
+    ] = 2000,
+    max_strings: Annotated[
+        int, typer.Option("--max-strings", help="Strings kept per function")
+    ] = 32,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Recover stack-constructed strings by bounded offline emulation (FLOSS-style).
+
+    Each function's bytes run on a private unicorn CPU -- nothing executes on
+    the host. Memory writes to the emulated stack are tracked and, at the stop
+    reason, printable ASCII and UTF-16LE runs in the written stack span become
+    stackstrings: medium confidence (the run provably appeared in emulated
+    memory, but emulation is an approximation).
+    """
+    from codevanta.analysis.stackstrings import extract_stack_strings
+
+    addresses = None
+    if address:
+        addresses = [_parse_address(one) for one in address]
+    try:
+        result = extract_stack_strings(
+            path,
+            addresses=addresses,
+            max_functions=max_functions,
+            max_instructions=max_instructions,
+            max_strings_per_function=max_strings,
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    if result.strings:
+        table = Table(title=f"stackstrings · {escape(str(path))}")
+        table.add_column("Function", justify="right")
+        table.add_column("Offset", justify="right")
+        table.add_column("Enc")
+        table.add_column("String")
+        for item in result.strings:
+            table.add_row(
+                hex(item.function_address),
+                hex(item.stack_offset),
+                item.encoding,
+                escape(item.value),
+            )
+        console.print(table)
+    else:
+        console.print(f"[green]no stackstrings recovered[/] · {escape(str(path))}")
+    stops: dict[str, int] = {}
+    for function in result.functions:
+        stops[function.stop_reason] = stops.get(function.stop_reason, 0) + 1
+    stops_text = " ".join(f"{name}:{count}" for name, count in sorted(stops.items()))
+    console.print(
+        f"[dim]functions: {result.functions_emulated}/{result.functions_scanned}"
+        f" · strings: {len(result.strings)}"
+        f" · stops: {escape(stops_text or 'none')}"
+        f" · truncated: {'yes' if result.truncated else 'no'}[/]"
+    )
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    report_evidence = result.evidence.to_dict()
+    console.print(
+        f"[dim]evidence: {escape(str(report_evidence.get('source')))} via "
+        f"{escape(str(report_evidence.get('method')))} · confidence: "
+        f"{escape(str(report_evidence.get('confidence')))}[/]"
+    )
+
+
 # ---- phase 7: analysis plugins ----------------------------------------------
 
 

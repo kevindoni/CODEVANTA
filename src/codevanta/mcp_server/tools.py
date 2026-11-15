@@ -204,6 +204,7 @@ from codevanta.mcp_server.ext_signal import (  # lane-signal: ONE MCP registrati
     codevanta_uart_decode,  # noqa: F401
 )
 from codevanta.mcp_server.ext_solver import codevanta_symbolic_solve  # noqa: F401 -- one-line registration of the ext solver MCP tool
+from codevanta.mcp_server.ext_stackstrings import codevanta_stackstrings as codevanta_stackstrings  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
 from codevanta.mcp_server.ext_web import codevanta_asar, codevanta_web_inspect  # noqa: F401 - registration of the ext_web MCP tools
 from codevanta.mcp_server.ext_webcap import (  # lane-webcap: ONE MCP registration line
     codevanta_proto_decode,  # noqa: F401

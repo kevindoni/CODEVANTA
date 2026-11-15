@@ -1183,6 +1183,37 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Recover stack-constructed strings by bounded offline emulation "
+            "(FLOSS-style). Each target function's bytes run on a private "
+            "unicorn CPU -- nothing executes on the host; emulated stack "
+            "writes are tracked and printable ASCII / UTF-16LE runs in the "
+            "written span become stackstrings with their function, stack "
+            "offset, encoding and evidence. Results are medium confidence: "
+            "the string provably appeared in emulated memory, but emulation "
+            "is an approximation. Needs the optional emulation extra (pip "
+            "install codevanta[emulation]); its absence is a typed error."
+        )
+    )
+    def codevanta_stackstrings(
+        path: str,
+        addresses: list[int] | None = None,
+        max_functions: int = 16,
+        max_instructions: int = 2000,
+        max_strings: int = 32,
+    ) -> dict:
+        try:
+            return tools.codevanta_stackstrings(
+                path,
+                addresses=addresses,
+                max_functions=max_functions,
+                max_instructions=max_instructions,
+                max_strings=max_strings,
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
             "Parse a PE file's certificate table offline with pure Python: "
             "WIN_CERTIFICATE entries and the PKCS#7 SignedData structure via "
             "a minimal hand-rolled DER walk - signer count, serial numbers "

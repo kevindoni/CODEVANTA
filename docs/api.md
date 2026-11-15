@@ -40,6 +40,7 @@ before you rely on it.
 - [`codevanta.analysis.electron_audit`: Electron security rules](#codevantaanalysiselectron_audit-electron-security-rules)
 - [`codevanta.analysis.sbom`: CycloneDX export](#codevantaanalysissbom-cyclonedx-export)
 - [`codevanta.analysis.capabilities`: capability rules](#codevantaanalysiscapabilities-capability-rules)
+- [`codevanta.analysis.stackstrings`: stack-built string recovery](#codevantaanalysisstackstrings-stack-built-string-recovery)
 - [`codevanta.plugins`: the plugin SDK](#codevantaplugins-the-plugin-sdk)
 - [`codevanta.storage.session`: persisted sessions](#codevantastoragesession-persisted-sessions)
 - [`codevanta.gui`: local web dashboard](#codevantagui-local-web-dashboard)
@@ -1376,6 +1377,19 @@ features fired and where; features are `certain`, the capability conclusion
 is `medium`. File scope only — no function-level attribution, unlike full
 capa. CLI: `codevanta capabilities`; MCP: `codevanta_capabilities`. See
 [docs/capabilities.md](capabilities.md).
+
+
+## `codevanta.analysis.stackstrings`: stack-built string recovery
+
+`extract_stack_strings(path, *, addresses=None, max_functions=16,
+max_instructions=2000, max_strings_per_function=32)` runs each target
+function's bytes on a private unicorn CPU (nothing executes on the host),
+tracks memory writes to the emulated stack, and reports the printable
+ASCII / UTF-16LE runs in the written span with their function, stack
+offset, encoding and evidence. Medium confidence: the string provably
+appeared in emulated memory, but emulation is an approximation. Needs the
+optional ``emulation`` extra. CLI: `codevanta stackstrings`; MCP:
+`codevanta_stackstrings`. See [docs/stackstrings.md](stackstrings.md).
 
 
 ## `codevanta.storage.session`: persisted sessions
