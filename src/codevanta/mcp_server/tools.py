@@ -214,6 +214,7 @@ from codevanta.mcp_server.ext_rebuild import (  # lane-rebuild: ONE MCP registra
     codevanta_rebuild_build,  # noqa: F401
     codevanta_rebuild_build_auto,  # noqa: F401
     codevanta_rebuild_check,  # noqa: F401
+    codevanta_rebuild_check_behavior,  # noqa: F401
     codevanta_rebuild_improve,  # noqa: F401
     codevanta_rebuild_list,  # noqa: F401
     codevanta_rebuild_ready,  # noqa: F401

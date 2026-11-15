@@ -2301,31 +2301,28 @@ def inspect_metadata(path: str | Path) -> MetadataReport:
     if notes is not None:
         results["elf-notes"] = notes.to_dict()
         evidence.append(notes.evidence)
-    # lane-depth2: deep format inspectors (one result key per detector).
-    pe_res = detect_pe_resources(p)
-    if pe_res is not None:
-        results["pe-resources"] = pe_res.to_dict()
-        evidence.append(pe_res.evidence)
-    pe_lc = detect_pe_loadconfig(p)
-    if pe_lc is not None:
-        results["pe-loadconfig"] = pe_lc.to_dict()
-        evidence.append(pe_lc.evidence)
-    elf_dyn = detect_elf_dynamic(p)
-    if elf_dyn is not None:
-        results["elf-dynamic"] = elf_dyn.to_dict()
-        evidence.append(elf_dyn.evidence)
-    macho_dy = detect_macho_dylibs(p)
-    if macho_dy is not None:
-        results["macho-dylibs"] = macho_dy.to_dict()
-        evidence.append(macho_dy.evidence)
-    managed = detect_managed_meta(p)
-    if managed is not None:
-        results["managed-meta"] = managed.to_dict()
-        evidence.append(managed.evidence)
-    pyc_deep = detect_pyc_deep(p)
-    if pyc_deep is not None:
-        results["pyc-deep"] = pyc_deep.to_dict()
-        evidence.append(pyc_deep.evidence)
+    # lane-depth2: deep format inspectors (one result key per detector). A deep
+    # parser may legitimately refuse a file whose magic passed the cheap gate
+    # but whose body is minimal or malformed -- a header-only .pyc, an ELF
+    # without PT_DYNAMIC, a bare MZ blob. This best-effort auto-report join
+    # degrades to "section absent" there; the strict raising contract belongs
+    # to the direct deep tools (codevanta_pe_deep, codevanta_elf_macho, ...),
+    # which keep their typed errors.
+    for key, detector in (
+        ("pe-resources", detect_pe_resources),
+        ("pe-loadconfig", detect_pe_loadconfig),
+        ("elf-dynamic", detect_elf_dynamic),
+        ("macho-dylibs", detect_macho_dylibs),
+        ("managed-meta", detect_managed_meta),
+        ("pyc-deep", detect_pyc_deep),
+    ):
+        try:
+            summary = detector(p)
+        except AnalysisError:
+            continue
+        if summary is not None:
+            results[key] = summary.to_dict()
+            evidence.append(summary.evidence)
     if not results:
         raise AnalysisError(f"unrecognized file format: {p} ({size} bytes)")
     kind = next(report_kind for key, report_kind in _KIND_PRIORITY if key in results)

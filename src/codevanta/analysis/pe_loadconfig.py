@@ -46,22 +46,23 @@ MAX_TLS_CALLBACKS = 16
 #: Load-config bytes the parser ever looks at (bounded work).
 MAX_LOAD_CONFIG_BYTES = 4096
 
-#: ``IMAGE_GUARD`` flag bits (winnt.h ``IMAGE_GUARD*``).
+#: ``IMAGE_GUARD`` flag bits (winnt.h ``IMAGE_GUARD*``, spec values).
 GUARD_FLAG_NAMES: dict[int, str] = {
     0x100: "CF_INSTRUMENTED",
     0x200: "CFW_INSTRUMENTED",
     0x400: "CF_FUNCTION_TABLE_PRESENT",
-    0x800: "CF_EXPORT_SUPPRESSION_INFO_PRESENT",
-    0x1000: "CF_SECURITY_COOKIE_UNUSED",
-    0x2000: "CF_ENABLE_EXPORT_SUPPRESSION",
-    0x4000: "CF_LONGJUMP_TABLE_PRESENT",
-    0x8000: "CF_LONGJUMP_TABLE_SUPPRESSION_PRESENT",
+    0x800: "SECURITY_COOKIE_UNUSED",
+    0x1000: "PROTECT_DELAYLOAD_IAT",
+    0x2000: "DELAYLOAD_IAT_IN_ITS_OWN_SECTION",
+    0x4000: "CF_EXPORT_SUPPRESSION_INFO_PRESENT",
+    0x8000: "CF_ENABLE_EXPORT_SUPPRESSION",
+    0x10000: "CF_LONGJUMP_TABLE_PRESENT",
 }
 
 #: ``DllCharacteristics`` bits this summary reports as the DEP/CF policy.
 DLLCHAR_DYNAMIC_BASE = 0x0040
 DLLCHAR_NX_COMPAT = 0x0200
-DLLCHAR_NO_SEH = 0x0800
+DLLCHAR_NO_SEH = 0x0400
 DLLCHAR_GUARD_CF = 0x4000
 
 
@@ -234,39 +235,43 @@ def _config_field(blob: bytes, offset32: int, offset64: int, is64: bool) -> int 
 
 def _read_tls_callbacks(
     data: bytes, image: _PeImage, warnings: list[str]
-) -> tuple[int, ...]:
-    """Walk the ``AddressOfCallBacks`` pointer array (bounded 16, typed)."""
+) -> tuple[tuple[int, ...], int, bool]:
+    """Walk the ``AddressOfCallBacks`` pointer array (keep 16, count honestly)."""
     if len(image.directories) <= 9:
-        return ()
+        return (), 0, False
     tls_rva, tls_size = image.directories[9]
     if tls_rva == 0 or tls_size == 0:
-        return ()
+        return (), 0, False
     is64 = image.opt_magic == 0x20B
     tls_off = _rva_to_offset(image, tls_rva)
     if tls_off is None:
         warnings.append(f"TLS directory RVA 0x{tls_rva:x} is not mapped; callbacks unknown")
-        return ()
+        return (), 0, False
     ptr_off = tls_off + (24 if is64 else 12)
     width = 8 if is64 else 4
     if ptr_off + width > len(data):
         raise AnalysisError("TLS directory truncated before AddressOfCallBacks")
     callbacks_va = int.from_bytes(data[ptr_off : ptr_off + width], "little")
     if callbacks_va == 0:
-        return ()
+        return (), 0, False
     array_off = _rva_to_offset(image, callbacks_va)
     if array_off is None:
         raise AnalysisError(f"TLS callback array VA 0x{callbacks_va:x} is not mapped")
     callbacks: list[int] = []
+    total = 0
     cursor = array_off
-    while cursor + width <= len(data) and len(callbacks) < MAX_TLS_CALLBACKS + 1:
+    while cursor + width <= len(data):
         entry = int.from_bytes(data[cursor : cursor + width], "little")
         if entry == 0:
             break
-        callbacks.append(entry)
+        total += 1
+        if total <= MAX_TLS_CALLBACKS:
+            callbacks.append(entry)
         cursor += width
-    else:
+    truncated = total > MAX_TLS_CALLBACKS
+    if truncated:
         warnings.append(f"TLS callback list truncated at {MAX_TLS_CALLBACKS} entries")
-    return tuple(callbacks[:MAX_TLS_CALLBACKS])
+    return tuple(callbacks), total, truncated
 
 
 def _empty_summary(bits: int, warnings: list[str]) -> PeLoadConfigSummary:
@@ -390,16 +395,16 @@ def inspect_pe_load_config(path: str | Path) -> PeLoadConfigSummary:
     image = _parse_pe_image(data)
     warnings: list[str] = []
     summary = _parse_load_config(data, image, warnings)
-    callbacks = _read_tls_callbacks(data, image, warnings)
+    callbacks, tls_total, tls_truncated = _read_tls_callbacks(data, image, warnings)
     evidence = summary.evidence
     if callbacks:
         extra = dict(summary.evidence.extra or {})
-        extra["tls_callbacks"] = len(callbacks)
+        extra["tls_callbacks"] = tls_total
         evidence = Evidence(
             source=EVIDENCE_SOURCE,
             method=summary.evidence.method,
             confidence=Confidence.HIGH,
-            detail=f"{summary.evidence.detail}; {len(callbacks)} TLS callback(s)",
+            detail=f"{summary.evidence.detail}; {tls_total} TLS callback(s)",
             extra=extra,
         )
     return PeLoadConfigSummary(
@@ -418,9 +423,9 @@ def inspect_pe_load_config(path: str | Path) -> PeLoadConfigSummary:
         seh_handler_count=summary.seh_handler_count,
         seh_handler_table_rva=summary.seh_handler_table_rva,
         security_cookie=summary.security_cookie,
-        tls_callback_count=len(callbacks),
+        tls_callback_count=tls_total,
         tls_callbacks=callbacks,
-        tls_callbacks_truncated=len(callbacks) > MAX_TLS_CALLBACKS,
+        tls_callbacks_truncated=tls_truncated,
         warnings=tuple(warnings),
         evidence=evidence,
     )

@@ -23,6 +23,7 @@ from codevanta.cli.rebuild import (
     _start_build,
     _verify_build_artifact,
     build_project,
+    check_behavior,
     check_build,
     get_project,
     list_projects,
@@ -561,6 +562,58 @@ def test_verify_build_artifact_unsupported(tmp_path: Path) -> None:
     file = tmp_path / "data.bin"
     file.write_bytes(b"\x00\x01\x02")
     result = _verify_build_artifact(file)
+    assert result["ok"] is False
+    assert "unsupported" in result["error"]
+
+
+# ---- behavior check ------------------------------------------------------------
+
+
+def test_check_behavior_runs_build_only(tmp_path: Path) -> None:
+    root = tmp_path / "rebuilds"
+    target = tmp_path / "target.txt"
+    target.write_text("original", encoding="utf-8")
+    record = build_project(str(target), "Rebuild it", root=root)
+    build = tmp_path / "build.py"
+    build.write_text('print("hello")\n', encoding="utf-8")
+
+    payload = check_behavior(record.id, build, root=root)
+    assert payload["kind"] == "behavior"
+    assert payload["run_original"] is False
+    assert payload["build_run"]["ok"] is True
+    assert payload["stdout_similarity"] is None
+    assert payload["behavior_match"] is None
+    check_file = root / record.id / "checks" / payload["id"] / "check.json"
+    assert check_file.is_file()
+
+
+def test_check_behavior_compares_runs(tmp_path: Path) -> None:
+    root = tmp_path / "rebuilds"
+    target = tmp_path / "original.py"
+    target.write_text('print("hello world")\n', encoding="utf-8")
+    record = build_project(str(target), "Rebuild it", root=root)
+    same = tmp_path / "same.py"
+    same.write_text('print("hello world")\n', encoding="utf-8")
+
+    payload = check_behavior(record.id, same, root=root, run_original=True)
+    assert payload["exit_match"] is True
+    assert payload["stdout_similarity"] == 1.0
+    assert payload["behavior_match"] is True
+
+    diff = tmp_path / "diff.py"
+    diff.write_text('print("goodbye cosmos")\n', encoding="utf-8")
+    payload2 = check_behavior(record.id, diff, root=root, run_original=True)
+    assert payload2["exit_match"] is True
+    assert payload2["stdout_similarity"] < 0.4
+    assert payload2["behavior_match"] is False
+
+
+def test_run_artifact_unsupported_suffix(tmp_path: Path) -> None:
+    from codevanta.cli.rebuild import _run_artifact
+
+    data = tmp_path / "data.bin"
+    data.write_bytes(b"\x00\x01")
+    result = _run_artifact(data)
     assert result["ok"] is False
     assert "unsupported" in result["error"]
 

@@ -62,11 +62,13 @@ __all__ = [
     "VALID_MODES",
     "app",
     "build_project",
+    "check_behavior",
     "check_build",
     "list_projects",
     "rebuild_build",
     "rebuild_build_auto",
     "rebuild_check",
+    "rebuild_check_behavior",
     "rebuild_inbox",
     "rebuild_ready",
     "rebuild_list",
@@ -741,6 +743,169 @@ def check_build(
 
 
 # --------------------------------------------------------------------------- #
+# Behavior check: compare how the build runs against how the original runs
+# --------------------------------------------------------------------------- #
+
+
+def _run_artifact(path: Path, timeout: int = 10) -> dict[str, Any]:
+    """Run one artifact read-only and capture its behaviour.
+
+    ``.py`` files run through the current interpreter; native executables run
+    directly. Anything else (needs compiling, data files) is unsupported and
+    reported as such, never as an error.
+    """
+    import subprocess
+    import sys
+
+    result: dict[str, Any] = {"path": str(path)}
+    suffix = path.suffix.lower()
+    if suffix == ".py":
+        cmd: list[str] | None = [sys.executable, str(path)]
+    elif suffix in (".exe", ".com") or path.stat().st_mode & 0o111:
+        cmd = [str(path)]
+    else:
+        cmd = None
+    if cmd is None:
+        result.update({"ok": False, "error": f"unsupported artifact: {suffix or 'no suffix'}"})
+        return result
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result.update(
+            {
+                "ok": proc.returncode == 0,
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        result.update({"ok": False, "error": str(exc)})
+    return result
+
+
+def _stdout_similarity(a: str | None, b: str | None) -> float:
+    """Normalised similarity of two captured stdout streams (0.0 .. 1.0)."""
+    import difflib
+
+    def norm(text: str | None) -> str:
+        return " ".join((text or "").split())
+
+    return difflib.SequenceMatcher(None, norm(a), norm(b)).ratio()
+
+
+def check_behavior(
+    project_id: str,
+    build_path: Path,
+    root: Path | None = None,
+    run_original: bool = False,
+    timeout: int = 10,
+) -> dict[str, Any]:
+    """Compare how the build *runs* against how the original runs.
+
+    Mirrors Craft Anything's behaviour checks for apps: run the build, capture
+    exit code and stdout/stderr, and — only when ``run_original`` is set
+    (explicit consent, like Craft Anything's approval cards) — run the
+    original target the same way, then compare exit codes and stdout
+    similarity. The payload is recorded under ``checks/`` with kind
+    ``behavior``.
+
+    Running the original is opt-in because it executes an arbitrary binary
+    on this machine.
+    """
+    root = root or _default_root()
+    root = Path(root)
+    record = get_project(project_id, root)
+    if record is None:
+        raise typer.Exit(code=2)
+
+    build_path = Path(build_path)
+    check_id = uuid.uuid4().hex[:8]
+    checked_at = _now_iso()
+    check_dir = _project_dir(root, project_id) / "checks" / check_id
+    check_dir.mkdir(parents=True, exist_ok=True)
+
+    build_run = _run_artifact(build_path, timeout=timeout)
+    original_run: dict[str, Any] | None = None
+    similarity: float | None = None
+    exit_match: bool | None = None
+    if run_original:
+        target_path = Path(record.target)
+        if target_path.is_file():
+            original_run = _run_artifact(target_path, timeout=timeout)
+            similarity = _stdout_similarity(
+                original_run.get("stdout"), build_run.get("stdout")
+            )
+            exit_match = original_run.get("exit_code") == build_run.get("exit_code")
+        else:
+            original_run = {"ok": False, "error": "target is not a runnable local file"}
+
+    behavior_match = (
+        bool(exit_match and similarity is not None and similarity >= 0.8)
+        if run_original
+        else None
+    )
+
+    payload: dict[str, Any] = {
+        "id": check_id,
+        "project_id": project_id,
+        "kind": "behavior",
+        "target": record.target,
+        "build_path": str(build_path),
+        "checked_at": checked_at,
+        "run_original": run_original,
+        "build_run": {k: v for k, v in build_run.items() if k != "stdout"} | {
+            "stdout_excerpt": (build_run.get("stdout") or "")[:500]
+        },
+        "original_run": (
+            {k: v for k, v in original_run.items() if k != "stdout"}
+            | {"stdout_excerpt": (original_run.get("stdout") or "")[:500]}
+            if original_run is not None
+            else None
+        ),
+        "stdout_similarity": similarity,
+        "exit_match": exit_match,
+        "behavior_match": behavior_match,
+    }
+
+    _write_json(check_dir / "check.json", payload)
+
+    checks = list(record.checks)
+    checks.append(
+        {
+            "id": check_id,
+            "kind": "behavior",
+            "build_path": str(build_path),
+            "checked_at": checked_at,
+            "behavior_match": behavior_match,
+        }
+    )
+    _validate_transition(record.status, "checked")
+    updated = replace(record, updated_at=checked_at, checks=checks, status="checked")
+    _write_json(_craft_path(_project_dir(root, project_id)), updated.to_dict())
+
+    _write_evidence(
+        _project_dir(root, project_id),
+        "check_behavior",
+        {
+            "check_id": check_id,
+            "project_id": project_id,
+            "build_path": str(build_path),
+            "run_original": run_original,
+            "stdout_similarity": similarity,
+            "exit_match": exit_match,
+            "behavior_match": behavior_match,
+        },
+        confidence="medium",
+        coverage="build run" if not run_original else "build and original runs",
+        limitations=(
+            "stdout/exit-code comparison only; output-less (GUI) apps compare weakly; "
+            "timing, side effects and exit paths beyond the first are not observed"
+        ),
+    )
+    return payload
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -942,6 +1107,66 @@ def rebuild_check(
         f"\n[dim]Check saved under checks/{payload['id']}/check.json[/]"
         "\n[dim]Next: open the build, review the diff, ask for changes, then re-check.[/]"
     )
+
+
+@app.command(name="check-behavior")
+def rebuild_check_behavior(
+    project_id: Annotated[str, typer.Argument(help="Project id")],
+    build_path: Annotated[
+        Path, typer.Argument(help="Path to the built recreation to run")
+    ],
+    run_original: Annotated[
+        bool,
+        typer.Option(
+            "--run-original",
+            help="Also run the ORIGINAL target to compare behaviour (executes an "
+            "arbitrary binary on this machine — opt-in, like Craft Anything's "
+            "approval cards)",
+        ),
+    ] = False,
+    timeout: Annotated[
+        int, typer.Option("--timeout", help="Per-run timeout in seconds")
+    ] = 10,
+    root: Annotated[
+        Path | None, typer.Option("--root", help="Project root directory")
+    ] = None,
+) -> None:
+    """Compare how the build RUNS against how the original runs.
+
+    Runs the build, captures exit code and stdout/stderr. With
+    ``--run-original``, also runs the original target and reports exit-code
+    match and stdout similarity (how alike the runs are).
+    """
+    payload = check_behavior(
+        project_id, build_path, root=root, run_original=run_original, timeout=timeout
+    )
+
+    console.print(
+        f"[bold]Behavior check {payload['id']}[/] — {escape(str(build_path))}"
+    )
+    build_run = payload["build_run"]
+    if build_run.get("ok"):
+        console.print(f"[green]build ran:[/] exit {build_run.get('exit_code')}")
+    else:
+        console.print(f"[yellow]build did not run cleanly: {build_run.get('error')}[/]")
+
+    if payload["run_original"]:
+        sim = payload["stdout_similarity"]
+        exit_match = payload["exit_match"]
+        console.print(
+            f"exit codes match: {'[green]yes[/]' if exit_match else '[yellow]no[/]'}"
+        )
+        console.print(f"stdout similarity: {sim:.2f}" if sim is not None else "no stdout to compare")
+        if payload["behavior_match"]:
+            console.print("[green]behaviour matches the original.[/]")
+        else:
+            console.print("[yellow]behaviour differs from the original.[/]")
+    else:
+        console.print(
+            "[dim]original not run (pass --run-original to compare behaviour "
+            "with the original).[/]"
+        )
+    console.print(f"\n[dim]Check saved under checks/{payload['id']}/check.json[/]")
 
 
 # --------------------------------------------------------------------------- #

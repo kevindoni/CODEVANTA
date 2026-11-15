@@ -1456,6 +1456,29 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Behavior check: run the built recreation and capture its exit code "
+            "and stdout/stderr. With run_original=true (explicit consent; "
+            "executes the original binary on this machine) also run the original "
+            "target and report exit-code match and stdout similarity. Recorded "
+            "under checks/ with kind 'behavior'."
+        )
+    )
+    def codevanta_rebuild_check_behavior(
+        project_id: str,
+        build_path: str,
+        run_original: bool = False,
+        timeout: int = 10,
+        root: str | None = None,
+    ) -> dict:
+        try:
+            return tools.codevanta_rebuild_check_behavior(
+                project_id, build_path, run_original=run_original, timeout=timeout, root=root
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
             "Mark a rebuild project as ``ready``. Requires the project to be "
             "in ``checked`` status and the most recent check to report "
             "``identical: true``. Returns the updated project record."

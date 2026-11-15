@@ -20,6 +20,7 @@ from codevanta.cli.rebuild import _start_build as start_build
 from codevanta.cli.rebuild import (
     _suggest_stack,
     build_project,
+    check_behavior,
     check_build,
     get_project,
     list_projects,
@@ -31,6 +32,7 @@ __all__ = [
     "codevanta_rebuild_build",
     "codevanta_rebuild_build_auto",
     "codevanta_rebuild_check",
+    "codevanta_rebuild_check_behavior",
     "codevanta_rebuild_improve",
     "codevanta_rebuild_list",
     "codevanta_rebuild_ready",
@@ -136,6 +138,31 @@ def codevanta_rebuild_check(
     """
     root_path = Path(root) if root else _default_root()
     return check_build(project_id, Path(build_path), root=root_path)
+
+
+def codevanta_rebuild_check_behavior(
+    project_id: str,
+    build_path: str,
+    run_original: bool = False,
+    timeout: int = 10,
+    root: str | None = None,
+) -> dict[str, Any]:
+    """Compare how the build RUNS against how the original runs.
+
+    Runs the built artifact, captures exit code and stdout/stderr, and — only
+    when ``run_original`` is true (explicit consent; this executes the
+    original binary on the machine) — runs the original target and reports
+    exit-code match plus stdout similarity. The check is recorded under the
+    project's ``checks/`` directory with kind ``behavior``.
+    """
+    root_path = Path(root) if root else _default_root()
+    return check_behavior(
+        project_id,
+        Path(build_path),
+        root=root_path,
+        run_original=run_original,
+        timeout=timeout,
+    )
 
 
 def codevanta_rebuild_ready(

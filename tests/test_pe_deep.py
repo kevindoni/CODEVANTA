@@ -456,7 +456,7 @@ def test_resources_absent_directory_is_present_false(tmp_path: Path) -> None:
 
 
 def test_resources_malformed_cases(tmp_path: Path) -> None:
-    with pytest.raises(AnalysisError, match="missing MZ magic"):
+    with pytest.raises(AnalysisError, match="file not found"):
         pe_resources.inspect_pe_resources(tmp_path / "ghost.exe")
     plain = tmp_path / "plain.bin"
     plain.write_bytes(b"not a pe at all" * 8)
@@ -512,25 +512,30 @@ def test_resources_detector_and_registry(tmp_path: Path) -> None:
 
 
 def loadconfig_payload(
-    lc: bytes, callbacks: list[int], *, is64: bool = True
+    lc: bytes,
+    callbacks: list[int],
+    *,
+    is64: bool = True,
+    section_va: int = SECTION_VA,
 ) -> tuple[bytes, dict[int, tuple[int, int]]]:
     buf = bytearray(lc)
     tls_pos = len(buf)
-    tls_dir = (
-        build_tls_directory64(SECTION_VA + tls_pos + 40)
-        if is64
-        else build_tls_directory32(SECTION_VA + tls_pos + 40)
-    )
+    if is64:
+        # IMAGE_TLS_DIRECTORY64 is 40 bytes; the array follows it directly.
+        tls_dir = build_tls_directory64(section_va + tls_pos + 40)
+    else:
+        # IMAGE_TLS_DIRECTORY32 is 24 bytes; the array follows it directly.
+        tls_dir = build_tls_directory32(section_va + tls_pos + 24)
     buf += tls_dir
     buf += build_tls_callback_array(callbacks, is64=is64)
     return bytes(buf), {
-        9: (SECTION_VA + tls_pos, len(tls_dir)),
-        10: (SECTION_VA, len(lc)),
+        9: (section_va + tls_pos, len(tls_dir)),
+        10: (section_va, len(lc)),
     }
 
 
 def test_loadconfig_full_summary(tmp_path: Path) -> None:
-    lc = build_loadconfig_blob(guard_flags=0x1400, guard_count=42, seh_count=7)
+    lc = build_loadconfig_blob(guard_flags=0x1500, guard_count=42, seh_count=7)
     payload, dirs = loadconfig_payload(lc, [0x401000, 0x401010, 0x401020])
     target = make_pe(tmp_path / "lc.exe", data_dirs=dirs, section_payload=payload)
     summary = pe_loadconfig.inspect_pe_load_config(target)
@@ -553,7 +558,9 @@ def test_loadconfig_full_summary(tmp_path: Path) -> None:
 
 def test_loadconfig_32bit_and_truncation(tmp_path: Path) -> None:
     lc = build_loadconfig_blob(is64=False, guard_count=5)
-    payload, dirs = loadconfig_payload(lc, [0x401000 + i * 4 for i in range(20)])
+    payload, dirs = loadconfig_payload(
+        lc, [0x401000 + i * 4 for i in range(20)], is64=False
+    )
     target = make_pe(
         tmp_path / "lc32.exe", opt_magic=0x10B, data_dirs=dirs, section_payload=payload
     )
@@ -574,7 +581,7 @@ def test_loadconfig_absent_and_warnings(tmp_path: Path) -> None:
     payload, dirs = loadconfig_payload(lc, [])
     special = make_pe(tmp_path / "noseh.exe", data_dirs=dirs, section_payload=payload)
     data = bytearray(special.read_bytes())
-    struct.pack_into("<H", data, 0x80 + 24 + 70, 0x0A40)  # NX|NO_SEH
+    struct.pack_into("<H", data, 0x80 + 24 + 70, 0x0600)  # NX|NO_SEH (spec bits)
     special.write_bytes(bytes(data))
     noseh = pe_loadconfig.inspect_pe_load_config(special)
     assert noseh.tls_callback_count == 0
@@ -583,12 +590,12 @@ def test_loadconfig_absent_and_warnings(tmp_path: Path) -> None:
 
 
 def test_loadconfig_malformed(tmp_path: Path) -> None:
-    with pytest.raises(AnalysisError, match="missing MZ magic"):
+    with pytest.raises(AnalysisError, match="file not found"):
         pe_loadconfig.inspect_pe_load_config(tmp_path / "ghost.exe")
     tiny = make_pe(
         tmp_path / "tiny.exe", data_dirs={10: (SECTION_VA, 4)}, section_payload=b"\x02\x00\x00\x00"
     )
-    with pytest.raises(AnalysisError, match="smaller than its Size field"):
+    with pytest.raises(AnalysisError, match="contradicts the directory bytes"):
         pe_loadconfig.inspect_pe_load_config(tiny)
     lie = bytearray(build_loadconfig_blob())
     struct.pack_into("<I", lie, 0, 400)
@@ -675,16 +682,22 @@ def test_managed_metadata_summary(tmp_path: Path) -> None:
 
 
 def test_managed_metadata_none_and_malformed(tmp_path: Path) -> None:
-    assert inspect_managed_metadata(tmp_path / "ghost.exe") is None
+    with pytest.raises(AnalysisError, match="file not found"):
+        inspect_managed_metadata(tmp_path / "ghost.exe")
     plain_pe = make_pe(tmp_path / "plain.exe")
     assert inspect_managed_metadata(plain_pe) is None  # no CLR directory
+    text = tmp_path / "text.bin"
+    text.write_bytes(b"just text, not a PE")
     with pytest.raises(AnalysisError, match="missing MZ magic"):
-        inspect_managed_metadata(tmp_path / "text.bin")
+        inspect_managed_metadata(text)
     # CLR header claiming less than its fixed layout.
     short = make_pe(
         tmp_path / "short.exe",
         data_dirs={14: (0x2000, 0x48)},
-        section_payload=struct.pack("<I", 8) + bytes(64),
+        # 76 bytes >= the 72-byte directory, so the parser reads the whole
+        # header and rejects its own Size field (8 < the fixed layout).
+        section_payload=struct.pack("<I", 8) + bytes(72),
+        section_va=0x2000,
     )
     with pytest.raises(AnalysisError, match="CLR header size 8"):
         inspect_managed_metadata(short)
@@ -693,6 +706,7 @@ def test_managed_metadata_none_and_malformed(tmp_path: Path) -> None:
         tmp_path / "clipped.exe",
         data_dirs={14: (0x2000, 0x48)},
         section_payload=bytes(16),
+        section_va=0x2000,
     )
     with pytest.raises(AnalysisError, match="CLR header truncated"):
         inspect_managed_metadata(truncated)
@@ -707,7 +721,10 @@ def test_managed_metadata_none_and_malformed(tmp_path: Path) -> None:
     )
     payload += bytes(0x80 - len(payload)) + root
     bad_rva = make_pe(
-        tmp_path / "badrva.exe", data_dirs={14: (0x2000, 0x48)}, section_payload=bytes(payload)
+        tmp_path / "badrva.exe",
+        data_dirs={14: (0x2000, 0x48)},
+        section_payload=bytes(payload),
+        section_va=0x2000,
     )
     with pytest.raises(AnalysisError, match="metadata RVA 0x900000"):
         inspect_managed_metadata(bad_rva)
@@ -746,7 +763,7 @@ def test_managed_bad_stream_layout(tmp_path: Path) -> None:
     with pytest.raises(AnalysisError, match="table stream"):
         inspect_managed_metadata(nostreams)
     # #Strings offset pointing past the heap.
-    broken = build_tables_stream({0x02: 1}, struct.pack("<IHHHHH", 0, 9999, 0, 0, 0))
+    broken = build_tables_stream({0x02: 1}, struct.pack("<IHHHHH", 0, 9999, 0, 0, 0, 0))
     badroot = build_metadata_root(tables_blob=broken, strings_blob=strings_heap)
     badheap = make_managed_pe(tmp_path / "badheap.exe", badroot)
     with pytest.raises(AnalysisError, match="#Strings offset"):
@@ -790,15 +807,22 @@ def test_cli_deep_error_path(tmp_path: Path) -> None:
 
 def test_mcp_pe_deep_tool(tmp_path: Path) -> None:
     lc = build_loadconfig_blob()
-    lc_payload, dirs = loadconfig_payload(lc, [0x401000])
-    merged = dict(dirs)
-    merged.update(resource_dirs())
-    target = make_pe(tmp_path / "mcp.exe", data_dirs=merged, section_payload=lc_payload)
+    # Resources keep their own layout (RVA base SECTION_VA); the load-config
+    # payload is rebuilt against a section_va shifted past the resource bytes,
+    # so every RVA baked into its TLS directory stays consistent after the
+    # two payloads are concatenated.
+    base = len(RESOURCE_PAYLOAD)
+    lc_payload, lc_dirs = loadconfig_payload(
+        lc, [0x401000], section_va=SECTION_VA + base
+    )
+    combined = RESOURCE_PAYLOAD + lc_payload
+    merged = {**lc_dirs, **resource_dirs()}
+    target = make_pe(tmp_path / "mcp.exe", data_dirs=merged, section_payload=combined)
     payload = tools.codevanta_pe_deep(str(target))
     assert payload["format"] == "pe"
     assert payload["resources"]["resource_table_present"] is True
     assert payload["loadconfig"]["tls_callback_count"] == 1
-    with pytest.raises(AnalysisError, match="missing MZ magic"):
+    with pytest.raises(AnalysisError, match="file not found"):
         tools.codevanta_pe_deep(str(tmp_path / "ghost.exe"))
 
 
