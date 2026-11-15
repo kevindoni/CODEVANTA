@@ -40,6 +40,7 @@ from .ext_fs import TOOL_DESCRIPTION_FS_DIFF as FS_DIFF_DESCRIPTION
 from .ext_fs import TOOL_DESCRIPTION_FS_SNAPSHOT as FS_SNAPSHOT_DESCRIPTION
 from .ext_netcapture import TOOL_DESCRIPTION_NET_CAPTURE as NET_CAPTURE_DESCRIPTION
 from .ext_netcapture import TOOL_DESCRIPTION_NET_INTERFACES as NET_INTERFACES_DESCRIPTION
+from .ext_rich import TOOL_DESCRIPTION_RICH as RICH_DESCRIPTION
 from .ext_solver import TOOL_DESCRIPTION as SYMBOLIC_SOLVE_DESCRIPTION
 from .ext_ssa import TOOL_DESCRIPTION_SSA as SSA_DESCRIPTION
 from .ext_uires import TOOL_DESCRIPTION_DIALOG_DECODE as UIRES_DIALOG_DESCRIPTION
@@ -2216,6 +2217,11 @@ def build_server() -> MCPServer:
             return tools.codevanta_dex(path)
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
+
+    # lane-rich: PE Rich header decoder (compiler fingerprint), offline.
+    @server.tool(description=RICH_DESCRIPTION)
+    def codevanta_rich(path: str) -> dict:
+        return tools.codevanta_rich(path)
 
     return server
 
