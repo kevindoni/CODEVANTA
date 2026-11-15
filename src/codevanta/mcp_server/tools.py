@@ -263,6 +263,36 @@ from codevanta.mcp_server.ext_meta import (
 from codevanta.mcp_server.ext_mobile import codevanta_adb as codevanta_adb
 from codevanta.mcp_server.ext_nav import codevanta_nav, codevanta_nav_providers  # noqa: F401 -- registration of the ext_nav MCP tools
 from codevanta.mcp_server.ext_pdb import codevanta_pdb as codevanta_pdb  # noqa: F401 -- lane-pdb: ONE MCP registration line
+from codevanta.mcp_server.ext_proccapture import (  # lane-proccapture: ONE MCP registration import line
+    DEFAULT_PROC_TIMEOUT as DEFAULT_PROC_TIMEOUT,  # noqa: F401 -- server wrapper default
+)
+from codevanta.mcp_server.ext_proccapture import (
+    PROC_MAX_OUTPUT_BYTES as PROC_MAX_OUTPUT_BYTES,  # noqa: F401 -- server wrapper default
+)
+from codevanta.mcp_server.ext_proccapture import (
+    TOOL_DESCRIPTION_PROC_COMPARE as TOOL_DESCRIPTION_PROC_COMPARE,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_proccapture import (
+    TOOL_DESCRIPTION_PROC_RUN as TOOL_DESCRIPTION_PROC_RUN,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_proccapture import (
+    TOOL_DESCRIPTION_PROC_SESSIONS as TOOL_DESCRIPTION_PROC_SESSIONS,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_proccapture import (
+    TOOL_DESCRIPTION_PROC_STATUS as TOOL_DESCRIPTION_PROC_STATUS,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_proccapture import (
+    codevanta_proc_compare as codevanta_proc_compare,  # noqa: F401
+)
+from codevanta.mcp_server.ext_proccapture import (
+    codevanta_proc_run as codevanta_proc_run,  # noqa: F401
+)
+from codevanta.mcp_server.ext_proccapture import (
+    codevanta_proc_sessions as codevanta_proc_sessions,  # noqa: F401
+)
+from codevanta.mcp_server.ext_proccapture import (
+    codevanta_proc_status as codevanta_proc_status,  # noqa: F401
+)
 from codevanta.mcp_server.ext_providers import codevanta_providers as codevanta_providers
 from codevanta.mcp_server.ext_rebuild import (  # lane-rebuild: ONE MCP registration line
     codevanta_rebuild,  # noqa: F401

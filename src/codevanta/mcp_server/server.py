@@ -71,8 +71,10 @@ HttpTransport = Literal["sse", "streamable-http"]
 
 INSTRUCTIONS = (
     "CODEVANTA performs static analysis of PE and ELF binaries and never executes "
-    "targets, with exactly one exception: the codevanta_debug tool runs a live gdb "
-    "session and executes the target inside it, on the analyst's explicit request. "
+    "targets, with exactly two exceptions: the codevanta_debug tool runs a live gdb "
+    "session and executes the target inside it, and the codevanta_proc_run tool "
+    "executes the caller-selected command locally as an owned, bounded child "
+    "process, both on the analyst's explicit request. "
     "Every result carries evidence: check 'source', 'method', and "
     "'confidence' before relying on a finding. Exports and function symbols are "
     "high confidence; the entry point is a medium-confidence code candidate, not a "
@@ -1998,6 +2000,48 @@ def build_server() -> MCPServer:
     def codevanta_frida_sessions() -> dict:
         try:
             return tools.codevanta_frida_sessions()
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_PROC_RUN)
+    def codevanta_proc_run(
+        command: str,
+        arguments: list[str] | None = None,
+        working_directory: str | None = None,
+        timeout: float = tools.DEFAULT_PROC_TIMEOUT,
+        env: dict[str, str] | None = None,
+        max_output_bytes: int = tools.PROC_MAX_OUTPUT_BYTES,
+    ) -> dict:
+        try:
+            return tools.codevanta_proc_run(
+                command,
+                arguments,
+                working_directory,
+                timeout=timeout,
+                env=env,
+                max_output_bytes=max_output_bytes,
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_PROC_STATUS)
+    def codevanta_proc_status(session_id: str) -> dict:
+        try:
+            return tools.codevanta_proc_status(session_id)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_PROC_COMPARE)
+    def codevanta_proc_compare(left_session_id: str, right_session_id: str) -> dict:
+        try:
+            return tools.codevanta_proc_compare(left_session_id, right_session_id)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_PROC_SESSIONS)
+    def codevanta_proc_sessions() -> dict:
+        try:
+            return tools.codevanta_proc_sessions()
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
