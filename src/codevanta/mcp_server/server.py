@@ -1336,6 +1336,142 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Start a rebuild project: Study → Build → Check → Ready. Studies "
+            "the target with CODEVANTA's analysis engine (surface-only in "
+            "clean-room mode, all tools in deep mode), writes craft.json and "
+            "the capture, and returns the project id. An external coding agent "
+            "then builds the recreation; use codevanta_rebuild_check to compare "
+            "it against the original. Nothing is executed, nothing touches the "
+            "network."
+        )
+    )
+    def codevanta_rebuild(
+        target: str,
+        request: str,
+        mode: str = "clean-room",
+        root: str | None = None,
+    ) -> dict:
+        try:
+            return tools.codevanta_rebuild(target, request, mode=mode, root=root)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Mark a rebuild project as ``building`` and scaffold the ``app/`` "
+            "directory. Returns the project id, status, suggested stack, "
+            "directory and the list of files written for the coding agent."
+        )
+    )
+    def codevanta_rebuild_build(
+        project_id: str,
+        root: str | None = None,
+    ) -> dict:
+        try:
+            return tools.codevanta_rebuild_build(project_id, root=root)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Run the automated Build → Check → Improve loop. Generates code "
+            "from study entries, writes it to ``app/``, runs "
+            "``codevanta_rebuild_check``, and repeats until identical or "
+            "``max_attempts`` is reached. Marks the project ``ready`` on "
+            "success."
+        )
+    )
+    def codevanta_rebuild_build_auto(
+        project_id: str,
+        root: str | None = None,
+        max_attempts: int = 5,
+    ) -> dict:
+        try:
+            return tools.codevanta_rebuild_build_auto(
+                project_id, root=root, max_attempts=max_attempts
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Request an improvement pass for a rebuild project. Regenerates "
+            "the code in ``app/`` using the latest study entries, then runs "
+            "one check. Returns whether the build is now identical. Intended "
+            "for external coding agents to iterate toward Ready."
+        )
+    )
+    def codevanta_rebuild_improve(
+        project_id: str,
+        hint: str | None = None,
+        root: str | None = None,
+    ) -> dict:
+        try:
+            return tools.codevanta_rebuild_improve(project_id, hint=hint, root=root)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "List rebuild projects, most recently updated first. Returns the "
+            "project id, name, status, mode, target and updated timestamp for "
+            "each project under the rebuild root."
+        )
+    )
+    def codevanta_rebuild_list(root: str | None = None) -> dict:
+        try:
+            return tools.codevanta_rebuild_list(root=root)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Show one rebuild project's full record: request, status, study "
+            "entries, checks and inbox. Returns the complete craft.json payload."
+        )
+    )
+    def codevanta_rebuild_show(project_id: str, root: str | None = None) -> dict:
+        try:
+            return tools.codevanta_rebuild_show(project_id, root=root)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Compare an agent-built recreation against the project's original "
+            "target and record the check. For binary targets uses CODEVANTA's "
+            "structural comparison; otherwise compares SHA-256 and size. Returns "
+            "whether the build is identical and saves the result under checks/."
+        )
+    )
+    def codevanta_rebuild_check(
+        project_id: str,
+        build_path: str,
+        root: str | None = None,
+    ) -> dict:
+        try:
+            return tools.codevanta_rebuild_check(project_id, build_path, root=root)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Mark a rebuild project as ``ready``. Requires the project to be "
+            "in ``checked`` status and the most recent check to report "
+            "``identical: true``. Returns the updated project record."
+        )
+    )
+    def codevanta_rebuild_ready(
+        project_id: str,
+        root: str | None = None,
+    ) -> dict:
+        try:
+            return tools.codevanta_rebuild_ready(project_id, root=root)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
             "Read PDB information offline. A .pdb input gets the bounded "
             "MSF v7 walk: streams, the info stream's GUID/age/version, "
             "named streams and the DBI module list. Any other input is "

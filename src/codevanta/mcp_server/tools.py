@@ -176,6 +176,9 @@ from codevanta.mcp_server.ext_depth import (
     codevanta_javascript as codevanta_javascript,
 )
 from codevanta.mcp_server.ext_depth import (
+    codevanta_source_map as codevanta_source_map,
+)
+from codevanta.mcp_server.ext_depth import (
     codevanta_js_recover as codevanta_js_recover,
 )
 from codevanta.mcp_server.ext_depth2 import (  # lane-depth2: ONE MCP registration line
@@ -206,8 +209,19 @@ from codevanta.mcp_server.ext_mobile import codevanta_adb as codevanta_adb
 from codevanta.mcp_server.ext_nav import codevanta_nav, codevanta_nav_providers  # noqa: F401 -- registration of the ext_nav MCP tools
 from codevanta.mcp_server.ext_pdb import codevanta_pdb as codevanta_pdb  # noqa: F401 -- lane-pdb: ONE MCP registration line
 from codevanta.mcp_server.ext_providers import codevanta_providers as codevanta_providers
+from codevanta.mcp_server.ext_rebuild import (  # lane-rebuild: ONE MCP registration line
+    codevanta_rebuild,  # noqa: F401
+    codevanta_rebuild_build,  # noqa: F401
+    codevanta_rebuild_build_auto,  # noqa: F401
+    codevanta_rebuild_check,  # noqa: F401
+    codevanta_rebuild_improve,  # noqa: F401
+    codevanta_rebuild_list,  # noqa: F401
+    codevanta_rebuild_ready,  # noqa: F401
+    codevanta_rebuild_show,  # noqa: F401
+)
 from codevanta.mcp_server.ext_replay import codevanta_replay_fixture as codevanta_replay_fixture  # noqa: F401 -- lane-replay: ONE MCP registration line
 from codevanta.mcp_server.ext_sbom import codevanta_sbom as codevanta_sbom  # noqa: F401 -- lane-sbom: ONE MCP registration line
+from codevanta.mcp_server.ext_sbom import codevanta_sbom_export as codevanta_sbom_export  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
 from codevanta.mcp_server.ext_search import (  # lane-search: ONE MCP registration import line
     codevanta_call_path,  # noqa: F401
     codevanta_graph_subset,  # noqa: F401
@@ -223,6 +237,7 @@ from codevanta.mcp_server.ext_signal import (  # lane-signal: ONE MCP registrati
 )
 from codevanta.mcp_server.ext_solver import codevanta_symbolic_solve  # noqa: F401 -- one-line registration of the ext solver MCP tool
 from codevanta.mcp_server.ext_stackstrings import codevanta_stackstrings as codevanta_stackstrings  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
+from codevanta.mcp_server.ext_stackstrings import codevanta_static_strings as codevanta_static_strings  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
 from codevanta.mcp_server.ext_triage import codevanta_triage as codevanta_triage  # noqa: F401 -- lane-triage: ONE MCP registration line
 from codevanta.mcp_server.ext_web import codevanta_asar, codevanta_web_inspect  # noqa: F401 - registration of the ext_web MCP tools
 from codevanta.mcp_server.ext_webcap import (  # lane-webcap: ONE MCP registration line
@@ -1718,3 +1733,56 @@ def unknowns(
         "revision": resolved.revisions[-1].revision,
         "count": int(payload["count"]),
     }
+def codevanta_containers(path: str) -> dict[str, Any]:
+    """Inspect a container file and summarise all detected formats.
+
+    Runs the WASM, GGUF, safetensors, pcap and EVM inspectors in that order
+    (magic-gated formats first; EVM last because it has no magic), then the
+    firmware magic sweep over the raw bytes. Inspectors that do not match
+    return ``None`` and stay out of the summary; a file matching nothing is a
+    valid summary with an empty ``detected`` list, never an error.
+
+    Args:
+        path: Path to the container file.
+
+    Returns:
+        A dict with the container detection summary compatible with the MCP
+        schema.
+    """
+    from codevanta.analysis.containers import inspect_container
+    from pathlib import Path
+
+    target = Path(path)
+    summary = inspect_container(target)
+    return summary.to_dict()
+
+
+def codevanta_png_diff(left: str, right: str) -> dict[str, Any]:
+    """Compare two PNG screenshots pixel by pixel and return a typed verdict.
+
+    Accepts paths (loaded through :func:`load_png`) or already-decoded
+    :class:`PngImage` values. When dimensions match, every aligned pixel is
+    compared channel-wise; ``changed_ratio`` is the fraction of pixels with
+    at least one differing channel, and the per-channel mean absolute delta
+    quantifies how the screenshot moved. When dimensions differ the
+    verdict is ``major`` with a note, because no aligned pixel comparison exists.
+
+    Verdicts:
+        ``identical`` when the ratio is exactly ``0.0``,
+        ``minor`` while it stays below :data:`MINOR_RATIO_THRESHOLD`,
+        ``major`` beyond that or for any dimension mismatch.
+
+    Args:
+        left: Path or PngImage for the left screenshot.
+        right: Path or PngImage for the right screenshot.
+
+    Returns:
+        A dict with the pixel-diff summary compatible with the MCP schema.
+    """
+    from codevanta.analysis.png_diff import pixel_diff
+    from pathlib import Path
+
+    left_img = Path(left)
+    right_img = Path(right)
+    diff = pixel_diff(left_img, right_img)
+    return diff.to_dict()

@@ -163,6 +163,7 @@ from codevanta.cli.meta import (  # codesign: lane-format2; deep2_app: lane-dept
 from codevanta.cli.mobile import app as mobile_app
 from codevanta.cli.nav import app as nav_app
 from codevanta.cli.obligations import app as obligations_app  # lane-ledger2: ONE import
+from codevanta.cli.rebuild import app as rebuild_app  # rebuild: Study → Build → Check → Ready
 from codevanta.cli.signal import app as signal_app
 from codevanta.cli.web import asar, web_app
 from codevanta.core.disassembler import DisassemblyError
@@ -3417,6 +3418,7 @@ app.add_typer(signal_app)
 app.add_typer(crash_app, name="crash")
 app.add_typer(mobile_app, name="mobile")
 app.add_typer(nav_app, name="nav")  # lane-nav: ONE registration line for the navigation sub-app
+app.add_typer(rebuild_app, name="rebuild")  # rebuild: Study → Build → Check → Ready
 app.add_typer(obligations_app, name="obligations")  # lane-ledger2: ONE registration line
 # lane-bridge-a: ONE registration block for the bridges lane (capability report
 # plus firmware/pcap/wasm/objdump sub-apps, one loop, deterministic order).
