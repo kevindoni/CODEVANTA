@@ -287,6 +287,8 @@ from codevanta.mcp_server.ext_webcap import (  # lane-webcap: ONE MCP registrati
     codevanta_proto_decode,  # noqa: F401
     codevanta_web_capture,  # noqa: F401
 )
+from codevanta.mcp_server.ext_webfw import codevanta_sourcemap as codevanta_sourcemap  # noqa: F401 -- lane-webfw: ONE MCP registration line
+from codevanta.mcp_server.ext_webfw import codevanta_unpack as codevanta_unpack  # noqa: F401 -- lane-webfw: ONE MCP registration line
 from codevanta.mcp_server.ext_yara import codevanta_yara as codevanta_yara  # noqa: F401 -- lane-yara: ONE MCP registration line
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore
