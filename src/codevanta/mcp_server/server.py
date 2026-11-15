@@ -26,6 +26,7 @@ from codevanta.core.report import AnalysisError
 
 from . import tools
 from .ext_assets import TOOL_DESCRIPTION_PE_ASSETS as PE_ASSETS_DESCRIPTION
+from .ext_dex import TOOL_DESCRIPTION_DEX as DEX_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_EMULATE as EXPOSE_EMULATE_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_TYPES as EXPOSE_TYPES_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_WASM as EXPOSE_WASM_DESCRIPTION
@@ -2207,6 +2208,13 @@ def build_server() -> MCPServer:
         except AnalysisError as exc:
             # A bad address or an out-of-range budget is caller-correctable;
             # keep the typed message instead of the framework's generic crash.
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=DEX_DESCRIPTION)
+    def codevanta_dex(path: str) -> dict:
+        try:
+            return tools.codevanta_dex(path)
+        except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
     return server

@@ -198,6 +198,7 @@ from codevanta.mcp_server.ext_depth2 import (  # lane-depth2: ONE MCP registrati
     codevanta_elf_macho,  # noqa: F401
     codevanta_pe_deep,  # noqa: F401
 )
+from codevanta.mcp_server.ext_dex import codevanta_dex as codevanta_dex  # noqa: F401 -- lane-dex: ONE MCP registration line
 from codevanta.mcp_server.ext_expose import (  # lane-expose: server wrapper defaults
     DEFAULT_EMULATE_INSTRUCTIONS,  # noqa: F401
     DEFAULT_EMULATE_STACK_SIZE,  # noqa: F401
