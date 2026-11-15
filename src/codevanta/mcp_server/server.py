@@ -37,6 +37,8 @@ from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_START as FRIDA_START_DESCRI
 from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_STATUS as FRIDA_STATUS_DESCRIPTION
 from .ext_fs import TOOL_DESCRIPTION_FS_DIFF as FS_DIFF_DESCRIPTION
 from .ext_fs import TOOL_DESCRIPTION_FS_SNAPSHOT as FS_SNAPSHOT_DESCRIPTION
+from .ext_netcapture import TOOL_DESCRIPTION_NET_CAPTURE as NET_CAPTURE_DESCRIPTION
+from .ext_netcapture import TOOL_DESCRIPTION_NET_INTERFACES as NET_INTERFACES_DESCRIPTION
 from .ext_solver import TOOL_DESCRIPTION as SYMBOLIC_SOLVE_DESCRIPTION
 from .ext_uires import TOOL_DESCRIPTION_DIALOG_DECODE as UIRES_DIALOG_DESCRIPTION
 from .ext_uires import TOOL_DESCRIPTION_UI_PREVIEW as UIRES_PREVIEW_DESCRIPTION
@@ -2156,6 +2158,33 @@ def build_server() -> MCPServer:
     def codevanta_fs_diff(before: str, after: str) -> dict:
         try:
             return tools.codevanta_fs_diff(before, after)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    # lane-net: TWO MCP wrappers for network capture around a target command.
+    @server.tool(description=NET_INTERFACES_DESCRIPTION)
+    def codevanta_net_interfaces() -> dict:
+        try:
+            return tools.codevanta_net_interfaces()
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=NET_CAPTURE_DESCRIPTION)
+    def codevanta_net_capture(
+        command: str,
+        arguments: list[str] | None,
+        capture_seconds: int,
+        interface: str,
+        output_directory: str,
+    ) -> dict:
+        try:
+            return tools.codevanta_net_capture(
+                command,
+                arguments,
+                capture_seconds,
+                interface,
+                output_directory,
+            )
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
