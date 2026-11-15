@@ -327,6 +327,7 @@ from codevanta.mcp_server.ext_rebuild import (  # lane-rebuild: ONE MCP registra
     codevanta_rebuild_show,  # noqa: F401
 )
 from codevanta.mcp_server.ext_replay import codevanta_replay_fixture as codevanta_replay_fixture  # noqa: F401 -- lane-replay: ONE MCP registration line
+from codevanta.mcp_server.ext_rich import codevanta_rich as codevanta_rich  # noqa: F401 -- lane-rich: ONE MCP registration line
 from codevanta.mcp_server.ext_sbom import codevanta_sbom as codevanta_sbom  # noqa: F401 -- lane-sbom: ONE MCP registration line
 from codevanta.mcp_server.ext_sbom import codevanta_sbom_export as codevanta_sbom_export  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
 from codevanta.mcp_server.ext_search import (  # lane-search: ONE MCP registration import line
