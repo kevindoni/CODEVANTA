@@ -25,6 +25,7 @@ from codevanta.analysis.uart_decode import DEFAULT_STOP_BITS as UART_DEFAULT_STO
 from codevanta.core.report import AnalysisError
 
 from . import tools
+from .ext_assets import TOOL_DESCRIPTION_PE_ASSETS as PE_ASSETS_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_EMULATE as EXPOSE_EMULATE_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_TYPES as EXPOSE_TYPES_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_WASM as EXPOSE_WASM_DESCRIPTION
@@ -2093,6 +2094,13 @@ def build_server() -> MCPServer:
     def codevanta_win_shot(hwnd: int, output_directory: str) -> dict:
         try:
             return tools.codevanta_win_shot(hwnd, output_directory)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=PE_ASSETS_DESCRIPTION)
+    def codevanta_pe_assets(path: str, output_directory: str) -> dict:
+        try:
+            return tools.codevanta_pe_assets(path, output_directory)
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 

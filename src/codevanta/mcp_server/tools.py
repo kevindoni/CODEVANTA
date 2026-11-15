@@ -151,6 +151,12 @@ from codevanta.core.unknowns import (
     records_to_payload,
     resolve_unknowns,
 )
+from codevanta.mcp_server.ext_assets import (
+    TOOL_DESCRIPTION_PE_ASSETS as TOOL_DESCRIPTION_PE_ASSETS,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_assets import (
+    codevanta_pe_assets as codevanta_pe_assets,  # noqa: F401 -- lane-assets
+)
 from codevanta.mcp_server.ext_bin import codevanta_binmeta as codevanta_binmeta
 from codevanta.mcp_server.ext_bin import codevanta_sqlite as codevanta_sqlite
 from codevanta.mcp_server.ext_bridges import (  # lane-bridge-a: ONE MCP registration import line
