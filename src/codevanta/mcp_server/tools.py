@@ -159,6 +159,7 @@ from codevanta.mcp_server.ext_assets import (
 )
 from codevanta.mcp_server.ext_bin import codevanta_binmeta as codevanta_binmeta
 from codevanta.mcp_server.ext_bin import codevanta_sqlite as codevanta_sqlite
+from codevanta.mcp_server.ext_bplist import codevanta_bplist as codevanta_bplist  # noqa: F401 -- lane-bplist: ONE MCP registration line
 from codevanta.mcp_server.ext_bridges import (  # lane-bridge-a: ONE MCP registration import line
     codevanta_bridges,  # noqa: F401
     codevanta_firmware_extract,  # noqa: F401

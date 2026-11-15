@@ -26,6 +26,7 @@ from codevanta.core.report import AnalysisError
 
 from . import tools
 from .ext_assets import TOOL_DESCRIPTION_PE_ASSETS as PE_ASSETS_DESCRIPTION
+from .ext_bplist import TOOL_DESCRIPTION_BPLIST as BPLIST_DESCRIPTION
 from .ext_dex import TOOL_DESCRIPTION_DEX as DEX_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_EMULATE as EXPOSE_EMULATE_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_TYPES as EXPOSE_TYPES_DESCRIPTION
@@ -2222,6 +2223,14 @@ def build_server() -> MCPServer:
     @server.tool(description=RICH_DESCRIPTION)
     def codevanta_rich(path: str) -> dict:
         return tools.codevanta_rich(path)
+
+    # lane-bplist: read-only Apple binary property list (bplist00) decoder.
+    @server.tool(description=BPLIST_DESCRIPTION)
+    def codevanta_bplist(path: str) -> dict:
+        try:
+            return tools.codevanta_bplist(path)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
 
     return server
 
