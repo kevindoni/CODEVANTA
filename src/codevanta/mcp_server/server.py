@@ -35,6 +35,8 @@ from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_SESSIONS as FRIDA_SESSIONS_
 from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_START as FRIDA_START_DESCRIPTION
 from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_STATUS as FRIDA_STATUS_DESCRIPTION
 from .ext_solver import TOOL_DESCRIPTION as SYMBOLIC_SOLVE_DESCRIPTION
+from .ext_uires import TOOL_DESCRIPTION_DIALOG_DECODE as UIRES_DIALOG_DESCRIPTION
+from .ext_uires import TOOL_DESCRIPTION_UI_PREVIEW as UIRES_PREVIEW_DESCRIPTION
 from .ext_webfw import TOOL_DESCRIPTION_SOURCEMAP as WEBFW_SOURCEMAP_DESCRIPTION
 from .ext_webfw import TOOL_DESCRIPTION_UNPACK as WEBFW_UNPACK_DESCRIPTION
 
@@ -2042,6 +2044,20 @@ def build_server() -> MCPServer:
     def codevanta_proc_sessions() -> dict:
         try:
             return tools.codevanta_proc_sessions()
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=UIRES_DIALOG_DESCRIPTION)
+    def codevanta_dialog_decode(path: str) -> dict:
+        try:
+            return tools.codevanta_dialog_decode(path)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=UIRES_PREVIEW_DESCRIPTION)
+    def codevanta_ui_preview(path: str, output_directory: str) -> dict:
+        try:
+            return tools.codevanta_ui_preview(path, output_directory)
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
