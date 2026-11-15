@@ -1285,8 +1285,8 @@ def test_lane_routes_are_registered_and_listed_by_health(
     assert set(payload["routes"]) == set(ROUTES)
     for route in LANE_ROUTES:
         assert route in payload["routes"]
-    # Fourteen established routes plus /api/js plus the six lane routes.
-    assert len(ROUTES) == 21
+    # Fourteen established routes, five lane-analysis /api routes, six lane routes.
+    assert len(ROUTES) == 25
     # A near-miss spelling stays an unknown route: 404, never a silent match.
     miss_status, miss_payload = _get(gui_server, "/bridge")
     assert miss_status == 404
@@ -1658,3 +1658,73 @@ def test_dashboard_page_has_the_lane_controls() -> None:
     ):
         assert line in page
     assert "innerHTML" not in page
+
+
+# ---------------------------------------------------------------------------
+# lane-analysis /api routes: js-audit, sbom, capabilities, stackstrings
+
+
+def _vuln_electron_app(tmp_path: Path) -> Path:
+    """A tiny Electron app with one certain finding (EA-001)."""
+    (tmp_path / "package.json").write_text('{"name": "vuln"}', encoding="utf-8")
+    (tmp_path / "main.js").write_text(
+        "new BrowserWindow({ webPreferences: { nodeIntegration: true } });\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_js_audit_route_reports_findings(gui_server: ThreadingHTTPServer, tmp_path: Path) -> None:
+    app = _vuln_electron_app(tmp_path)
+    status, payload = _get(gui_server, f"/api/js-audit?path={quote(app.as_posix())}")
+    assert status == 200
+    assert "EA-001" in [f["rule_id"] for f in payload["findings"]]
+
+
+def test_js_audit_route_bad_path_is_400(gui_server: ThreadingHTTPServer, tmp_path: Path) -> None:
+    plain = tmp_path / "x.txt"
+    plain.write_text("hi", encoding="utf-8")
+    status, payload = _get(gui_server, f"/api/js-audit?path={quote(plain.as_posix())}")
+    assert status == 400
+    assert "neither a directory nor an .asar" in payload["error"]
+
+
+def test_sbom_route_accepts_repeated_paths(gui_server: ThreadingHTTPServer, tmp_path: Path) -> None:
+    app = _vuln_electron_app(tmp_path)
+    second = tmp_path / "second"
+    second.mkdir()
+    (second / "package.json").write_text('{"name": "two"}', encoding="utf-8")
+    (second / "a.js").write_text("require('lodash');\n", encoding="utf-8")
+    joined = quote(f"{app.as_posix()},{second.as_posix()}")
+    status, payload = _get(gui_server, f"/api/sbom?paths={joined}")
+    assert status == 200
+    assert payload["bomFormat"] == "CycloneDX"
+    assert payload["specVersion"] == "1.6"
+
+
+def test_sbom_route_requires_paths(gui_server: ThreadingHTTPServer) -> None:
+    status, payload = _get(gui_server, "/api/sbom")
+    assert status == 400
+    assert "required" in payload["error"]
+
+
+def test_capabilities_route_no_false_matches(
+    gui_server: ThreadingHTTPServer, elf64_text_path: Path
+) -> None:
+    status, payload = _get(gui_server, f"/api/capabilities?path={quote(elf64_text_path.as_posix())}")
+    assert status == 200
+    assert payload["rule_count"] >= 14
+    assert payload["matches"] == []
+
+
+def test_stackstrings_route_recovers_strings(
+    gui_server: ThreadingHTTPServer, tmp_path: Path
+) -> None:
+    pytest.importorskip("unicorn")
+    from test_stackstrings import CODE_HELLO_WORLD, _sample
+
+    sample = _sample(tmp_path, CODE_HELLO_WORLD)
+    status, payload = _get(gui_server, f"/api/stackstrings?path={quote(sample.as_posix())}")
+    assert status == 200
+    assert payload["functions_emulated"] >= 1
+    assert any(s["encoding"] == "ascii" for s in payload["strings"])

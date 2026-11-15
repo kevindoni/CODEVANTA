@@ -5,7 +5,7 @@ User-facing documentation for CODEVANTA.
 | Document | What it covers |
 |----------|----------------|
 | [Install](install.md) | Installing from PyPI or from source |
-| [API](api.md) | The 21 dashboard routes and the 60 MCP tools (as of v0.3.x) |
+| [API](api.md) | The 25 dashboard routes and the 60 MCP tools (as of v0.3.x) |
 | [Architecture](architecture.md) | How the engine, CLI, GUI and MCP layers fit together |
 | [Samples](samples.md) | The committed analysis fixtures and how to reproduce them |
 | [JavaScript/Electron](javascript.md) | Static app inventory: modules, imports, IPC boundaries |
