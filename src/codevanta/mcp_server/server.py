@@ -1881,6 +1881,41 @@ def build_server() -> MCPServer:
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
+    @server.tool(description=tools.TOOL_DESCRIPTION_START)
+    def codevanta_debug_start(
+        path: str,
+        addresses: list[int],
+        max_hits: int = tools.DEFAULT_DEBUG_MAX_HITS,
+        timeout: float = tools.DEFAULT_DEBUG_TIMEOUT,
+    ) -> dict:
+        try:
+            return tools.codevanta_debug_start(
+                path, addresses, max_hits=max_hits, timeout=timeout
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_STATUS)
+    def codevanta_debug_status(session_id: str) -> dict:
+        try:
+            return tools.codevanta_debug_status(session_id)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_CLOSE)
+    def codevanta_debug_close(session_id: str) -> dict:
+        try:
+            return tools.codevanta_debug_close(session_id)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_SESSIONS)
+    def codevanta_debug_sessions() -> dict:
+        try:
+            return tools.codevanta_debug_sessions()
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
     return server
 
 

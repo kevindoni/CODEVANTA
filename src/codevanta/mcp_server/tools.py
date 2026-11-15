@@ -212,6 +212,36 @@ from codevanta.mcp_server.ext_live import (  # lane-live2: ONE MCP registration 
     codevanta_lldb_run,  # noqa: F401
     codevanta_rizin_functions,  # noqa: F401
 )
+from codevanta.mcp_server.ext_livesession import (  # lane-livesessions: ONE MCP registration import line
+    DEFAULT_DEBUG_MAX_HITS as DEFAULT_DEBUG_MAX_HITS,  # noqa: F401 -- server wrapper default
+)
+from codevanta.mcp_server.ext_livesession import (
+    DEFAULT_DEBUG_TIMEOUT as DEFAULT_DEBUG_TIMEOUT,  # noqa: F401 -- server wrapper default
+)
+from codevanta.mcp_server.ext_livesession import (
+    TOOL_DESCRIPTION_CLOSE as TOOL_DESCRIPTION_CLOSE,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_livesession import (
+    TOOL_DESCRIPTION_SESSIONS as TOOL_DESCRIPTION_SESSIONS,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_livesession import (
+    TOOL_DESCRIPTION_START as TOOL_DESCRIPTION_START,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_livesession import (
+    TOOL_DESCRIPTION_STATUS as TOOL_DESCRIPTION_STATUS,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_livesession import (
+    codevanta_debug_close as codevanta_debug_close,  # noqa: F401
+)
+from codevanta.mcp_server.ext_livesession import (
+    codevanta_debug_sessions as codevanta_debug_sessions,  # noqa: F401
+)
+from codevanta.mcp_server.ext_livesession import (
+    codevanta_debug_start as codevanta_debug_start,  # noqa: F401
+)
+from codevanta.mcp_server.ext_livesession import (
+    codevanta_debug_status as codevanta_debug_status,  # noqa: F401
+)
 from codevanta.mcp_server.ext_meta import (
     codevanta_metadata as codevanta_metadata,  # lane-meta: ONE MCP registration line
 )
