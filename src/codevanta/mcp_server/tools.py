@@ -346,6 +346,24 @@ from codevanta.mcp_server.ext_webcap import (  # lane-webcap: ONE MCP registrati
 )
 from codevanta.mcp_server.ext_webfw import codevanta_sourcemap as codevanta_sourcemap  # noqa: F401 -- lane-webfw: ONE MCP registration line
 from codevanta.mcp_server.ext_webfw import codevanta_unpack as codevanta_unpack  # noqa: F401 -- lane-webfw: ONE MCP registration line
+from codevanta.mcp_server.ext_wingui import (  # lane-wingui: ONE MCP registration import line
+    TOOL_DESCRIPTION_WIN_SHOT as TOOL_DESCRIPTION_WIN_SHOT,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_wingui import (
+    TOOL_DESCRIPTION_WIN_TREE as TOOL_DESCRIPTION_WIN_TREE,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_wingui import (
+    TOOL_DESCRIPTION_WIN_WINDOWS as TOOL_DESCRIPTION_WIN_WINDOWS,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_wingui import (
+    codevanta_win_shot as codevanta_win_shot,  # noqa: F401 -- lane-wingui
+)
+from codevanta.mcp_server.ext_wingui import (
+    codevanta_win_tree as codevanta_win_tree,  # noqa: F401 -- lane-wingui
+)
+from codevanta.mcp_server.ext_wingui import (
+    codevanta_win_windows as codevanta_win_windows,  # noqa: F401 -- lane-wingui
+)
 from codevanta.mcp_server.ext_yara import codevanta_yara as codevanta_yara  # noqa: F401 -- lane-yara: ONE MCP registration line
 from codevanta.storage.session import MAX_LIMIT as MAX_SESSION_LIMIT
 from codevanta.storage.session import SessionError, SessionStore

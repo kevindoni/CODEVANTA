@@ -39,6 +39,9 @@ from .ext_uires import TOOL_DESCRIPTION_DIALOG_DECODE as UIRES_DIALOG_DESCRIPTIO
 from .ext_uires import TOOL_DESCRIPTION_UI_PREVIEW as UIRES_PREVIEW_DESCRIPTION
 from .ext_webfw import TOOL_DESCRIPTION_SOURCEMAP as WEBFW_SOURCEMAP_DESCRIPTION
 from .ext_webfw import TOOL_DESCRIPTION_UNPACK as WEBFW_UNPACK_DESCRIPTION
+from .ext_wingui import TOOL_DESCRIPTION_WIN_SHOT as WINGUI_SHOT_DESCRIPTION
+from .ext_wingui import TOOL_DESCRIPTION_WIN_TREE as WINGUI_TREE_DESCRIPTION
+from .ext_wingui import TOOL_DESCRIPTION_WIN_WINDOWS as WINGUI_WINDOWS_DESCRIPTION
 
 #: Upstream ``DEFAULT_PARITY`` is inferred plain ``str``; the MCP schema
 #: publishes the literal union the UART decoder actually accepts.
@@ -2058,6 +2061,27 @@ def build_server() -> MCPServer:
     def codevanta_ui_preview(path: str, output_directory: str) -> dict:
         try:
             return tools.codevanta_ui_preview(path, output_directory)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=WINGUI_WINDOWS_DESCRIPTION)
+    def codevanta_win_windows(pid: int | None = None) -> dict:
+        try:
+            return tools.codevanta_win_windows(pid)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=WINGUI_TREE_DESCRIPTION)
+    def codevanta_win_tree(hwnd: int) -> dict:
+        try:
+            return tools.codevanta_win_tree(hwnd)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=WINGUI_SHOT_DESCRIPTION)
+    def codevanta_win_shot(hwnd: int, output_directory: str) -> dict:
+        try:
+            return tools.codevanta_win_shot(hwnd, output_directory)
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
