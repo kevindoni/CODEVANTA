@@ -2064,6 +2064,17 @@ def build_server() -> MCPServer:
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
+    @server.tool(description=tools.TOOL_DESCRIPTION_CODEGEN)
+    def codevanta_rebuild_generate(
+        project_dir: str, output_directory: str, language: str = "python"
+    ) -> dict:
+        try:
+            return tools.codevanta_rebuild_generate(
+                project_dir, output_directory, language=language
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
     @server.tool(description=WINGUI_WINDOWS_DESCRIPTION)
     def codevanta_win_windows(pid: int | None = None) -> dict:
         try:
