@@ -66,7 +66,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
 def test_server_lists_fifty_five_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
-    assert len(names) == 88
+    assert len(names) == 89
     assert names == [
     "codevanta_adb",
     "codevanta_analyze",
@@ -88,6 +88,7 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_dataflow",
     "codevanta_debug",
     "codevanta_decompile",
+    "codevanta_demangle",
     "codevanta_diff",
     "codevanta_disasm",
     "codevanta_dtb",
@@ -2005,3 +2006,46 @@ def test_pdb_tool_codeview_mode_on_plain_elf(elf64_text_path: Path) -> None:
     # An ELF is not a PE: the engine's typed error names the mismatch.
     with pytest.raises(AnalysisError):
         tools.codevanta_pdb(str(elf64_text_path))
+
+
+# ---------------------------------------------------------------------------
+# codevanta_demangle
+
+
+def test_demangle_tool_reports_schemes_counts_and_results() -> None:
+    payload = tools.codevanta_demangle(
+        ["_Z3fooi", "?foo@Bar@@QEAAXXZ", "not_a_mangled_symbol"]
+    )
+    assert payload["total"] == 3
+    assert payload["counts"] == {"itanium": 1, "msvc": 1, "unknown": 1}
+    assert payload["results"][0]["demangled"] == "foo(int)"
+    assert payload["results"][0]["complete"] is True
+    assert payload["results"][2]["demangled"] is None
+    assert payload["evidence"]["source"] == "demangle.symbol"
+
+
+def test_demangle_tool_rejects_bad_input() -> None:
+    with pytest.raises(AnalysisError):
+        tools.codevanta_demangle([])
+    with pytest.raises(AnalysisError):
+        tools.codevanta_demangle(["_Z3fooi", ""])  # empty symbol
+    with pytest.raises(AnalysisError):
+        tools.codevanta_demangle(["x" * 300])  # oversized symbol
+
+
+def test_server_call_tool_demangle_returns_payload() -> None:
+    result = asyncio.run(
+        build_server().call_tool(
+            "codevanta_demangle",
+            {"symbols": ["_ZN3foo3barE", "_RNvNtCs1234_7mycrate3foo"]},
+        )
+    )
+    payload = _payload(result)
+    assert payload["results"][0]["demangled"] == "foo::bar"
+    assert payload["results"][1]["demangled"] == "mycrate::foo"
+    assert payload["results"][1]["scheme"] == "rust-v0"
+
+
+def test_server_call_tool_demangle_rejects_empty_list() -> None:
+    with pytest.raises(ToolError):
+        asyncio.run(build_server().call_tool("codevanta_demangle", {"symbols": []}))
