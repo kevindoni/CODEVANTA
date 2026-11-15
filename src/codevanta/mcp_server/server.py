@@ -29,6 +29,8 @@ from .ext_expose import TOOL_DESCRIPTION_EMULATE as EXPOSE_EMULATE_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_TYPES as EXPOSE_TYPES_DESCRIPTION
 from .ext_expose import TOOL_DESCRIPTION_WASM as EXPOSE_WASM_DESCRIPTION
 from .ext_solver import TOOL_DESCRIPTION as SYMBOLIC_SOLVE_DESCRIPTION
+from .ext_webfw import TOOL_DESCRIPTION_SOURCEMAP as WEBFW_SOURCEMAP_DESCRIPTION
+from .ext_webfw import TOOL_DESCRIPTION_UNPACK as WEBFW_UNPACK_DESCRIPTION
 
 #: Upstream ``DEFAULT_PARITY`` is inferred plain ``str``; the MCP schema
 #: publishes the literal union the UART decoder actually accepts.
@@ -1913,6 +1915,22 @@ def build_server() -> MCPServer:
     def codevanta_debug_sessions() -> dict:
         try:
             return tools.codevanta_debug_sessions()
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=WEBFW_SOURCEMAP_DESCRIPTION)
+    def codevanta_sourcemap(
+        path: str, line: int | None = None, column: int | None = None
+    ) -> dict:
+        try:
+            return tools.codevanta_sourcemap(path, line=line, column=column)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=WEBFW_UNPACK_DESCRIPTION)
+    def codevanta_unpack(path: str, hashes: bool = True) -> dict:
+        try:
+            return tools.codevanta_unpack(path, hashes=hashes)
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
