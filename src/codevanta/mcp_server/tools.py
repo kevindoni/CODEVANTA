@@ -327,6 +327,18 @@ from codevanta.mcp_server.ext_stackstrings import (
     codevanta_static_strings as codevanta_static_strings,  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
 )
 from codevanta.mcp_server.ext_triage import codevanta_triage as codevanta_triage  # noqa: F401 -- lane-triage: ONE MCP registration line
+from codevanta.mcp_server.ext_uires import (  # lane-uistatic: ONE MCP registration line
+    TOOL_DESCRIPTION_DIALOG_DECODE as TOOL_DESCRIPTION_DIALOG_DECODE,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_uires import (
+    TOOL_DESCRIPTION_UI_PREVIEW as TOOL_DESCRIPTION_UI_PREVIEW,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_uires import (
+    codevanta_dialog_decode as codevanta_dialog_decode,  # noqa: F401 -- lane-uistatic
+)
+from codevanta.mcp_server.ext_uires import (
+    codevanta_ui_preview as codevanta_ui_preview,  # noqa: F401 -- lane-uistatic
+)
 from codevanta.mcp_server.ext_web import codevanta_asar, codevanta_web_inspect  # noqa: F401 - registration of the ext_web MCP tools
 from codevanta.mcp_server.ext_webcap import (  # lane-webcap: ONE MCP registration line
     codevanta_proto_decode,  # noqa: F401
