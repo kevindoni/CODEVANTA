@@ -185,6 +185,15 @@ from codevanta.mcp_server.ext_depth2 import (  # lane-depth2: ONE MCP registrati
     codevanta_elf_macho,  # noqa: F401
     codevanta_pe_deep,  # noqa: F401
 )
+from codevanta.mcp_server.ext_expose import (  # lane-expose: server wrapper defaults
+    DEFAULT_EMULATE_INSTRUCTIONS,  # noqa: F401
+    DEFAULT_EMULATE_STACK_SIZE,  # noqa: F401
+    DEFAULT_TYPES_INSTRUCTIONS,  # noqa: F401
+    DEFAULT_WASM_TIMEOUT,  # noqa: F401
+)
+from codevanta.mcp_server.ext_expose import codevanta_emulate as codevanta_emulate  # noqa: F401 -- lane-expose
+from codevanta.mcp_server.ext_expose import codevanta_types as codevanta_types  # noqa: F401 -- lane-expose
+from codevanta.mcp_server.ext_expose import codevanta_wasm as codevanta_wasm  # noqa: F401 -- lane-expose
 from codevanta.mcp_server.ext_format2 import (  # lane-format2: ONE MCP registration import line
     codevanta_codesign,  # noqa: F401
 )

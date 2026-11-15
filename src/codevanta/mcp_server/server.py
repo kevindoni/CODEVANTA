@@ -25,6 +25,9 @@ from codevanta.analysis.uart_decode import DEFAULT_STOP_BITS as UART_DEFAULT_STO
 from codevanta.core.report import AnalysisError
 
 from . import tools
+from .ext_expose import TOOL_DESCRIPTION_EMULATE as EXPOSE_EMULATE_DESCRIPTION
+from .ext_expose import TOOL_DESCRIPTION_TYPES as EXPOSE_TYPES_DESCRIPTION
+from .ext_expose import TOOL_DESCRIPTION_WASM as EXPOSE_WASM_DESCRIPTION
 from .ext_solver import TOOL_DESCRIPTION as SYMBOLIC_SOLVE_DESCRIPTION
 
 #: Upstream ``DEFAULT_PARITY`` is inferred plain ``str``; the MCP schema
@@ -1804,6 +1807,56 @@ def build_server() -> MCPServer:
     def codevanta_png_diff(left: str, right: str) -> dict:
         try:
             return tools.codevanta_png_diff(left, right)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=EXPOSE_EMULATE_DESCRIPTION)
+    def codevanta_emulate(
+        path: str,
+        address: int,
+        initial_registers: dict[str, int] | None = None,
+        max_instructions: int = tools.DEFAULT_EMULATE_INSTRUCTIONS,
+        stack_size: int = tools.DEFAULT_EMULATE_STACK_SIZE,
+    ) -> dict:
+        try:
+            return tools.codevanta_emulate(
+                path,
+                address=address,
+                initial_registers=initial_registers,
+                max_instructions=max_instructions,
+                stack_size=stack_size,
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=EXPOSE_WASM_DESCRIPTION)
+    def codevanta_wasm(
+        path: str,
+        mode: Literal["validate", "objdump"] = "validate",
+        timeout: float = tools.DEFAULT_WASM_TIMEOUT,
+        out_dir: str | None = None,
+    ) -> dict:
+        try:
+            return tools.codevanta_wasm(
+                path, mode=mode, timeout=timeout, out_dir=out_dir
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=EXPOSE_TYPES_DESCRIPTION)
+    def codevanta_types(
+        path: str,
+        address: int,
+        abi: str = "sysv",
+        max_instructions: int = tools.DEFAULT_TYPES_INSTRUCTIONS,
+    ) -> dict:
+        try:
+            return tools.codevanta_types(
+                path,
+                address=address,
+                abi=abi,
+                max_instructions=max_instructions,
+            )
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
