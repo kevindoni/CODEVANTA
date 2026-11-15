@@ -176,10 +176,10 @@ from codevanta.mcp_server.ext_depth import (
     codevanta_javascript as codevanta_javascript,
 )
 from codevanta.mcp_server.ext_depth import (
-    codevanta_source_map as codevanta_source_map,
+    codevanta_js_recover as codevanta_js_recover,
 )
 from codevanta.mcp_server.ext_depth import (
-    codevanta_js_recover as codevanta_js_recover,
+    codevanta_source_map as codevanta_source_map,
 )
 from codevanta.mcp_server.ext_depth2 import (  # lane-depth2: ONE MCP registration line
     codevanta_elf_macho,  # noqa: F401
@@ -237,7 +237,9 @@ from codevanta.mcp_server.ext_signal import (  # lane-signal: ONE MCP registrati
 )
 from codevanta.mcp_server.ext_solver import codevanta_symbolic_solve  # noqa: F401 -- one-line registration of the ext solver MCP tool
 from codevanta.mcp_server.ext_stackstrings import codevanta_stackstrings as codevanta_stackstrings  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
-from codevanta.mcp_server.ext_stackstrings import codevanta_static_strings as codevanta_static_strings  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
+from codevanta.mcp_server.ext_stackstrings import (
+    codevanta_static_strings as codevanta_static_strings,  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
+)
 from codevanta.mcp_server.ext_triage import codevanta_triage as codevanta_triage  # noqa: F401 -- lane-triage: ONE MCP registration line
 from codevanta.mcp_server.ext_web import codevanta_asar, codevanta_web_inspect  # noqa: F401 - registration of the ext_web MCP tools
 from codevanta.mcp_server.ext_webcap import (  # lane-webcap: ONE MCP registration line
@@ -1750,7 +1752,6 @@ def codevanta_containers(path: str) -> dict[str, Any]:
         schema.
     """
     from codevanta.analysis.containers import inspect_container
-    from pathlib import Path
 
     target = Path(path)
     summary = inspect_container(target)
@@ -1780,7 +1781,6 @@ def codevanta_png_diff(left: str, right: str) -> dict[str, Any]:
         A dict with the pixel-diff summary compatible with the MCP schema.
     """
     from codevanta.analysis.png_diff import pixel_diff
-    from pathlib import Path
 
     left_img = Path(left)
     right_img = Path(right)

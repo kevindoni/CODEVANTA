@@ -62,6 +62,7 @@ Guarantees
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,7 +70,7 @@ from typing import Any, Literal
 
 from codevanta.analysis import emulate
 from codevanta.core.functions import discover_functions
-from codevanta.core.loader import BinaryInfo, BinaryLoader
+from codevanta.core.loader import BinaryInfo, BinaryLoader, SectionInfo
 from codevanta.core.report import AnalysisError
 from codevanta.evidence.confidence import Confidence
 from codevanta.evidence.models import Evidence
@@ -84,12 +85,17 @@ __all__ = [
     "MAX_STRINGS_PER_FUNCTION",
     "MAX_VALUE_CHARS",
     "MIN_STRING_CHARS",
+    "MIN_XOR_RUN_CHARS",
     "MAX_WARNINGS",
     "FunctionScan",
+    "RecoveredString",
     "StackString",
     "StackStringReport",
+    "StackStringResult",
     "StackStringEncoding",
+    "StackStringMethod",
     "extract_stack_strings",
+    "scan_static_strings",
 ]
 
 
@@ -839,3 +845,412 @@ def extract_stack_strings(
         instruction_limit,
         string_limit,
     )
+
+
+# ---- static byte-pattern scanning (no emulator required) ---------------------
+#
+# The emulated path above is the ground truth (the bytes provably appeared in
+# emulated stack memory), but it needs the optional unicorn engine. The scans
+# below are pure file-byte pattern matching, always available offline:
+#
+# * ``stack_store``: sequences of ``mov byte ptr [rsp|rbp+N], imm8`` stores in
+#   executable sections, reconstructed into strings byte by byte -- the static
+#   twin of what the emulator observes dynamically.
+# * ``xor_decode``: printable runs that appear under a single-byte XOR key in
+#   section bytes, i.e. strings obfuscated with the classic
+#   ``xor byte ptr [buf], key`` loop. Every hit names its key; when the code
+#   also carries an ``xor r/m8, imm8`` opcode with the same key the confidence
+#   is medium, otherwise low (pure data coincidence).
+
+#: Methods a :class:`StackStringResult` can report.
+StackStringMethod = Literal["stack_store", "xor_decode"]
+
+#: Strings kept in one :class:`StackStringResult`.
+MAX_RESULT_STRINGS = 64
+
+#: Longest section window (bytes) scanned for byte-store patterns.
+MAX_PATTERN_SCAN_BYTES = 0x100000
+
+#: Longest section window (bytes) single-byte-XOR scanned per section.
+MAX_XOR_SCAN_BYTES = 0x10000
+
+#: Shortest printable run accepted for XOR-decoded candidates (stricter than
+#: :data:`MIN_STRING_CHARS` because random bytes decode to printable runs
+#: under some key by coincidence).
+MIN_XOR_RUN_CHARS = 6
+
+#: Most XOR-decoded candidates kept before confidence re-ranking.
+MAX_XOR_CANDIDATES = 4096
+
+#: Evidence identity for the static scans.
+_EVIDENCE_SOURCE_STATIC = "stackstrings.static"
+
+#: ``mov byte ptr [rsp+disp8], imm8`` and ``mov byte ptr [rbp+disp8], imm8``
+#: (the rsp form carries the ``24`` SIB byte, the rbp form does not).
+_MOV_STORE_PATTERNS: tuple[tuple[re.Pattern[bytes], bool], ...] = (
+    (re.compile(rb"\xc6\x44\x24(.)(.)", re.DOTALL), False),
+    (re.compile(rb"\xc6\x45(.)(.)", re.DOTALL), False),
+    (re.compile(rb"\xc6\x84\x24(....)(.)", re.DOTALL), True),
+    (re.compile(rb"\xc6\x85(....)(.)", re.DOTALL), True),
+)
+
+#: ``xor byte ptr [rsp|rbp+disp{8,32}], imm8`` (same SIB split as the stores).
+_XOR_IMM_PATTERNS: tuple[tuple[re.Pattern[bytes], bool], ...] = (
+    (re.compile(rb"\x80\x74\x24(.)(.)", re.DOTALL), False),
+    (re.compile(rb"\x80\x75(.)(.)", re.DOTALL), False),
+    (re.compile(rb"\x80\xb4\x24(....)(.)", re.DOTALL), True),
+    (re.compile(rb"\x80\xb5(....)(.)", re.DOTALL), True),
+)
+
+#: Longest code-gap (bytes) between two consecutive byte stores of one run:
+#: each ``mov`` is 4-8 bytes, so a much bigger gap means a different buffer.
+_MAX_STORE_GAP = 32
+
+
+@dataclass(frozen=True)
+class RecoveredString:
+    """One string reconstructed from static file bytes.
+
+    Attributes:
+        value: The decoded characters (cut at :data:`MAX_VALUE_CHARS`).
+        section: Name of the section the bytes came from.
+        offset: File offset of the first byte of the run.
+        evidence: Provenance for the recovery.
+    """
+
+    value: str
+    section: str
+    offset: int
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict (offset becomes a hex string)."""
+        return {
+            "value": self.value,
+            "section": self.section,
+            "offset": f"0x{self.offset:x}",
+            "evidence": self.evidence.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class StackStringResult:
+    """The bounded outcome of one static scan method over one binary.
+
+    Attributes:
+        strings: Kept records, bounded by :data:`MAX_RESULT_STRINGS`.
+        method: Which scan produced them (``stack_store`` or
+            ``xor_decode``).
+        confidence: Confidence for the whole result (the strongest per-record
+            confidence; byte-immediate stores are strong, XOR decoding is
+            weaker and says so).
+        truncated: True when more strings matched than the cap kept.
+        evidence: Provenance for the whole scan.
+    """
+
+    strings: tuple[RecoveredString, ...]
+    method: StackStringMethod
+    confidence: Confidence
+    truncated: bool
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict."""
+        return {
+            "strings": [record.to_dict() for record in self.strings],
+            "string_count": len(self.strings),
+            "method": self.method,
+            "confidence": self.confidence.value,
+            "truncated": self.truncated,
+            "evidence": self.evidence.to_dict(),
+        }
+
+
+def _section_windows(
+    path: Path, info: BinaryInfo, limit: int
+) -> list[tuple[SectionInfo, bytes, int]]:
+    """Read a bounded window of every file-backed section once.
+
+    Returns ``(section, bytes, window_offset)`` triples; ``window_offset`` is
+    the file offset of the first returned byte. Sections are visited in loader
+    order and each window is capped at ``limit`` bytes.
+    """
+    windows: list[tuple[SectionInfo, bytes, int]] = []
+    with open(path, "rb") as handle:
+        for section in info.sections:
+            # ``raw_size`` is a PE concept; ELF sections carry their length in
+            # ``size`` and file-backedness is decided by ``va_to_offset`` (the
+            # same check the emulated path uses), which also rejects NOBITS.
+            if section.size <= 0:
+                continue
+            if info.va_to_offset(section.virtual_address) is None:
+                continue
+            length = min(section.size, limit)
+            handle.seek(section.offset)
+            data = handle.read(length)
+            if len(data) < length:
+                continue
+            windows.append((section, data, section.offset))
+    return windows
+
+
+def _stack_store_candidates(data: bytes) -> list[tuple[int, int, str]]:
+    """Collect ``(code_offset, displacement, char)`` byte-store immediates."""
+    found: list[tuple[int, int, str]] = []
+    for pattern, wide in _MOV_STORE_PATTERNS:
+        for match in pattern.finditer(data):
+            disp_bytes = match.group(1)
+            imm = match.group(2)[0]
+            if not 0x20 <= imm <= 0x7E:
+                continue
+            disp = int.from_bytes(disp_bytes, "little") if wide else disp_bytes[0]
+            found.append((match.start(), disp, chr(imm)))
+    found.sort(key=lambda item: (item[1], item[0]))
+    return found
+
+
+def _runs_from_stores(
+    stores: list[tuple[int, int, str]],
+) -> list[tuple[int, str]]:
+    """Stitch consecutive-displacement stores into ``(offset, value)`` runs.
+
+    Stores sorted by displacement form a string when each next displacement
+    is exactly one higher and sits close in the code (within
+    :data:`_MAX_STORE_GAP` bytes of the previous store). Runs shorter than
+    :data:`MIN_STRING_CHARS` are dropped.
+    """
+    runs: list[tuple[int, str]] = []
+    buffer = ""
+    start = 0
+    previous_disp: int | None = None
+    previous_offset: int | None = None
+    for offset, disp, char in stores:
+        consecutive = (
+            previous_disp is not None
+            and disp == previous_disp + 1
+            and offset - (previous_offset or 0) <= _MAX_STORE_GAP
+        )
+        if consecutive:
+            buffer += char
+        else:
+            if len(buffer) >= MIN_STRING_CHARS:
+                runs.append((start, buffer))
+            buffer = char
+            start = offset
+        previous_disp = disp
+        previous_offset = offset
+    if len(buffer) >= MIN_STRING_CHARS:
+        runs.append((start, buffer))
+    return runs
+
+
+def _xor_imm_keys(data: bytes) -> set[int]:
+    """Immediate keys used by ``xor r/m8, imm8`` opcodes in ``data``."""
+    keys: set[int] = set()
+    for pattern, _wide in _XOR_IMM_PATTERNS:
+        for match in pattern.finditer(data):
+            key = match.group(2)[0]
+            if key:
+                keys.add(key)
+    return keys
+
+
+def _xor_candidates(data: bytes) -> list[tuple[int, int, int, str]]:
+    """Find printable runs under every single-byte XOR key.
+
+    Returns ``(start, length, key, value)`` tuples, longest-first, overlapping
+    runs removed (the longest run wins its span), capped at
+    :data:`MAX_XOR_CANDIDATES` before the caller bounds the output.
+    """
+    best: dict[int, tuple[int, int, str]] = {}
+    printable = frozenset(range(0x20, 0x7F))
+    run_re = re.compile(rb"[\x20-\x7e]{%d,}" % MIN_XOR_RUN_CHARS)
+    for key in range(1, 256):
+        table = bytes(
+            (byte ^ key) if (byte ^ key) in printable else 0
+            for byte in range(256)
+        )
+        decoded = data.translate(table)
+        for match in run_re.finditer(decoded):
+            length = match.end() - match.start()
+            previous = best.get(match.start())
+            if previous is None or length > previous[0]:
+                best[match.start()] = (length, key, match.group().decode("ascii"))
+    candidates = sorted(
+        (
+            (start, length, key, value)
+            for start, (length, key, value) in best.items()
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )[:MAX_XOR_CANDIDATES]
+    kept: list[tuple[int, int, int, str]] = []
+    spans: list[tuple[int, int]] = []
+    for start, length, key, value in candidates:
+        if any(start < end and start + length > begin for begin, end in spans):
+            continue
+        kept.append((start, length, key, value))
+        spans.append((start, start + length))
+    return kept
+
+
+def _static_record(
+    value: str,
+    section: SectionInfo,
+    window_offset: int,
+    in_window_offset: int,
+    method: str,
+    confidence: Confidence,
+    detail: str,
+) -> RecoveredString:
+    """Build one :class:`RecoveredString` with its evidence record."""
+    return RecoveredString(
+        value=value[:MAX_VALUE_CHARS],
+        section=section.name,
+        offset=window_offset + in_window_offset,
+        evidence=Evidence(
+            source=_EVIDENCE_SOURCE_STATIC,
+            method=method,
+            confidence=confidence,
+            detail=detail,
+            extra={
+                "section": section.name,
+                "virtual_address": f"0x{section.virtual_address + in_window_offset:x}",
+            },
+        ),
+    )
+
+
+def scan_static_strings(
+    path: Path, *, max_strings: int = MAX_RESULT_STRINGS
+) -> tuple[StackStringResult, ...]:
+    """Recover stack-constructed and XOR-obfuscated strings statically.
+
+    Pure file-byte pattern matching over the loaded binary's sections -- no
+    emulator is needed and nothing is executed:
+
+    * ``stack_store``: byte-by-byte ``mov byte ptr [rsp|rbp+N], imm8`` stores
+      in executable sections are stitched back into strings (high confidence:
+      the characters are literal file bytes).
+    * ``xor_decode``: printable runs under a single-byte XOR key in section
+      bytes, each hit carrying its key; medium confidence when the code also
+      carries a matching ``xor r/m8, imm8`` opcode, low otherwise.
+
+    Args:
+        path: Binary to analyse (only its bytes are read).
+        max_strings: Strings kept per result (1..:data:`MAX_RESULT_STRINGS`);
+            the cut is reported through ``truncated``, never silently.
+
+    Returns:
+        Up to two :class:`StackStringResult` records (``stack_store`` first,
+        then ``xor_decode``), only for methods that found at least one string.
+
+    Raises:
+        AnalysisError: ``max_strings`` is out of range, or the loader cannot
+            parse the file (:class:`~codevanta.core.loader.BinaryLoadError`).
+    """
+    limit = _validated_limit("max_strings", max_strings, MAX_RESULT_STRINGS)
+    loaded = Path(path)
+    info = BinaryLoader().load(loaded)
+
+    # -- stack_store ---------------------------------------------------------
+    store_records: list[RecoveredString] = []
+    seen_values: set[str] = set()
+    code_sections = 0
+    for section, data, window_offset in _section_windows(
+        loaded, info, MAX_PATTERN_SCAN_BYTES
+    ):
+        if not section.is_executable:
+            continue
+        code_sections += 1
+        for in_window_offset, value in _runs_from_stores(
+            _stack_store_candidates(data)
+        ):
+            if value in seen_values:
+                continue
+            seen_values.add(value)
+            store_records.append(
+                _static_record(
+                    value,
+                    section,
+                    window_offset,
+                    in_window_offset,
+                    "mov_imm8_store_scan",
+                    Confidence.HIGH,
+                    "printable run of mov byte ptr [rsp|rbp+N], imm8 stores",
+                )
+            )
+            if len(store_records) >= limit:
+                break
+        if len(store_records) >= limit:
+            break
+    results: list[StackStringResult] = []
+    if store_records:
+        results.append(
+            StackStringResult(
+                strings=tuple(store_records[:limit]),
+                method="stack_store",
+                confidence=Confidence.HIGH,
+                truncated=len(store_records) >= limit,
+                evidence=Evidence(
+                    source=_EVIDENCE_SOURCE_STATIC,
+                    method="mov_imm8_store_scan",
+                    confidence=Confidence.HIGH,
+                    detail=(
+                        "reconstructed from literal mov byte ptr imm8 stores "
+                        f"in {code_sections} executable section(s)"
+                    ),
+                ),
+            )
+        )
+
+    # -- xor_decode ----------------------------------------------------------
+    xor_keys: set[int] = set()
+    for section, data, _window_offset in _section_windows(
+        loaded, info, MAX_PATTERN_SCAN_BYTES
+    ):
+        if section.is_executable:
+            xor_keys |= _xor_imm_keys(data)
+    xor_records: list[RecoveredString] = []
+    for section, data, window_offset in _section_windows(
+        loaded, info, MAX_XOR_SCAN_BYTES
+    ):
+        if len(xor_records) >= limit:
+            break
+        for start, _length, key, value in _xor_candidates(
+            data[:MAX_XOR_SCAN_BYTES]
+        ):
+            if len(xor_records) >= limit:
+                break
+            backed = key in xor_keys
+            xor_records.append(
+                _static_record(
+                    value,
+                    section,
+                    window_offset,
+                    start,
+                    "xor_single_byte_scan",
+                    Confidence.MEDIUM if backed else Confidence.LOW,
+                    f"printable run under single-byte xor key 0x{key:02x}"
+                    + (" backed by an xor r/m8, imm8 opcode" if backed else ""),
+                )
+            )
+    if xor_records:
+        strongest = max(record.evidence.confidence for record in xor_records)
+        results.append(
+            StackStringResult(
+                strings=tuple(xor_records[:limit]),
+                method="xor_decode",
+                confidence=strongest,
+                truncated=len(xor_records) >= limit,
+                evidence=Evidence(
+                    source=_EVIDENCE_SOURCE_STATIC,
+                    method="xor_single_byte_scan",
+                    confidence=strongest,
+                    detail=(
+                        "printable runs under single-byte xor keys; "
+                        f"{len(xor_keys)} distinct xor-imm8 opcode key(s) in code"
+                    ),
+                ),
+            )
+        )
+    return tuple(results)

@@ -4923,5 +4923,56 @@ def main() -> None:
     app()
 
 
+@app.command(name="doctor")
+def doctor() -> None:
+    """Check the CODEVANTA install: Python version, build tools, coding agents,
+    and the rebuild root directory. Mirrors ``craft-anything-cli doctor``."""
+    from codevanta.cli.rebuild import _default_root
+
+    console = Console()
+    console.print("[bold]CODEVANTA doctor[/]\n")
+
+    ok = True
+
+    # Python version
+    import sys
+    py = sys.version.split()[0]
+    console.print(f"Python: {py}")
+    console.print("  [green]ok[/]")
+
+    # Build tools
+    import shutil
+    for tool in ("cc", "gcc", "clang", "python", "python3"):
+        found = shutil.which(tool) is not None
+        console.print(f"Build tool '{tool}': {'[green]ok[/]' if found else '[yellow]not found[/]'}")
+    if not any(shutil.which(t) for t in ("cc", "gcc", "clang")):
+        console.print("  [dim]no C compiler found; C builds unavailable, Python builds still work[/]")
+
+    # Coding agents
+    for agent in ("claude", "copilot", "grok"):
+        found = shutil.which(agent) is not None
+        console.print(f"Agent '{agent}': {'[green]ok[/]' if found else '[dim]not installed[/]'}")
+    if not any(shutil.which(a) for a in ("claude", "copilot", "grok")):
+        console.print("  [dim]no coding agent found; installs: claude (Anthropic), copilot (GitHub), grok (xAI)[/]")
+
+    # Rebuild root
+    root = _default_root()
+    console.print(f"Rebuild root: {root} ({'exists' if root.exists() else 'will be created on first use'})")
+
+    # CODEVANTA package
+    import importlib.util
+    if importlib.util.find_spec("codevanta") is not None:
+        console.print("CODEVANTA package: [green]ok[/] (importable)")
+    else:
+        console.print("CODEVANTA package: [red]not importable[/]")
+        ok = False
+
+    if ok:
+        console.print("\n[green]All checks passed.[/]")
+    else:
+        console.print("\n[yellow]Some checks failed — see above.[/]")
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     main()

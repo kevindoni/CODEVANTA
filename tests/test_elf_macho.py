@@ -388,7 +388,7 @@ def test_elf32be_section_fallback(tmp_path: Path) -> None:
 
 
 def test_elf_malformed(tmp_path: Path) -> None:
-    with pytest.raises(AnalysisError, match="missing ELF magic"):
+    with pytest.raises(AnalysisError, match="file not found"):
         elf_dynamic.inspect_elf_dynamic(tmp_path / "ghost.so")
     plain = tmp_path / "plain.so"
     plain.write_bytes(b"MZELFnotreally" * 4)
@@ -401,38 +401,45 @@ def test_elf_malformed(tmp_path: Path) -> None:
     # NEEDED without STRTAB.
     nostrtab = tmp_path / "nostrtab.so"
     entries = _dyn_entry64(DT["NEEDED"], 1) + _dyn_entry64(0, 0)
-    phdrs = _phdr64(2, 176, SECTION_VA + 176, len(entries))
+    # The entries physically sit right after ehdr (64) + one phdr (56) = 120.
+    phdrs = _phdr64(2, 120, SECTION_VA + 120, len(entries))
     nostrtab.write_bytes(_elf_header(is64=True, phnum=1, phoff=64) + phdrs + entries)
     with pytest.raises(AnalysisError, match="DT_NEEDED present without DT_STRTAB"):
         elf_dynamic.inspect_elf_dynamic(nostrtab)
-    # STRTAB mapped nowhere.
+    # STRTAB mapped nowhere: no PT_LOAD covers 0x900000, so the VA->offset
+    # walk finds nothing and the read is refused before any bytes are touched.
     badstrtab = tmp_path / "badstrtab.so"
     entries2 = (
         _dyn_entry64(DT["NEEDED"], 1)
         + _dyn_entry64(DT["STRTAB"], 0x900000)
         + _dyn_entry64(0, 0)
     )
-    phdrs2 = _phdr64(2, 176, SECTION_VA + 176, len(entries2))
+    phdrs2 = _phdr64(2, 120, SECTION_VA + 120, len(entries2))
     badstrtab.write_bytes(_elf_header(is64=True, phnum=1, phoff=64) + phdrs2 + entries2)
     with pytest.raises(AnalysisError, match="DT_STRTAB VA"):
         elf_dynamic.inspect_elf_dynamic(badstrtab)
-    # Unterminated dynamic string.
+    # Unterminated dynamic string: the PT_LOAD covers a 300-byte run with no
+    # NUL byte inside the bounded scan window, so the read is refused as
+    # unterminated rather than silently decoding past the table.
     unterminated = tmp_path / "unterminated.so"
-    dynstr = b"\x00no-terminator"
+    dynstr = b"A" * 300
     entries3 = (
-        _dyn_entry64(DT["NEEDED"], 1)
+        _dyn_entry64(DT["NEEDED"], 0)
         + _dyn_entry64(DT["STRTAB"], SECTION_VA + 176)
         + _dyn_entry64(0, 0)
     )
     blob = dynstr + entries3
-    phdrs3 = _phdr64(2, 176, SECTION_VA + 176, len(blob))
-    unterminated.write_bytes(_elf_header(is64=True, phnum=1, phoff=64) + phdrs3 + blob)
+    phdrs3 = (
+        _phdr64(1, 176, SECTION_VA + 176, len(dynstr))
+        + _phdr64(2, 176 + len(dynstr), SECTION_VA + 176 + len(dynstr), len(entries3))
+    )
+    unterminated.write_bytes(_elf_header(is64=True, phnum=2, phoff=64) + phdrs3 + blob)
     with pytest.raises(AnalysisError, match="unterminated dynamic string"):
         elf_dynamic.inspect_elf_dynamic(unterminated)
     # Dynamic blob that holds zero entries before DT_NULL.
     nullonly = tmp_path / "nullonly.so"
     entries4 = _dyn_entry64(0, 0)
-    phdrs4 = _phdr64(2, 176, SECTION_VA + 176, len(entries4))
+    phdrs4 = _phdr64(2, 120, SECTION_VA + 120, len(entries4))
     nullonly.write_bytes(_elf_header(is64=True, phnum=1, phoff=64) + phdrs4 + entries4)
     with pytest.raises(AnalysisError, match="no entries before DT_NULL"):
         elf_dynamic.inspect_elf_dynamic(nullonly)

@@ -70,7 +70,14 @@ __all__ = [
     "NODE_BUILTINS",
     "PackageFacts",
     "SKIP_DIRS",
+    "SourceMapResult",
+    "MAX_BEAUTIFY_OUTPUT_CHARS",
+    "MAX_SOURCEMAP_MAPPINGS",
+    "MAX_SOURCEMAP_SOURCES",
     "analyze_javascript_app",
+    "beautify_javascript",
+    "looks_minified",
+    "parse_source_map",
 ]
 
 #: Hard ceiling on file rows kept in one report. The walk keeps counting
@@ -830,4 +837,336 @@ def _finish(
         truncated=bool(state["truncated"]),
         warnings=tuple(warnings),
         evidence=evidence,
+    )
+
+
+# ---- minified-JS beautifier ----------------------------------------------------
+#
+# A bounded, dependency-free reformatter for minified bundles. It is *not* a
+# parser: it inserts newlines after ``;`` ``{`` ``}`` outside strings,
+# template literals and comments, and indents by brace depth. Renaming,
+# dead-code lifting and scope analysis are out of scope (that is what the
+# Wakaru bridge is for); this is the readable-diff helper that always works
+# offline.
+
+#: Hard ceiling on beautifier output (characters); larger bundles are cut and
+#: the cut is marked with a trailing comment, never silently.
+MAX_BEAUTIFY_OUTPUT_CHARS = 1_000_000
+
+#: Average line length above which a file is considered minified.
+MINIFIED_AVG_LINE_CHARS = 240
+
+#: Lines above which a file is considered minified even with short lines.
+_MINIFIED_MIN_LINES = 400
+
+
+def looks_minified(text: str) -> bool:
+    """Heuristic: True when the text looks like minified JavaScript.
+
+    True when the average line length exceeds
+    :data:`MINIFIED_AVG_LINE_CHARS` and the file has fewer than
+    :data:`_MINIFIED_MIN_LINES` lines (a big well-formatted file has many
+    short lines; a minified bundle is one giant line).
+    """
+    lines = text.splitlines()
+    if len(lines) >= _MINIFIED_MIN_LINES:
+        return False
+    total = sum(len(line) for line in lines)
+    average = total / max(len(lines), 1)
+    return average > MINIFIED_AVG_LINE_CHARS
+
+
+def beautify_javascript(
+    text: str,
+    *,
+    indent: str = "  ",
+    max_output_chars: int = MAX_BEAUTIFY_OUTPUT_CHARS,
+) -> str:
+    """Reformat minified JavaScript into readable lines (bounded).
+
+    Newlines are inserted after ``;`` and around braces -- but only outside
+    string literals, template literals, line comments and block comments, so
+    string contents pass through untouched. Brace depth drives indentation.
+    Regex literals are *not* lexed: a ``;`` inside ``/.../ `` is split like
+    code (this is a reformatter, not a parser; the Wakaru bridge owns real
+    transformation). The output is capped at ``max_output_chars``; the cut is
+    marked with a trailing ``/* codevanta: truncated */`` comment.
+
+    Args:
+        text: The (possibly minified) source.
+        indent: One indentation step (default two spaces).
+        max_output_chars: Ceiling on returned characters (positive); a cut
+            output ends with an explicit truncation marker.
+
+    Returns:
+        The reformatted source.
+
+    Raises:
+        AnalysisError: ``max_output_chars`` is not a positive int.
+    """
+    if isinstance(max_output_chars, bool) or not isinstance(max_output_chars, int):
+        raise AnalysisError("max_output_chars must be an int")
+    if max_output_chars < 1:
+        raise AnalysisError("max_output_chars must be >= 1")
+    lines: list[str] = []
+    depth = 0
+    line: list[str] = []
+    state = "\0"  # previous character (escape tracking)
+    in_string: str | None = None  # the active quote character, if any
+    in_line_comment = False
+    in_block_comment = False
+    for char in text:
+        if in_line_comment:
+            if char == "\n":
+                in_line_comment = False
+                lines.append(indent * depth + "".join(line).rstrip())
+                line = []
+            else:
+                line.append(char)
+            continue
+        if in_block_comment:
+            line.append(char)
+            if state == "*" and char == "/":
+                in_block_comment = False
+                lines.append(indent * depth + "".join(line).rstrip())
+                line = []
+            state = char
+            continue
+        if in_string is not None:
+            line.append(char)
+            if state == "\\":
+                pass  # escaped character: stays inside the literal
+            elif char == in_string:
+                in_string = None
+            elif char == "\n":
+                # Unterminated string: bail out of string state honestly.
+                in_string = None
+            state = char
+            continue
+        if char in "\"'`":
+            in_string = char
+            line.append(char)
+            state = char
+            continue
+        if char == "/" and line and line[-1] == "/":
+            line.pop()
+            line.append("//")
+            in_line_comment = True
+            state = "/"
+            continue
+        if char == "*" and line and line[-1] == "/":
+            line[-1] = "/*"
+            in_block_comment = True
+            state = "*"
+            continue
+        if char == "\n":
+            line.append(" ")
+            state = char
+            continue
+        if char in ";{":
+            line.append(char)
+            lines.append(indent * depth + "".join(line).rstrip())
+            line = []
+            if char == "{":
+                depth += 1
+            state = char
+            continue
+        if char == "}":
+            if line:
+                lines.append(indent * depth + "".join(line).rstrip())
+                line = []
+            depth = max(depth - 1, 0)
+            lines.append(indent * depth + "}")
+            state = char
+            continue
+        line.append(char)
+        state = char
+    if line:
+        lines.append(indent * depth + "".join(line).rstrip())
+    output = "\n".join(lines)
+    if len(output) > max_output_chars:
+        output = (
+            output[:max_output_chars].rstrip() + "\n/* codevanta: truncated */"
+        )
+    return output
+
+
+# ---- source map parser ---------------------------------------------------------
+#
+# Standard source-map v3 JSON: ``sources`` names original files, ``mappings``
+# is a base64-VLQ stream (lines separated by ``;``, segments by ``,``; each
+# segment is 1, 4 or 5 VLQ fields). This module decodes the segment stream
+# enough to count mappings and validate the structure -- full position
+# resolution is a later lane's job -- and keeps the original file list.
+
+#: Sources kept in one :class:`SourceMapResult`.
+MAX_SOURCEMAP_SOURCES = 64
+
+#: Segments decoded per map (hard bound; the cut is reported).
+MAX_SOURCEMAP_MAPPINGS = 200_000
+
+#: Base64 alphabet used by the VLQ encoding.
+_B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+_B64_INDEX = {char: index for index, char in enumerate(_B64_CHARS)}
+
+#: VLQ continuation bit (5 payload bits per base64 digit).
+_VLQ_CONTINUATION = 0b100000
+
+_EVIDENCE_SOURCE_MAP = "javascript.sourcemap"
+
+
+@dataclass(frozen=True)
+class SourceMapResult:
+    """The decoded inventory of one source map.
+
+    Attributes:
+        sources: Original file paths as named by the map (bounded by
+            :data:`MAX_SOURCEMAP_SOURCES`; ``null`` entries are skipped and
+            the cut is reported).
+        mappings_count: Number of decoded mapping segments (honest total even
+            past the decode cap).
+        original_files: Sorted, deduplicated basenames of ``sources`` --
+            the human-facing list of original files.
+        mappings_truncated: True when decoding stopped at the
+            :data:`MAX_SOURCEMAP_MAPPINGS` budget (the count keeps going).
+        sources_truncated: True when the source list was cut.
+        evidence: Provenance for the parse.
+    """
+
+    sources: tuple[str, ...]
+    mappings_count: int
+    original_files: tuple[str, ...]
+    mappings_truncated: bool = False
+    sources_truncated: bool = False
+    evidence: Evidence | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict."""
+        return {
+            "sources": list(self.sources),
+            "mappings_count": self.mappings_count,
+            "original_files": list(self.original_files),
+            "mappings_truncated": self.mappings_truncated,
+            "sources_truncated": self.sources_truncated,
+            "evidence": self.evidence.to_dict() if self.evidence else None,
+        }
+
+
+def _decode_vlq_segment(segment: str) -> int:
+    """Count the VLQ fields in one mapping segment (structure check).
+
+    A segment is 1, 4 or 5 fields; each field is one or more base64 digits
+    chained by the continuation bit. Malformed input raises.
+    """
+    fields = 0
+    index = 0
+    while index < len(segment):
+        shifted = True
+        while shifted:
+            if index >= len(segment):
+                raise AnalysisError(
+                    "source map mappings end mid-VLQ-field (truncated segment)"
+                )
+            digit = segment[index]
+            value = _B64_INDEX.get(digit)
+            if value is None:
+                raise AnalysisError(
+                    f"source map mappings carry invalid base64 character {digit!r}"
+                )
+            index += 1
+            shifted = bool(value & _VLQ_CONTINUATION)
+        fields += 1
+    if fields not in (1, 4, 5):
+        raise AnalysisError(
+            f"source map segment has {fields} field(s); expected 1, 4 or 5"
+        )
+    return fields
+
+
+def _count_mappings(mappings: str) -> tuple[int, bool]:
+    """Count mapping segments in the ``mappings`` field, bounded.
+
+    Returns ``(total, truncated)``: the total keeps counting past the
+    :data:`MAX_SOURCEMAP_MAPPINGS` budget (honesty over the cap) while
+    decoding/validation stops there; malformed segments beyond the budget
+    are not an error -- they belong to the region nobody will read.
+    """
+    total = 0
+    decoded = 0
+    truncated = False
+    for line in mappings.split(";"):
+        if not line:
+            continue
+        for segment in line.split(","):
+            if not segment:
+                continue
+            total += 1
+            if decoded >= MAX_SOURCEMAP_MAPPINGS:
+                truncated = True
+                continue
+            _decode_vlq_segment(segment)
+            decoded += 1
+    return total, truncated
+
+
+def parse_source_map(text: str) -> SourceMapResult:
+    """Parse a source-map v3 JSON document (base64 VLQ mappings validated).
+
+    Args:
+        text: The ``.map`` file content (JSON with ``sources`` and
+            ``mappings``).
+
+    Returns:
+        The :class:`SourceMapResult` with the original file list, the mapping
+        segment count and the VLQ structure validated within the decode
+        budget.
+
+    Raises:
+        AnalysisError: the JSON is not an object, ``mappings`` is missing or
+            not a string, or the VLQ stream is malformed within the decoded
+            budget.
+    """
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AnalysisError(f"source map is not valid JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise AnalysisError("source map JSON must be an object")
+    mappings = document.get("mappings")
+    if not isinstance(mappings, str):
+        raise AnalysisError("source map is missing a string 'mappings' field")
+    raw_sources = document.get("sources")
+    sources: list[str] = []
+    sources_truncated = False
+    if isinstance(raw_sources, list):
+        for entry in raw_sources:
+            if not isinstance(entry, str):
+                continue
+            if len(sources) >= MAX_SOURCEMAP_SOURCES:
+                sources_truncated = True
+                break
+            sources.append(entry)
+    count, mappings_truncated = _count_mappings(mappings)
+    original_files = tuple(
+        sorted({posixpath.basename(source) for source in sources if source})
+    )
+    return SourceMapResult(
+        sources=tuple(sources),
+        mappings_count=count,
+        original_files=original_files,
+        mappings_truncated=mappings_truncated,
+        sources_truncated=sources_truncated,
+        evidence=Evidence(
+            source=_EVIDENCE_SOURCE_MAP,
+            method="vlq_decode",
+            confidence=Confidence.HIGH
+            if not mappings_truncated
+            else Confidence.MEDIUM,
+            detail=(
+                f"{count} mapping segment(s) decoded"
+                + (" (decode budget reached)" if mappings_truncated else "")
+                + f"; {len(sources)} original source(s)"
+            ),
+            extra={"version": document.get("version")},
+        ),
     )

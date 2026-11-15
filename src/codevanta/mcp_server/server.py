@@ -1751,6 +1751,39 @@ def build_server() -> MCPServer:
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
+    @server.tool(
+        description=(
+            "Auto-detect container formats in one file, offline and pure "
+            "Python: WebAssembly module sections, GGUF tensor metadata, "
+            "safetensors headers, pcap/pcapng capture summaries, EVM bytecode "
+            "opcodes and a firmware magic sweep over the raw bytes. Formats "
+            "that do not match stay out of the summary; a file matching "
+            "nothing is a valid empty detection, never an error. Read-only; "
+            "nothing is executed."
+        )
+    )
+    def codevanta_containers(path: str) -> dict:
+        try:
+            return tools.codevanta_containers(path)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Compare two PNG screenshots pixel by pixel: changed-pixel "
+            "ratio, per-channel mean absolute delta and a verdict "
+            "(identical / minor / major) using documented thresholds. "
+            "Different dimensions short-circuit to major with a warning "
+            "because no aligned comparison exists. Pure-Python PNG decode; "
+            "nothing is executed."
+        )
+    )
+    def codevanta_png_diff(left: str, right: str) -> dict:
+        try:
+            return tools.codevanta_png_diff(left, right)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
     return server
 
 

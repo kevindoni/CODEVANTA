@@ -220,17 +220,26 @@ def _write_evidence(
     project_dir: Path,
     kind: str,
     payload: dict[str, Any],
+    confidence: str | None = None,
+    coverage: str | None = None,
+    limitations: str | None = None,
 ) -> Path:
     """Append one evidence record to investigation.cany/evidence.jsonl."""
     ev_dir = _evidence_dir(project_dir)
     ev_dir.mkdir(parents=True, exist_ok=True)
     path = ev_dir / "evidence.jsonl"
-    record = {
+    record: dict[str, Any] = {
         "id": uuid.uuid4().hex[:8],
         "kind": kind,
         "created_at": _now_iso(),
         "payload": payload,
     }
+    if confidence is not None:
+        record["confidence"] = confidence
+    if coverage is not None:
+        record["coverage"] = coverage
+    if limitations is not None:
+        record["limitations"] = limitations
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     return path
@@ -529,6 +538,14 @@ def build_project(
             "warning_count": len(warnings),
             "capture": str(capture_path.relative_to(project_dir)),
         },
+        confidence="medium",
+        coverage="surface" if mode == "clean-room" else "deep",
+        limitations=(
+            "clean-room mode: only surface inspection; no code or files read "
+            "inside the target"
+        )
+        if mode == "clean-room"
+        else "deep mode: reads code and files inside the target; for private use only",
     )
     return record
 
@@ -1609,6 +1626,118 @@ def rebuild_inbox(
     console.print(f"[green]inbox item {question_id} answered[/]")
 
 
-# Backwards-compatible top-level command name `rebuild` maps to `start` via the
-# sub-app registration in cli/main.py (app.add_typer(app, name="rebuild")).
-# The `start` command is the default entry point for a new project.
+@app.command(name="make")
+def rebuild_make(
+    target: Annotated[str, typer.Argument(help="Target to study: a local file, directory or URL")],
+    request: Annotated[
+        str, typer.Argument(help="What to build, e.g. 'Recreate this website in React'")
+    ],
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            help="Study mode: 'clean-room' (surface only, default) or 'deep' (all analysis tools)",
+        ),
+    ] = "clean-room",
+    project_folder: Annotated[
+        Path | None, typer.Option("--project-folder", help="Project root directory")
+    ] = None,
+    existing: Annotated[
+        str | None,
+        typer.Option(
+            "--existing",
+            help="How to treat an existing project: 'skip-study' (reuse, don't restudy) or 'edit' (keep and rebuild)",
+        ),
+    ] = None,
+    max_attempts: Annotated[
+        int, typer.Option("--max-attempts", help="Maximum build→check iterations")
+    ] = 5,
+) -> None:
+    """Study a target and run the Build → Check → Improve loop in one command.
+
+    Mirrors ``craft-anything-cli rebuild <target> "<description>"``: runs the
+    Study step, scaffolds the project, generates code into ``app/``, checks it
+    against the original, and repeats until identical or ``--max-attempts`` is
+    reached. Marks the project ``ready`` on success.
+
+    Use ``--existing skip-study`` to reuse an already-studied project without
+    restudying the target. Use ``--project-folder`` to choose where the
+    project directory is created.
+    """
+    root = Path(project_folder) if project_folder else _default_root()
+
+    if existing == "skip-study":
+        # Reuse an already-studied project: find it by target+request under root.
+        record = get_project(target, root=root) if len(target) <= 40 else None
+        if record is None:
+            # Try matching by target string among existing projects.
+            for cand in list_projects(root=root):
+                if cand.target == target:
+                    record = cand
+                    break
+        if record is None:
+            console.print(
+                f"[bold red]error:[/] no existing project found for target "
+                f"{target!r} under {root}. Run without --existing first."
+            )
+            raise typer.Exit(code=2)
+        project_id = record.id
+        console.print(
+            f"[dim]Reusing existing project {project_id} (study skipped).[/]"
+        )
+    else:
+        record = build_project(target, request, mode=mode, root=root)
+        project_id = record.id
+
+        project_dir = _project_dir(root, project_id)
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(style="bold cyan")
+        grid.add_column()
+        grid.add_row("Project", record.id)
+        grid.add_row("Name", record.name)
+        grid.add_row("Target", record.target)
+        grid.add_row("Request", record.request)
+        grid.add_row("Mode", record.mode)
+        grid.add_row("Status", record.status)
+        grid.add_row("Directory", str(project_dir))
+        console.print(Panel(grid, title="CODEVANTA · rebuild project created"))
+
+        console.print("\n[bold]Study entries:[/]")
+        _print_study_entries(record.study_entries)
+
+    console.print(
+        f"\n[bold]Running Build → Check → Improve loop "
+        f"(max {max_attempts} attempts)...[/]"
+    )
+    summary = _attempt_auto_build(project_id, root=root, max_attempts=max_attempts)
+
+    console.print(
+        Panel(
+            f"[bold]{summary['id']}[/]\n"
+            f"status: {summary['status']}\n"
+            f"attempts: {summary['attempts']}\n"
+            f"identical: {'yes' if summary['identical'] else 'no'}",
+            title="CODEVANTA · rebuild make",
+        )
+    )
+
+    if summary.get("last_verify"):
+        v = summary["last_verify"]
+        if v.get("ok"):
+            console.print("[green]Build artifact compiled/ran successfully.[/]")
+            if v.get("output"):
+                console.print(f"[dim]output: {v['output'][:200]}[/]")
+        else:
+            console.print(f"[yellow]Build artifact had issues: {v.get('error')}[/]")
+
+    if summary["identical"]:
+        console.print("[green]Build matches original — project is ready.[/]")
+    else:
+        console.print(
+            "[yellow]Build did not match original within "
+            f"{max_attempts} attempts.[/]"
+        )
+        console.print(
+            "[dim]Review app/ and checks/, adjust, then run build-auto again "
+            "or mark ready manually.[/]"
+        )

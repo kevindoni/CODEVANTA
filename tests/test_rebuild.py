@@ -547,3 +547,66 @@ def test_verify_build_artifact_unsupported(tmp_path: Path) -> None:
     result = _verify_build_artifact(file)
     assert result["ok"] is False
     assert "unsupported" in result["error"]
+
+
+# ---- evidence confidence / coverage / limitations -----------------------------
+
+
+def test_write_evidence_with_metadata(tmp_path: Path) -> None:
+    from codevanta.cli.rebuild import _write_evidence
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    _write_evidence(
+        project_dir,
+        "study",
+        {"target": "example.exe"},
+        confidence="medium",
+        coverage="deep",
+        limitations="deep mode: reads code inside the target",
+    )
+    ev_file = project_dir / "investigation.cany" / "evidence.jsonl"
+    assert ev_file.is_file()
+    line = ev_file.read_text(encoding="utf-8").strip()
+    record = json.loads(line)
+    assert record["confidence"] == "medium"
+    assert record["coverage"] == "deep"
+    assert record["limitations"] == "deep mode: reads code inside the target"
+
+
+# ---- make command -------------------------------------------------------------
+
+
+def test_rebuild_make_clean_room_then_auto_build(tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    from codevanta.cli.rebuild import app as rebuild_app
+
+    runner = CliRunner()
+    result = runner.invoke(
+        rebuild_app,
+        [
+            "make",
+            str(tmp_path / "target.json"),
+            "Recreate this in Python",
+            "--mode",
+            "clean-room",
+            "--project-folder",
+            str(tmp_path / "rebuilds"),
+            "--max-attempts",
+            "3",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Build → Check → Improve loop" in result.output
+
+
+def test_doctor_runs() -> None:
+    from typer.testing import CliRunner
+
+    from codevanta.cli.main import app
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "CODEVANTA doctor" in result.output
+    assert "Python:" in result.output
