@@ -1,4 +1,4 @@
-"""CycloneDX 1.6 SBOM export over the CODEVANTA inventories (pure stdlib).
+"""CycloneDX 1.6 + SPDX 2.3 SBOM export over the CODEVANTA inventories (stdlib).
 
 Turns what the other lanes have already proved into a Software Bill of
 Materials, inspired by `anchore/syft` but implemented with the Python
@@ -11,12 +11,21 @@ standard library only (``json``, ``hashlib``, ``uuid``, ``pathlib``):
   purl ``pkg:npm/<name>@<version>`` is emitted only when ``package.json``
   declares an *exact* version for that package -- ranges such as ``^1.2.3``
   are demands, not facts, and never become versions.
+* **Package manager manifests** found next to the inputs -- npm
+  ``package.json``, pip ``requirements.txt``, cargo ``Cargo.toml``, go
+  ``go.mod`` and maven ``pom.xml`` -- contribute one component per declared
+  dependency, again with versions only when they are exact.
 * **Binaries** (PE / ELF / Mach-O / DEX, through
   :class:`~codevanta.core.loader.BinaryLoader`) contribute one ``library``
   component per imported dynamic library named by the import inventory and
   one ``application`` component for the file itself, carrying the SHA-256 of
   its bytes. Versions are never claimed for binaries: the import table does
   not know one.
+
+The aggregate exports in two document formats (:func:`export_sbom` returns
+the typed :class:`SbomExport`): CycloneDX 1.6 (``to_dict()``) and SPDX 2.3
+JSON (``to_spdx_dict()``). SPDX output carries a fixed epoch ``created``
+timestamp so the byte-identical-output guarantee also holds there.
 
 Guarantees:
 
@@ -49,10 +58,11 @@ import hashlib
 import json
 import re
 import uuid
+import xml.etree.ElementTree
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import codevanta
 from codevanta.analysis.asar import extract_file
@@ -65,16 +75,43 @@ from codevanta.evidence.models import Evidence
 __all__ = [
     "DEFAULT_MAX_COMPONENTS",
     "EVIDENCE_SOURCE",
+    "EXPORT_FORMATS",
     "MAX_COMPONENTS",
+    "MAX_EXPORT_PACKAGES",
     "MAX_WARNINGS",
+    "SPDX_VERSION",
     "SPEC_VERSION",
+    "PackageManager",
+    "PackageManagerHit",
     "SbomComponent",
+    "SbomExport",
+    "SbomExportPackage",
     "SbomReport",
     "build_sbom",
+    "detect_package_managers",
+    "export_sbom",
 ]
 
 #: CycloneDX specification version emitted by this module.
 SPEC_VERSION = "1.6"
+
+#: SPDX specification version emitted by :meth:`SbomReport.to_spdx_dict`.
+SPDX_VERSION = "SPDX-2.3"
+
+#: Fixed ``creationInfo.created`` timestamp for SPDX documents: the module's
+#: determinism guarantee (byte-identical output for identical inputs) also
+#: applies to SPDX, whose ``created`` field is mandatory -- so it is the
+#: epoch, honestly fixed, never the wall clock.
+SPDX_CREATED = "1970-01-01T00:00:00Z"
+
+#: Document formats :func:`export_sbom` accepts, in stable order.
+EXPORT_FORMATS: tuple[str, ...] = ("cyclonedx", "spdx")
+
+#: Packages kept in one :class:`SbomExport` (hard bound; the cut is reported).
+MAX_EXPORT_PACKAGES = 128
+
+#: Package managers whose manifests this module detects and parses.
+PackageManager = Literal["npm", "pip", "cargo", "go", "maven"]
 
 #: Hard ceiling accepted for ``max_components``.
 MAX_COMPONENTS = 20_000
@@ -90,6 +127,28 @@ EVIDENCE_SOURCE = "sbom.export"
 
 #: purl prefix for npm packages.
 _NPM_PURL_PREFIX = "pkg:npm/"
+
+#: purl prefixes per package manager (purl spec type slugs).
+_PURL_PREFIXES: dict[str, str] = {
+    "npm": "pkg:npm/",
+    "pip": "pkg:pypi/",
+    "cargo": "pkg:cargo/",
+    "go": "pkg:golang/",
+    "maven": "pkg:maven/",
+}
+
+#: Manifest file names mapped to their package manager, checked at the root
+#: of every directory input (deterministic sorted-key order when scanning).
+MANIFEST_FILES: dict[str, PackageManager] = {
+    "package.json": "npm",
+    "requirements.txt": "pip",
+    "Cargo.toml": "cargo",
+    "go.mod": "go",
+    "pom.xml": "maven",
+}
+
+#: PEP 503 name normalisation for pip requirements (``Foo_bar.baz`` -> ``foo-baz``).
+_PEP503_RE = re.compile(r"[-_.]+")
 
 #: Deterministic UUID namespace for serial numbers ("codevanta").
 _UUID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "codevanta")
@@ -156,6 +215,59 @@ class SbomComponent:
         ]
         return data
 
+    def to_spdx_dict(self, index: int) -> dict[str, Any]:
+        """The JSON-safe SPDX 2.3 package fragment for this component.
+
+        ``index`` numbers the SPDX ID deterministically. Licenses are
+        ``NOASSERTION`` everywhere: the inventories this module aggregates do
+        not carry license facts, and SPDX forbids inventing them.
+        """
+        data: dict[str, Any] = {
+            "name": self.name,
+            "SPDXID": f"SPDXRef-Package-{index}",
+            "downloadLocation": "NOASSERTION",
+            "filesAnalyzed": False,
+            "licenseConcluded": "NOASSERTION",
+            "licenseDeclared": "NOASSERTION",
+            "copyrightText": "NOASSERTION",
+        }
+        if self.version is not None:
+            data["versionInfo"] = self.version
+        if self.sha256 is not None:
+            data["checksums"] = [{"algorithm": "SHA256", "checksumValue": self.sha256}]
+        if self.purl is not None:
+            data["externalRefs"] = [
+                {
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": self.purl,
+                }
+            ]
+        return data
+
+
+@dataclass(frozen=True)
+class PackageManagerHit:
+    """One detected package-manager manifest.
+
+    Attributes:
+        manager: The package manager the manifest belongs to.
+        manifest: Path of the manifest file, as given.
+        evidence: Provenance for the detection.
+    """
+
+    manager: PackageManager
+    manifest: str
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict."""
+        return {
+            "manager": self.manager,
+            "manifest": self.manifest,
+            "evidence": self.evidence.to_dict(),
+        }
+
 
 @dataclass(frozen=True)
 class SbomReport:
@@ -199,6 +311,106 @@ class SbomReport:
         emitted in insertion order (``sort_keys=False``)."""
         return json.dumps(self.to_dict(), indent=2)
 
+    def to_spdx_dict(self) -> dict[str, Any]:
+        """The same inventory as an SPDX 2.3 JSON document (deterministic).
+
+        Package order matches :attr:`components`; SPDX IDs are
+        ``SPDXRef-Package-<n>`` and the document DESCRIBES every package. The
+        ``documentNamespace`` derives from the CycloneDX serial UUID, so the
+        same inputs produce the same namespace. ``creationInfo.created`` is
+        the fixed epoch (see :data:`SPDX_CREATED`) -- never a wall-clock
+        timestamp.
+        """
+        serial_uuid = self.serial_number.removeprefix("urn:uuid:")
+        packages = [
+            component.to_spdx_dict(index)
+            for index, component in enumerate(self.components, start=1)
+        ]
+        relationships = [
+            {
+                "spdxElementId": "SPDXRef-DOCUMENT",
+                "relationshipType": "DESCRIBES",
+                "relatedSpdxElement": f"SPDXRef-Package-{index}",
+            }
+            for index in range(1, len(self.components) + 1)
+        ]
+        return {
+            "spdxVersion": SPDX_VERSION,
+            "dataLicense": "CC0-1.0",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "name": "codevanta-sbom",
+            "documentNamespace": f"urn:codevanta:spdx:{serial_uuid}",
+            "creationInfo": {
+                "created": SPDX_CREATED,
+                "creators": ["Tool: codevanta"],
+            },
+            "packages": packages,
+            "relationships": relationships,
+        }
+
+    def to_spdx_json(self) -> str:
+        """The SPDX document as pretty JSON (insertion order preserved)."""
+        return json.dumps(self.to_spdx_dict(), indent=2)
+
+
+@dataclass(frozen=True)
+class SbomExportPackage:
+    """One bounded, typed package row of a :class:`SbomExport`.
+
+    Attributes:
+        name: Package name.
+        version: Exact version when known, else ``None``.
+        licenses: Declared license identifiers; the inventories aggregated
+            here carry none, so this is ``("NOASSERTION",)`` unless a future
+            source adds facts.
+    """
+
+    name: str
+    version: str | None
+    licenses: tuple[str, ...] = ("NOASSERTION",)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict."""
+        data: dict[str, Any] = {"name": self.name, "licenses": list(self.licenses)}
+        if self.version is not None:
+            data["version"] = self.version
+        return data
+
+
+@dataclass(frozen=True)
+class SbomExport:
+    """A typed, format-tagged SBOM export (CycloneDX or SPDX).
+
+    Attributes:
+        format: ``"cyclonedx"`` or ``"spdx"``.
+        packages: Typed package rows, bounded by
+            :data:`MAX_EXPORT_PACKAGES`.
+        licenses: Sorted union of every package's license identifiers.
+        truncated: True when the component list was cut to the package cap.
+        document: The format-native JSON-safe document (CycloneDX 1.6 or
+            SPDX 2.3).
+        evidence: Provenance for the export.
+    """
+
+    format: str
+    packages: tuple[SbomExportPackage, ...]
+    licenses: tuple[str, ...]
+    truncated: bool
+    document: dict[str, Any]
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict (the native document included)."""
+        return {
+            "format": self.format,
+            "packages": [package.to_dict() for package in self.packages],
+            "package_count": len(self.packages),
+            "licenses": list(self.licenses),
+            "truncated": self.truncated,
+            "document": self.document,
+            "evidence": self.evidence.to_dict(),
+        }
+
 
 def build_sbom(
     paths: Sequence[Path], *, max_components: int = DEFAULT_MAX_COMPONENTS
@@ -236,8 +448,15 @@ def build_sbom(
             raise AnalysisError(f"cannot stat {path}: {exc}") from exc
         if path.is_dir():
             components, digest = _js_components(path, is_asar=False, warnings=warnings)
+            manifest_components, manifest_digest = _manifest_components(
+                path, warnings
+            )
+            components.extend(manifest_components)
+            digest = _composite_digest(digest, manifest_digest)
         elif path.suffix.lower() == ".asar" and path.is_file():
             components, digest = _js_components(path, is_asar=True, warnings=warnings)
+        elif path.is_file() and path.name in MANIFEST_FILES:
+            components, digest = _manifest_components(path, warnings)
         elif path.is_file():
             components, digest = _binary_components(path, warnings=warnings)
         else:
@@ -387,6 +606,360 @@ def _dependency_versions(manifest: dict[str, Any] | None) -> dict[str, str]:
     return versions
 
 
+# ---- package manager manifests ------------------------------------------------
+
+
+def detect_package_managers(root: Path) -> tuple[PackageManagerHit, ...]:
+    """Detect package-manager manifests at ``root`` (offline, bounded).
+
+    A directory is checked for the five known manifests at its root only (no
+    recursion -- package trees can be enormous and nested manifests belong to
+    vendored copies); a file path is recognised when its *name* is a known
+    manifest. Detection is certain: the file exists and carries a canonical
+    manifest name.
+
+    Raises:
+        AnalysisError: ``root`` cannot be stat'ed.
+    """
+    try:
+        root.stat()
+    except OSError as exc:
+        raise AnalysisError(f"cannot stat {root}: {exc}") from exc
+    hits: list[PackageManagerHit] = []
+    if root.is_dir():
+        for name in sorted(MANIFEST_FILES):
+            candidate = root / name
+            if candidate.is_file():
+                hits.append(_manifest_hit(MANIFEST_FILES[name], candidate))
+    elif root.is_file() and root.name in MANIFEST_FILES:
+        hits.append(_manifest_hit(MANIFEST_FILES[root.name], root))
+    return tuple(hits)
+
+
+def _manifest_hit(manager: PackageManager, path: Path) -> PackageManagerHit:
+    """Build the detection record for one manifest file."""
+    return PackageManagerHit(
+        manager=manager,
+        manifest=str(path),
+        evidence=Evidence(
+            source=EVIDENCE_SOURCE,
+            method="manifest_detection",
+            confidence=Confidence.CERTAIN,
+            detail=f"{manager} manifest {path.name!r} exists at the scanned root",
+        ),
+    )
+
+
+#: Hard ceiling on dependencies parsed from one manifest.
+MAX_PER_MANIFEST = 256
+
+
+def _manifest_components(
+    root: Path, warnings: list[str]
+) -> tuple[list[SbomComponent], str]:
+    """Parse every detected manifest under ``root`` into components.
+
+    Returns ``(components, digest)`` where ``digest`` is a SHA-256 over the
+    sorted ``(name, bytes)`` of all manifests found (deterministic; the empty
+    digest when none). Malformed manifests degrade to a warning and no
+    components -- a broken file is not evidence of packages.
+    """
+    collected: list[SbomComponent] = []
+    hasher = hashlib.sha256()
+    for hit in detect_package_managers(root):
+        try:
+            data = _manifest_file_bytes(Path(hit.manifest))
+        except (OSError, AnalysisError) as exc:
+            _warn(warnings, f"manifest {hit.manifest}: cannot read ({exc})")
+            continue
+        hasher.update(hit.manifest.encode("utf-8", "replace"))
+        hasher.update(b"\x00")
+        hasher.update(data)
+        text = _manifest_text(data)
+        if text is None:
+            _warn(warnings, f"manifest {hit.manifest}: not valid UTF-8 text; skipped")
+            continue
+        parsed = _parse_one_manifest(hit.manager, text)
+        if parsed is None:
+            _warn(
+                warnings,
+                f"manifest {hit.manifest}: parse failed; no components derived",
+            )
+            continue
+        source = str(hit.manifest)
+        evidence = _evidence_line(
+            EVIDENCE_SOURCE, f"{hit.manager}_manifest", Confidence.HIGH
+        )
+        for name, version, purl in parsed[:MAX_PER_MANIFEST]:
+            collected.append(
+                SbomComponent(
+                    type="library",
+                    name=name,
+                    evidence=evidence,
+                    version=version,
+                    purl=purl,
+                    sources=(source,),
+                )
+            )
+        if len(parsed) > MAX_PER_MANIFEST:
+            _warn(
+                warnings,
+                f"manifest {hit.manifest}: {len(parsed)} dependencies cut to "
+                f"the {MAX_PER_MANIFEST}-per-manifest budget",
+            )
+    return collected, hasher.hexdigest()
+
+
+def _manifest_file_bytes(path: Path) -> bytes:
+    """Read one manifest file, bounded by :data:`MAX_FILE_BYTES`."""
+    stat = path.stat()
+    if stat.st_size > MAX_FILE_BYTES:
+        raise AnalysisError(
+            f"manifest {path} is larger than the {MAX_FILE_BYTES}-byte budget"
+        )
+    return path.read_bytes()
+
+
+def _manifest_text(data: bytes) -> str | None:
+    """Decode manifest bytes as UTF-8 text, or ``None``."""
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None
+
+
+def _parse_one_manifest(
+    manager: PackageManager, text: str
+) -> list[tuple[str, str | None, str | None]] | None:
+    """Dispatch to the per-manager parser; ``None`` on unusable syntax."""
+    if manager == "npm":
+        return _npm_manifest_packages(text)
+    if manager == "pip":
+        return _pip_manifest_packages(text)
+    if manager == "cargo":
+        return _cargo_manifest_packages(text)
+    if manager == "go":
+        return _go_manifest_packages(text)
+    return _maven_manifest_packages(text)
+
+
+def _manifest_purl(manager: PackageManager, name: str, version: str | None) -> str:
+    """``pkg:<type>/<name>`` plus ``@<version>`` only when exactly known."""
+    prefix = _PURL_PREFIXES[manager]
+    if version is not None:
+        return f"{prefix}{name}@{version}"
+    return f"{prefix}{name}"
+
+
+def _npm_manifest_packages(
+    text: str,
+) -> list[tuple[str, str | None, str | None]] | None:
+    """Parse ``package.json`` dependency sections; ``None`` on bad JSON."""
+    try:
+        manifest = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    packages: list[tuple[str, str | None, str | None]] = []
+    seen: set[str] = set()
+    for section in _DEPENDENCY_SECTIONS:
+        block = manifest.get(section)
+        if not isinstance(block, dict):
+            continue
+        for name, value in block.items():
+            if not isinstance(name, str) or name in seen:
+                continue
+            seen.add(name)
+            version = _exact_version(value)
+            packages.append((name, version, _manifest_purl("npm", name, version)))
+    return packages
+
+
+#: A pip requirement line: distribution name, optional extras, then the
+#: version spec (environment markers were cut before this runs).
+_PIP_REQUIREMENT_RE = re.compile(
+    r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"  # distribution name
+    r"(?:\[[^\]]*\])?"                                 # optional extras
+    r"\s*(.*)$"
+)
+
+
+def _pip_manifest_packages(text: str) -> list[tuple[str, str | None, str | None]]:
+    """Parse ``requirements.txt`` lines into ``(name, version, purl)`` rows.
+
+    Whole-line comments, ``-r``/``-e`` style options and environment markers
+    are skipped; only ``==`` pins become versions -- ranges are demands, not
+    facts, exactly like the npm path.
+    """
+    packages: list[tuple[str, str | None, str | None]] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("-"):
+            continue
+        line = line.split(";", 1)[0].strip()
+        match = _PIP_REQUIREMENT_RE.match(line)
+        if match is None:
+            continue
+        name = _PEP503_RE.sub("-", match.group(1)).lower()
+        if name in seen:
+            continue
+        seen.add(name)
+        rest = match.group(2).strip()
+        version: str | None = None
+        if rest.startswith("=="):
+            version = _exact_version(rest[2:].split(",")[0].strip())
+        packages.append((name, version, _manifest_purl("pip", name, version)))
+    return packages
+
+
+_CARGO_SECTION_RE = re.compile(r"^\[([^\]]+)\]\s*$")
+
+#: Cargo tables consulted (``[target.'cfg(..)'.dependencies]`` is matched by
+#: its last dotted segment, like cargo's own dependency kinds).
+_CARGO_DEPENDENCY_SECTIONS = frozenset(
+    {"dependencies", "dev-dependencies", "build-dependencies"}
+)
+
+
+def _cargo_manifest_packages(text: str) -> list[tuple[str, str | None, str | None]]:
+    """Parse ``Cargo.toml`` dependency tables (line-oriented TOML subset).
+
+    Handles ``name = "1.2"``, ``name = { version = "1.2", features = [...] }``
+    and ``name = { path = "..." }`` (no version). Sections outside the three
+    dependency tables, comments and workspace inheritance are skipped; only
+    exact versions are claimed.
+    """
+    packages: list[tuple[str, str | None, str | None]] = []
+    seen: set[str] = set()
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        header = _CARGO_SECTION_RE.match(line)
+        if header is not None:
+            section = header.group(1).strip().strip("'\"")
+            continue
+        if section.rsplit(".", 1)[-1] not in _CARGO_DEPENDENCY_SECTIONS:
+            continue
+        name, sep, spec = line.partition("=")
+        if not sep:
+            continue
+        name = name.strip().strip("'\"")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        version = _cargo_version(spec.strip().rstrip(","))
+        packages.append((name, version, _manifest_purl("cargo", name, version)))
+    return packages
+
+
+def _cargo_version(spec: str) -> str | None:
+    """Exact version from a cargo dependency spec, or ``None``."""
+    if spec.startswith("{"):
+        inner = spec.strip("{}").strip()
+        match = re.search(r"version\s*=\s*\"([^\"]+)\"", inner)
+        if match is None:
+            return None
+        spec = match.group(1)
+    elif spec.startswith('"') and spec.endswith('"'):
+        spec = spec[1:-1]
+    if "workspace" in spec or "path" in spec:
+        return None
+    return _exact_version(spec)
+
+
+def _go_manifest_packages(
+    text: str,
+) -> list[tuple[str, str | None, str | None]] | None:
+    """Parse ``go.mod`` require blocks; ``None`` when no require exists.
+
+    Both the block form (``require ( ... )``) and single-line requires are
+    handled; ``// indirect`` annotations are stripped. A version is claimed
+    only when the tag is an exact ``v<digits...>`` (no ``+incompatible``
+    fuzz beyond the exact-version rule).
+    """
+    packages: list[tuple[str, str | None, str | None]] = []
+    entries: list[str] = []
+    block = re.search(r"require\s*\(([^)]*)\)", text, re.DOTALL)
+    if block is not None:
+        entries.extend(block.group(1).splitlines())
+        tail = re.sub(r"require\s*\([^)]*\)", "", text, flags=re.DOTALL)
+        entries.extend(re.findall(r"^\s*require\s+\S+\s+\S+", tail, re.MULTILINE))
+    else:
+        if "require" not in text:
+            return None
+        entries.extend(re.findall(r"^\s*require\s+\S+\s+\S+", text, re.MULTILINE))
+    seen: set[str] = set()
+    for entry in entries:
+        entry = entry.split("//", 1)[0].strip()
+        if not entry:
+            continue
+        parts = entry.split()
+        if parts and parts[0] == "require":
+            parts = parts[1:]
+        if len(parts) < 2:
+            continue
+        name, raw_version = parts[0], parts[1]
+        if name in seen:
+            continue
+        seen.add(name)
+        version: str | None = None
+        if raw_version.startswith("v"):
+            stripped = raw_version[1:]
+            if _exact_version(stripped) == stripped:
+                version = stripped
+        packages.append((name, version, _manifest_purl("go", name, version)))
+    return packages
+
+
+def _local_tag(tag: str) -> str:
+    """Strip an XML namespace from a tag (``{ns}dependency`` -> ``dependency``)."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _maven_manifest_packages(
+    text: str,
+) -> list[tuple[str, str | None, str | None]] | None:
+    """Parse ``pom.xml`` ``<dependency>`` entries; ``None`` on bad XML.
+
+    Namespaces are ignored (maven's default POM namespace and none both
+    parse); versions that are Maven property references (``${...}``) are
+    demands, not facts, so they stay unclaimed.
+    """
+    try:
+        tree = xml.etree.ElementTree.fromstring(text)
+    except xml.etree.ElementTree.ParseError:
+        return None
+    packages: list[tuple[str, str | None, str | None]] = []
+    seen: set[str] = set()
+    for element in tree.iter():
+        if _local_tag(element.tag) != "dependency":
+            continue
+        fields = {
+            _local_tag(child.tag): (child.text or "").strip() for child in element
+        }
+        group = fields.get("groupId", "")
+        artifact = fields.get("artifactId", "")
+        if not group or not artifact:
+            continue
+        name = f"{group}:{artifact}"
+        if name in seen:
+            continue
+        seen.add(name)
+        raw_version = fields.get("version", "")
+        version = None
+        if raw_version and not raw_version.startswith("${"):
+            version = _exact_version(raw_version)
+        purl = f"pkg:maven/{group}/{artifact}"
+        if version is not None:
+            purl = f"{purl}@{version}"
+        packages.append((name, version, purl))
+    return packages
+
+
 # ---- binaries ---------------------------------------------------------------
 
 
@@ -519,6 +1092,78 @@ def _serial_number(pairs: set[tuple[str, str]]) -> str:
     """``urn:uuid:<uuid5>`` over the sorted, deduplicated input digests."""
     canonical = json.dumps(sorted(pairs), separators=(",", ":"))
     return f"urn:uuid:{uuid.uuid5(_UUID_NAMESPACE, canonical)}"
+
+
+def _composite_digest(first: str, second: str) -> str:
+    """Deterministic SHA-256 over two hex digests (order matters, is fixed)."""
+    hasher = hashlib.sha256()
+    hasher.update(first.encode("ascii"))
+    hasher.update(b"\x00")
+    hasher.update(second.encode("ascii"))
+    return hasher.hexdigest()
+
+
+def export_sbom(
+    report: SbomReport,
+    *,
+    fmt: str = "cyclonedx",
+    max_packages: int = MAX_EXPORT_PACKAGES,
+) -> SbomExport:
+    """Turn a :class:`SbomReport` into a typed, format-tagged export.
+
+    Args:
+        report: The aggregate to export (``build_sbom`` output).
+        fmt: ``"cyclonedx"`` (default) or ``"spdx"`` -- the native document
+            embedded in the export switches accordingly.
+        max_packages: Ceiling on typed package rows kept
+            (1..:data:`MAX_EXPORT_PACKAGES`); the cut is reported through
+            ``truncated``, never silently.
+
+    Returns:
+        The :class:`SbomExport`; ``to_dict()`` is JSON-safe end to end.
+
+    Raises:
+        AnalysisError: ``fmt`` is not a supported format or ``max_packages``
+            is out of range.
+    """
+    if fmt not in EXPORT_FORMATS:
+        raise AnalysisError(
+            f"unsupported format {fmt!r}; expected one of {', '.join(EXPORT_FORMATS)}"
+        )
+    if isinstance(max_packages, bool) or not isinstance(max_packages, int):
+        raise AnalysisError("max_packages must be an int")
+    if not 1 <= max_packages <= MAX_EXPORT_PACKAGES:
+        raise AnalysisError(
+            f"max_packages must be between 1 and {MAX_EXPORT_PACKAGES}"
+        )
+    kept = report.components[:max_packages]
+    truncated = len(report.components) > max_packages
+    packages = tuple(
+        SbomExportPackage(name=component.name, version=component.version)
+        for component in kept
+    )
+    licenses: tuple[str, ...] = tuple(
+        sorted({license for package in packages for license in package.licenses})
+    )
+    document = (
+        report.to_dict() if fmt == "cyclonedx" else report.to_spdx_dict()
+    )
+    return SbomExport(
+        format=fmt,
+        packages=packages,
+        licenses=licenses,
+        truncated=truncated,
+        document=document,
+        evidence=Evidence(
+            source=EVIDENCE_SOURCE,
+            method="sbom_export",
+            confidence=Confidence.MEDIUM,
+            detail=(
+                f"{fmt} export of {len(report.components)} component(s); "
+                "licenses are NOASSERTION because no aggregated source carries them"
+            ),
+        ),
+    )
 
 
 def _warn(warnings: list[str], message: str) -> None:

@@ -19,7 +19,11 @@ from rich.text import Text
 
 from codevanta.analysis import debug_session, dynamic
 from codevanta.analysis import emulate as emulator
+from codevanta.analysis import pdb_info as pdb_engine
+from codevanta.analysis import replay_fixture as replay_engine
 from codevanta.analysis import sbom as sbom_engine
+from codevanta.analysis import triage_hash as triage_engine
+from codevanta.analysis import yara_subset as yara_engine
 from codevanta.analysis.binary_diff import (
     DEFAULT_MAX_FUNCTIONS as DIFF_MAX_FUNCTIONS,
 )
@@ -151,10 +155,15 @@ from codevanta.cli.il2gpu import app as il2gpu_app
 from codevanta.cli.live import frida_app as frida_app  # lane-live2: ONE import block
 from codevanta.cli.live import lldb_app as lldb_app
 from codevanta.cli.live import rizin_app as rizin_app
-from codevanta.cli.meta import codesign, meta_app  # codesign: lane-format2, registered below
+from codevanta.cli.meta import (  # codesign: lane-format2; deep2_app: lane-depth2, registered below
+    codesign,
+    deep2_app,
+    meta_app,
+)
 from codevanta.cli.mobile import app as mobile_app
 from codevanta.cli.nav import app as nav_app
 from codevanta.cli.obligations import app as obligations_app  # lane-ledger2: ONE import
+from codevanta.cli.rebuild import app as rebuild_app  # rebuild: Study → Build → Check → Ready
 from codevanta.cli.signal import app as signal_app
 from codevanta.cli.web import asar, web_app
 from codevanta.core.disassembler import DisassemblyError
@@ -3047,6 +3056,358 @@ def stackstrings_cmd(
     )
 
 
+@app.command(name="replay-fixture")
+def replay_fixture_cmd(
+    har: Annotated[Path, typer.Argument(help="Path to a HAR (HTTP Archive) recording")],
+    max_entries: Annotated[
+        int, typer.Option("--max-entries", help="Ceiling on normalized entries kept")
+    ] = 500,
+    max_body_bytes: Annotated[
+        int,
+        typer.Option(
+            "--max-body-bytes", help="Bodies at or below this size get a 128-byte preview"
+        ),
+    ] = 262_144,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write the standalone fixture JSON to this file"),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the report JSON instead of a table")
+    ] = False,
+) -> None:
+    """Normalize a HAR recording into a deterministic replay fixture (offline).
+
+    Entries become bounded request/response records (bodies as size + sha256
+    + preview only), and the endpoint manifest collapses paths into templates
+    (``/api/items/42`` -> ``/api/items/{n}``) -- the surface an agent could
+    train or test against. Nothing is served or executed.
+    """
+    try:
+        result = replay_engine.build_replay_fixture(
+            har, max_entries=max_entries, max_body_bytes=max_body_bytes
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if output is not None:
+        try:
+            output.write_text(result.to_fixture_json(), encoding="utf-8")
+        except OSError as exc:
+            _fail(f"cannot write {output}: {exc}", 2)
+        console.print(f"[dim]wrote {escape(str(output))}[/]")
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    summary = result.to_dict()
+    table = Table(title=f"replay fixture · {escape(str(har))}")
+    table.add_column("Endpoint (template)")
+    table.add_column("Method", justify="right")
+    table.add_column("Count", justify="right")
+    table.add_column("Statuses")
+    for endpoint in summary["endpoints"]:
+        statuses = ",".join(
+            f"{status}x{count}" for status, count in sorted(endpoint["statuses"].items())
+        )
+        table.add_row(
+            escape(str(endpoint["path_template"])),
+            escape(str(endpoint["method"])),
+            str(endpoint["count"]),
+            escape(statuses[:48]),
+        )
+    console.print(table)
+    console.print(
+        f"[dim]entries: {summary['summary']['total_entries']}"
+        f" · endpoints: {summary['endpoint_count']}"
+        f" · hosts: {summary['summary']['host_count']}"
+        f" · truncated: {'yes' if summary['truncated'] else 'no'}[/]"
+    )
+    for warning in summary["warnings"]:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    fixture_evidence = summary.get("evidence") or {}
+    console.print(
+        f"[dim]evidence: {escape(str(fixture_evidence.get('source')))} via "
+        f"{escape(str(fixture_evidence.get('method')))} · confidence: "
+        f"{escape(str(fixture_evidence.get('confidence')))}[/]"
+    )
+
+
+@app.command(name="gosymbols")
+def gosymbols_cmd(
+    path: Annotated[Path, typer.Argument(help="Path to the (possibly stripped) Go binary")],
+    max_functions: Annotated[
+        int, typer.Option("--max-functions", help="Ceiling on recovered functions kept")
+    ] = 65_536,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Recover function names from a Go binary's embedded pclntab (offline).
+
+    ``strip`` leaves the pclntab behind because the runtime needs it for
+    stack traces. Walks the go1.2 / 1.16 / 1.18+ / 1.20+ layouts (located by
+    section name, then a bounded magic scan) and reports each function's
+    name, address and - from 1.16 on - file and line when the tables carry
+    them. UPX-compressed or garble-obfuscated tables are out of scope.
+    """
+    from codevanta.analysis.gosymbols import recover_go_symbols
+
+    try:
+        result = recover_go_symbols(path, max_functions=max_functions)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    payload = result.to_dict()
+    if payload["functions"]:
+        table = Table(title=f"go symbols · {escape(str(path))}")
+        table.add_column("Address", justify="right")
+        table.add_column("Function")
+        table.add_column("File:Line")
+        for function in payload["functions"][:200]:
+            location = (
+                f"{function['file']}:{function['line']}"
+                if function.get("file")
+                else "-"
+            )
+            table.add_row(
+                function["address"],
+                escape(function["name"]),
+                escape(location),
+            )
+        console.print(table)
+    else:
+        console.print(f"[green]no functions recovered[/] · {escape(str(path))}")
+    pclntab = payload["pclntab"] or {}
+    console.print(
+        f"[dim]functions: {payload['function_count']}"
+        f" · go: {escape(str(payload['go_version_guess']))}"
+        f" · pclntab: {escape(str(pclntab.get('found_by', '-')))}"
+        f" · truncated: {'yes' if payload['truncated'] else 'no'}[/]"
+    )
+    for warning in payload["warnings"]:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    symbols_evidence = payload.get("evidence") or {}
+    console.print(
+        f"[dim]evidence: {escape(str(symbols_evidence.get('source')))} via "
+        f"{escape(str(symbols_evidence.get('method')))} · confidence: "
+        f"{escape(str(symbols_evidence.get('confidence')))}[/]"
+    )
+
+
+@app.command(name="yara")
+def yara_cmd(
+    target: Annotated[Path, typer.Argument(help="Path to the file to scan")],
+    rules: Annotated[
+        Path,
+        typer.Option("--rules", help="Path to a .yar rules file (bounded subset)"),
+    ],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Match a bounded subset of real YARA rules against a file (offline).
+
+    Supports text strings (``nocase`` / ``wide``), hex strings with ``??``
+    nibble wildcards and bounded ``[n-m]`` jumps, and conditions built from
+    ``and/or/not``, ``$a``, ``#a OP N``, ``filesize OP N`` and
+    ``all of / any of / N of``. Everything else fails with a typed error
+    naming the rule -- never silently ignored. String hits are certain
+    evidence; a satisfied rule is a medium-confidence conclusion.
+    """
+    try:
+        result = yara_engine.match_rules(target, rules_path=rules)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    payload = result.to_dict()
+    if payload["matches"]:
+        table = Table(title=f"yara · {escape(str(target))}")
+        table.add_column("Rule")
+        table.add_column("Strings hit")
+        table.add_column("Offsets")
+        for match in payload["matches"]:
+            offsets = ", ".join(
+                f"{sm['string_id']}@{'/'.join(sm['offsets'][:3])}"
+                for sm in match["string_matches"][:4]
+            )
+            table.add_row(
+                escape(match["rule"]),
+                str(len(match["string_matches"])),
+                escape(offsets or "-"),
+            )
+        console.print(table)
+    else:
+        console.print(f"[green]no rule matched[/] · {escape(str(target))}")
+    console.print(
+        f"[dim]rules evaluated: {payload['rule_count']}"
+        f" · matches: {len(payload['matches'])}"
+        f" · truncated: {'yes' if payload['truncated'] else 'no'}[/]"
+    )
+    for warning in payload["warnings"]:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    yara_report_evidence = payload.get("evidence") or {}
+    console.print(
+        f"[dim]evidence: {escape(str(yara_report_evidence.get('source')))} via "
+        f"{escape(str(yara_report_evidence.get('method')))} · confidence: "
+        f"{escape(str(yara_report_evidence.get('confidence')))}[/]"
+    )
+
+
+@app.command(name="triage")
+def triage_cmd(
+    path: Annotated[Path, typer.Argument(help="Path to the file to hash")],
+    compare: Annotated[
+        Path | None,
+        typer.Option(
+            "--compare", help="Second file: also report the fuzzy similarity score"
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Compute triage hashes: imphash (Mandiant convention) + ssdeep-shaped fuzzy hash.
+
+    The imphash is the exact VirusTotal-pivot hash (MD5 over the lowercase
+    dll.function import list); the fuzzy signature uses the ssdeep piecewise
+    algorithm (block ladder documented in docs/triage-hash.md) and
+    ``--compare`` scores two files 0-100. ELF/Mach-O imphash is refused with
+    a typed error rather than producing a non-interoperable value.
+    """
+    try:
+        result = triage_engine.triage_hashes(path)
+        comparison = (
+            triage_engine.fuzzy_compare(
+                triage_engine.fuzzy_hash_file(path).signature,
+                triage_engine.fuzzy_hash_file(compare).signature,
+            )
+            if compare is not None
+            else None
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        payload = result.to_dict()
+        if comparison is not None:
+            payload["fuzzy_comparison"] = comparison.to_dict()
+        console.print_json(json.dumps(payload))
+        return
+    payload = result.to_dict()
+    table = Table(title=f"triage hashes · {escape(str(path))}")
+    table.add_column("Hash")
+    table.add_column("Value")
+    table.add_row("sha256", escape(payload["sha256"]))
+    table.add_row("imphash", escape(payload["imphash"] or "- (refused, see warnings)"))
+    table.add_row("fuzzy", escape(payload["fuzzy"]["signature"]))
+    if comparison is not None and compare is not None:
+        table.add_row(
+            f"fuzzy vs {compare.name}",
+            f"score {comparison.score}/100"
+            + (" (same file)" if comparison.same_file else ""),
+        )
+    console.print(table)
+    for warning in payload.get("warnings", []):
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    triage_report_evidence = payload.get("evidence") or {}
+    console.print(
+        f"[dim]evidence: {escape(str(triage_report_evidence.get('source')))} via "
+        f"{escape(str(triage_report_evidence.get('method')))} · confidence: "
+        f"{escape(str(triage_report_evidence.get('confidence')))}[/]"
+    )
+
+
+@app.command(name="pdb")
+def pdb_cmd(
+    path: Annotated[
+        Path, typer.Argument(help="Path to a .pdb file (full parse) or a PE binary (CodeView ref)")
+    ],
+    max_streams: Annotated[
+        int, typer.Option("--max-streams", help="Ceiling on stream rows kept")
+    ] = 256,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of tables")
+    ] = False,
+) -> None:
+    """Read PDB information offline: MSF structure, or the PE's CodeView reference.
+
+    A ``.pdb`` input gets the bounded MSF v7 walk (streams, info stream
+    GUID/age/version, named streams, DBI module list). A PE input gets its
+    debug directory's CodeView record -- the PDB path, GUID and age that
+    identify the symbol file. No symbol download, no network, ever.
+    """
+    try:
+        if _looks_like_pdb(path):
+            result: Any = pdb_engine.parse_pdb(path, max_streams=max_streams)
+            payload = result.to_dict()
+            payload["mode"] = "pdb"
+        else:
+            reference = pdb_engine.codeview_reference(path)
+            if reference is None:
+                _fail(f"no CodeView debug record in {path}", 2)
+            payload = reference.to_dict()
+            payload["mode"] = "codeview"
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(payload))
+        return
+    if payload["mode"] == "codeview":
+        table = Table(title=f"codeview reference · {escape(str(path))}")
+        table.add_column("Field")
+        table.add_column("Value")
+        table.add_row("debug type", escape(str(payload["debug_type"])))
+        table.add_row("pdb path", escape(str(payload["pdb_path"])))
+        table.add_row("guid", escape(str(payload["guid"] or "-")))
+        table.add_row("age", str(payload["age"]))
+        console.print(table)
+        ref_evidence = payload.get("evidence") or {}
+        console.print(
+            f"[dim]evidence: {escape(str(ref_evidence.get('source')))} via "
+            f"{escape(str(ref_evidence.get('method')))} · confidence: "
+            f"{escape(str(ref_evidence.get('confidence')))}[/]"
+        )
+        return
+    table = Table(title=f"pdb info · {escape(str(path))}")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("guid", escape(str(payload["guid"] or "-")))
+    table.add_row("age", str(payload["age"]))
+    table.add_row("version", escape(str(payload["pdb_version"] or "-")))
+    table.add_row("block size", str(payload["block_size"]))
+    table.add_row("streams", f"{payload['stream_count']} kept {len(payload['streams'])}")
+    table.add_row("modules", str(payload["module_count"]))
+    console.print(table)
+    names = ", ".join(payload["stream_names"][:8])
+    if names:
+        console.print(f"[dim]named streams: {escape(names)}[/]")
+    modules = ", ".join(m["module_name"] for m in payload["modules"][:8])
+    if modules:
+        console.print(f"[dim]modules: {escape(modules)}[/]")
+    for warning in payload.get("warnings", []):
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    pdb_report_evidence = payload.get("evidence") or {}
+    console.print(
+        f"[dim]evidence: {escape(str(pdb_report_evidence.get('source')))} via "
+        f"{escape(str(pdb_report_evidence.get('method')))} · confidence: "
+        f"{escape(str(pdb_report_evidence.get('confidence')))}[/]"
+    )
+
+
+def _looks_like_pdb(path: Path) -> bool:
+    """True when the file starts with the MSF superblock magic (or is .pdb)."""
+    if path.suffix.lower() == ".pdb":
+        return True
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(len(pdb_engine.MSF_MAGIC))
+    except OSError:
+        return False
+    return head == pdb_engine.MSF_MAGIC
+
+
 # ---- phase 7: analysis plugins ----------------------------------------------
 
 
@@ -3057,6 +3418,7 @@ app.add_typer(signal_app)
 app.add_typer(crash_app, name="crash")
 app.add_typer(mobile_app, name="mobile")
 app.add_typer(nav_app, name="nav")  # lane-nav: ONE registration line for the navigation sub-app
+app.add_typer(rebuild_app, name="rebuild")  # rebuild: Study → Build → Check → Ready
 app.add_typer(obligations_app, name="obligations")  # lane-ledger2: ONE registration line
 # lane-bridge-a: ONE registration block for the bridges lane (capability report
 # plus firmware/pcap/wasm/objdump sub-apps, one loop, deterministic order).
@@ -3495,6 +3857,7 @@ def uninstall(
 session_app = typer.Typer(help="Persisted analysis sessions (SQLite)")
 app.add_typer(session_app, name="session")
 app.add_typer(meta_app, name="metadata")
+app.add_typer(deep2_app, name="deep")  # lane-depth2: ONE registration line for the deep format sub-app
 
 
 @session_app.command("save")
@@ -3668,7 +4031,7 @@ def session_notes(
 # ---- phase 8: typed comparators and the residual-unknown ledger --------------
 
 #: ``bundles`` is the documented extra beyond the required ``functions`` and
-#: ``strings``: the registry grew to twelve offline comparators (JSON
+#: ``strings``: the registry grew to fifteen offline comparators (JSON
 #: document kinds and file-path kinds) reached through
 #: :func:`compare_artifacts`.
 CompareWhat = Literal[
@@ -3684,6 +4047,9 @@ CompareWhat = Literal[
     "firmware",
     "screenshots",
     "har",
+    "sections",
+    "imports",
+    "bridges",
 ]
 CompareFormat = Literal["text", "json"]
 
@@ -4129,6 +4495,109 @@ def _print_compare_warnings(result: Any) -> None:
     )
 
 
+def _print_sections_compare(result: Any) -> None:
+    """Render a :class:`SectionsCompare` result as text tables."""
+    for title, names in (
+        ("Added sections (right-only)", result.added),
+        ("Removed sections (left-only)", result.removed),
+    ):
+        if names:
+            table = Table(title=title)
+            table.add_column("Name")
+            for name in names:
+                table.add_row(escape(name))
+            console.print(table)
+    if result.changed:
+        table = Table(title="Changed sections (size / entropy)")
+        table.add_column("Name")
+        table.add_column("Left size", justify="right")
+        table.add_column("Right size", justify="right")
+        table.add_column("Entropy changed", justify="center")
+        for delta in result.changed:
+            table.add_row(
+                escape(delta.name),
+                str(delta.left_size),
+                str(delta.right_size),
+                "yes" if delta.entropy_changed else "no",
+            )
+        console.print(table)
+    console.print(
+        f"[dim]sections: {result.left_sections} vs {result.right_sections}"
+        f" · changed: {result.changed_count}"
+        f" · verdict: {result.verdict}"
+        f" · identical: {result.identical}[/]"
+    )
+
+
+def _print_imports_compare(result: Any) -> None:
+    """Render an :class:`ImportsCompare` result as text tables."""
+    if result.added_dlls or result.removed_dlls:
+        table = Table(title="Import library diff")
+        table.add_column("Added (right-only)")
+        table.add_column("Removed (left-only)")
+        for index in range(max(len(result.added_dlls), len(result.removed_dlls))):
+            added = result.added_dlls[index] if index < len(result.added_dlls) else "-"
+            removed = (
+                result.removed_dlls[index] if index < len(result.removed_dlls) else "-"
+            )
+            table.add_row(escape(added), escape(removed))
+        console.print(table)
+    if result.changed:
+        table = Table(title="Changed function counts per library")
+        table.add_column("Library")
+        table.add_column("Left", justify="right")
+        table.add_column("Right", justify="right")
+        table.add_column("Delta", justify="right")
+        for delta in result.changed:
+            table.add_row(
+                escape(delta.library),
+                str(delta.left_functions),
+                str(delta.right_functions),
+                str(delta.right_functions - delta.left_functions),
+            )
+        console.print(table)
+    console.print(
+        f"[dim]DLLs: {result.left_dlls} vs {result.right_dlls}"
+        f" · functions: {result.left_functions} vs {result.right_functions}"
+        f" · changed libraries: {result.changed_count}"
+        f" · verdict: {result.verdict}"
+        f" · identical: {result.identical}[/]"
+    )
+
+
+def _print_bridges_compare(result: Any) -> None:
+    """Render a :class:`BridgesCompare` result as text tables."""
+    if result.changes:
+        table = Table(title="Bridge changes")
+        table.add_column("Tool")
+        table.add_column("Kind")
+        table.add_column("Left")
+        table.add_column("Right")
+        for change in result.changes:
+            table.add_row(
+                escape(change.tool),
+                escape(change.kind),
+                escape(
+                    "-"
+                    if change.left_available is None
+                    else str(change.left_available)
+                ),
+                escape(
+                    "-"
+                    if change.right_available is None
+                    else str(change.right_available)
+                ),
+            )
+        console.print(table)
+    console.print(
+        f"[dim]tools: {result.left_tools} vs {result.right_tools}"
+        f" · available: {result.left_available} vs {result.right_available}"
+        f" · changes: {result.change_count}"
+        f" · verdict: {result.verdict}"
+        f" · identical: {result.identical}[/]"
+    )
+
+
 #: Comparator kind -> text renderer for ``codevanta compare`` output.
 _COMPARE_RENDERERS: dict[str, Callable[[Any], None]] = {
     "functions": _print_inventory_compare,
@@ -4143,6 +4612,9 @@ _COMPARE_RENDERERS: dict[str, Callable[[Any], None]] = {
     "firmware": _print_firmware_compare,
     "screenshots": _print_screenshot_compare,
     "har": _print_har_compare,
+    "sections": _print_sections_compare,
+    "imports": _print_imports_compare,
+    "bridges": _print_bridges_compare,
 }
 
 
@@ -4153,8 +4625,9 @@ def compare(
         typer.Argument(
             help=(
                 "Left artifact: a JSON document (analyze report, evidence "
-                "bundle, MetadataReport) or, for wasm/crash/sessions/nav/"
-                "firmware/screenshots/har, the file itself"
+                "bundle, MetadataReport, bridges snapshot) or, for wasm/"
+                "crash/sessions/nav/firmware/screenshots/har/sections/"
+                "imports, the file itself"
             )
         ),
     ],
@@ -4214,8 +4687,10 @@ def compare(
     core dumps with a same_crash_site verdict), ``sessions``/``nav``
     (CODEVANTA session databases), ``firmware`` (raw firmware images),
     ``screenshots`` (8-bit PNG pixel diff with an identical/minor/major
-    verdict) and ``har`` (two HAR captures: entry delta, URL paths,
-    status-code and method histogram diffs).
+    verdict), ``har`` (two HAR captures: entry delta, URL paths,
+    status-code and method histogram diffs), ``sections``/``imports``
+    (two binaries' section/import tables via the loader) and ``bridges``
+    (two bridges_report() JSON snapshots).
     """
     if what not in COMPARE_WHATS:
         _fail(f"invalid --what {what!r}; expected one of {', '.join(COMPARE_WHATS)}", 2)
@@ -4446,6 +4921,57 @@ def unknowns(
 def main() -> None:
     """Console-script entry point."""
     app()
+
+
+@app.command(name="doctor")
+def doctor() -> None:
+    """Check the CODEVANTA install: Python version, build tools, coding agents,
+    and the rebuild root directory. Mirrors ``craft-anything-cli doctor``."""
+    from codevanta.cli.rebuild import _default_root
+
+    console = Console()
+    console.print("[bold]CODEVANTA doctor[/]\n")
+
+    ok = True
+
+    # Python version
+    import sys
+    py = sys.version.split()[0]
+    console.print(f"Python: {py}")
+    console.print("  [green]ok[/]")
+
+    # Build tools
+    import shutil
+    for tool in ("cc", "gcc", "clang", "python", "python3"):
+        found = shutil.which(tool) is not None
+        console.print(f"Build tool '{tool}': {'[green]ok[/]' if found else '[yellow]not found[/]'}")
+    if not any(shutil.which(t) for t in ("cc", "gcc", "clang")):
+        console.print("  [dim]no C compiler found; C builds unavailable, Python builds still work[/]")
+
+    # Coding agents
+    for agent in ("claude", "copilot", "grok"):
+        found = shutil.which(agent) is not None
+        console.print(f"Agent '{agent}': {'[green]ok[/]' if found else '[dim]not installed[/]'}")
+    if not any(shutil.which(a) for a in ("claude", "copilot", "grok")):
+        console.print("  [dim]no coding agent found; installs: claude (Anthropic), copilot (GitHub), grok (xAI)[/]")
+
+    # Rebuild root
+    root = _default_root()
+    console.print(f"Rebuild root: {root} ({'exists' if root.exists() else 'will be created on first use'})")
+
+    # CODEVANTA package
+    import importlib.util
+    if importlib.util.find_spec("codevanta") is not None:
+        console.print("CODEVANTA package: [green]ok[/] (importable)")
+    else:
+        console.print("CODEVANTA package: [red]not importable[/]")
+        ok = False
+
+    if ok:
+        console.print("\n[green]All checks passed.[/]")
+    else:
+        console.print("\n[yellow]Some checks failed — see above.[/]")
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

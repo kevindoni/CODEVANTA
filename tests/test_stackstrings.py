@@ -475,7 +475,7 @@ def test_cli_stackstrings_table_and_json(tmp_path: Path) -> None:
 
     runner = CliRunner()
     sample = _sample(tmp_path, CODE_HELLO_WORLD)
-    result = runner.invoke(cli, ["stackstrings", str(sample)])
+    result = runner.invoke(cli, ["stackstrings", str(sample)], env={"TERM": "dumb"})
     assert result.exit_code == 0, result.output
     assert "ascii" in result.output
 

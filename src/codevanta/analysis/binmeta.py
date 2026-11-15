@@ -32,6 +32,12 @@ detector per format (each returns ``None`` when the format does not match):
 * Desktop app classification (bounded walk: 2000 files, depth 4):
   Unity, IL2CPP, Unreal (``.pak``), Electron (``app.asar``), .NET
   (CLR header directory entry).
+* Depth-2 deep inspectors (lane-depth2): PE resource directory tree with a
+  shallow ``VS_VERSION_INFO`` walk and manifest preview, PE load config
+  (TLS callbacks, Guard CF counts, DEP policy), ELF ``PT_DYNAMIC``
+  (``DT_NEEDED``/RPATH/RUNPATH/SONAME/init-fini arrays), Mach-O dylib load
+  commands, a ``.pyc`` shallow marshal walk (bytecode is never decoded)
+  and a .NET ``#~``/``#Strings`` member-count walk.
 
 Every finding carries :class:`~codevanta.evidence.models.Evidence` with a
 ``meta.*`` source id; ``high`` confidence marks magic-verified parses.
@@ -49,6 +55,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from codevanta.analysis import (
+    elf_dynamic,
+    macho_dylibs,
+    managed_meta,
+    pe_loadconfig,
+    pe_resources,
+    pyc_inspect,
+)
+from codevanta.analysis.elf_dynamic import ElfDynamicSummary
+from codevanta.analysis.macho_dylibs import MachoDylibSummary
+from codevanta.analysis.managed_meta import ManagedMetaSummary
+from codevanta.analysis.pe_loadconfig import PeLoadConfigSummary
+from codevanta.analysis.pe_resources import PeResourceSummary
+from codevanta.analysis.pyc_inspect import PycInspectSummary
 from codevanta.core.report import AnalysisError
 from codevanta.evidence.confidence import Confidence
 from codevanta.evidence.models import Evidence
@@ -2119,6 +2139,71 @@ def detect_cuda_fatbin(path: str | Path) -> CudaFatbinInfo | None:
     )
 
 
+# ---- depth-2 deep format inspectors (lane-depth2) -----------------------------
+
+
+def _head_bytes(p: Path, count: int) -> bytes:
+    """Read the first ``count`` bytes of ``p`` (empty on unreadable paths)."""
+    try:
+        with _open_file(p) as handle:
+            return _read_slice(handle, 0, count)
+    except OSError:
+        return b""
+
+
+def detect_pe_resources(path: str | Path) -> PeResourceSummary | None:
+    """Deep-walk a PE's resource directory. ``None`` when not a PE."""
+    p = Path(path)
+    if p.is_dir() or _head_bytes(p, 2)[:2] != b"MZ":
+        return None
+    return pe_resources.inspect_pe_resources(p)
+
+
+def detect_pe_loadconfig(path: str | Path) -> PeLoadConfigSummary | None:
+    """Deep-read a PE's load config. ``None`` when not a PE."""
+    p = Path(path)
+    if p.is_dir() or _head_bytes(p, 2)[:2] != b"MZ":
+        return None
+    return pe_loadconfig.inspect_pe_load_config(p)
+
+
+def detect_elf_dynamic(path: str | Path) -> ElfDynamicSummary | None:
+    """Deep-read an ELF's dynamic section. ``None`` when not an ELF."""
+    p = Path(path)
+    if p.is_dir() or _head_bytes(p, 4)[:4] != b"\x7fELF":
+        return None
+    return elf_dynamic.inspect_elf_dynamic(p)
+
+
+def detect_macho_dylibs(path: str | Path) -> MachoDylibSummary | None:
+    """Deep-read a Mach-O's dylib load commands. ``None`` when not Mach-O."""
+    p = Path(path)
+    head = b"" if p.is_dir() else _head_bytes(p, 4)
+    (magic,) = struct.unpack("<I", head) if len(head) == 4 else (0,)
+    if magic not in macho_dylibs.MACHO_MAGICS:
+        return None
+    return macho_dylibs.inspect_macho_dylibs(p)
+
+
+def detect_pyc_deep(path: str | Path) -> PycInspectSummary | None:
+    """Shallow-walk a ``.pyc``'s top-level code tables. ``None`` when not a pyc."""
+    p = Path(path)
+    if p.is_dir():
+        return None
+    head = _head_bytes(p, 4)
+    if len(head) < 4 or head[2:4] != b"\r\n" or head[0] == 0 and head[1] == 0:
+        return None
+    return pyc_inspect.inspect_pyc_code(p)
+
+
+def detect_managed_meta(path: str | Path) -> ManagedMetaSummary | None:
+    """Shallow-walk a .NET assembly's metadata. ``None`` when not a managed PE."""
+    p = Path(path)
+    if p.is_dir() or _head_bytes(p, 2)[:2] != b"MZ":
+        return None
+    return managed_meta.inspect_managed_metadata(p)
+
+
 # ---- auto-detecting entry point ----------------------------------------------
 
 _KIND_PRIORITY: tuple[tuple[str, str], ...] = (
@@ -2134,6 +2219,14 @@ _KIND_PRIORITY: tuple[tuple[str, str], ...] = (
     ("electron-fuses", "electron-fuses"),
     ("kernel-module", "kernel-module"),
     ("elf-notes", "elf-notes"),
+    # lane-depth2: deep format inspectors sort below the header-only kinds so
+    # e.g. a .pyc still reports kind "python-pyc" while also gaining "pyc-deep".
+    ("pe-resources", "pe-resources"),
+    ("pe-loadconfig", "pe-loadconfig"),
+    ("elf-dynamic", "elf-dynamic"),
+    ("macho-dylibs", "macho-dylibs"),
+    ("managed-meta", "managed-meta"),
+    ("pyc-deep", "pyc-deep"),
 )
 
 
@@ -2208,6 +2301,28 @@ def inspect_metadata(path: str | Path) -> MetadataReport:
     if notes is not None:
         results["elf-notes"] = notes.to_dict()
         evidence.append(notes.evidence)
+    # lane-depth2: deep format inspectors (one result key per detector). A deep
+    # parser may legitimately refuse a file whose magic passed the cheap gate
+    # but whose body is minimal or malformed -- a header-only .pyc, an ELF
+    # without PT_DYNAMIC, a bare MZ blob. This best-effort auto-report join
+    # degrades to "section absent" there; the strict raising contract belongs
+    # to the direct deep tools (codevanta_pe_deep, codevanta_elf_macho, ...),
+    # which keep their typed errors.
+    for key, detector in (
+        ("pe-resources", detect_pe_resources),
+        ("pe-loadconfig", detect_pe_loadconfig),
+        ("elf-dynamic", detect_elf_dynamic),
+        ("macho-dylibs", detect_macho_dylibs),
+        ("managed-meta", detect_managed_meta),
+        ("pyc-deep", detect_pyc_deep),
+    ):
+        try:
+            summary = detector(p)
+        except AnalysisError:
+            continue
+        if summary is not None:
+            results[key] = summary.to_dict()
+            evidence.append(summary.evidence)
     if not results:
         raise AnalysisError(f"unrecognized file format: {p} ({size} bytes)")
     kind = next(report_kind for key, report_kind in _KIND_PRIORITY if key in results)

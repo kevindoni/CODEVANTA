@@ -45,7 +45,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 from codevanta.analysis.asar import extract_file, list_archive
 from codevanta.analysis.javascript import (
@@ -80,6 +80,11 @@ __all__ = [
     "SKIP_DIRS",
     "SNIPPET_MAX_CHARS",
     "audit_electron_app",
+    "build_audit_result",
+    "ElectronAuditResult",
+    "ElectronCheck",
+    "CheckStatus",
+    "OverallSecurity",
 ]
 
 #: Hard ceiling on findings kept in one report. Counting continues beyond it
@@ -798,4 +803,213 @@ def _finish(
         role_counts=role_counts,
         js_file_count=inventory.file_count,
         js_truncated=inventory.truncated,
+    )
+
+
+# ---- the typed audit result (checks + overall verdict) ------------------------
+#
+# The finding list above is forensic (one row per rule hit per file line).
+# Consumers that need a verdict get the rollup below: named checks in a fixed
+# order (the BrowserWindow security knobs, CSP, preload) plus one check per
+# additional rule that fired, and an overall ``good`` / ``warning`` / ``bad``.
+
+#: Per-check status.
+CheckStatus = Literal["pass", "warning", "fail"]
+
+#: Overall security verdict of an :class:`ElectronAuditResult`.
+OverallSecurity = Literal["good", "warning", "bad"]
+
+#: Checks kept in one :class:`ElectronAuditResult` (hard bound).
+MAX_AUDIT_CHECKS = 16
+
+#: Fixed check order: the BrowserWindow security knobs first, then CSP.
+_CORE_CHECKS: tuple[tuple[str, str], ...] = (
+    ("nodeIntegration", "EA-001"),
+    ("contextIsolation", "EA-002"),
+    ("sandbox", "EA-003"),
+    ("webSecurity", "EA-004"),
+    ("csp", "EA-010"),
+)
+
+
+@dataclass(frozen=True)
+class ElectronCheck:
+    """One named security check rolled up from the finding list.
+
+    Attributes:
+        name: Stable check name (``nodeIntegration``, ``csp``, a rule id for
+            non-core rules, ...).
+        status: ``pass`` (no findings), ``fail`` (the check's rule fired) or
+            ``warning`` (present-but-weak signal, e.g. no preload script).
+        detail: One-line human explanation.
+        evidence: Provenance for the rollup decision.
+    """
+
+    name: str
+    status: CheckStatus
+    detail: str
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict."""
+        return {
+            "name": self.name,
+            "status": self.status,
+            "detail": self.detail,
+            "evidence": self.evidence.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class ElectronAuditResult:
+    """The bounded, typed verdict over one Electron audit.
+
+    Attributes:
+        checks: Named checks, bounded by :data:`MAX_AUDIT_CHECKS`; the core
+            BrowserWindow/CSP checks come first, then preload, then extra
+            fired rules in rule-id order. The cut is reported, never silent.
+        overall_security: ``bad`` when any check failed, ``warning`` when
+            only warnings or medium+ findings remain, ``good`` otherwise.
+        truncated: True when more checks matched than the cap kept.
+        evidence: Provenance for the whole result.
+    """
+
+    checks: tuple[ElectronCheck, ...]
+    overall_security: OverallSecurity
+    truncated: bool
+    evidence: Evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict."""
+        return {
+            "checks": [check.to_dict() for check in self.checks],
+            "check_count": len(self.checks),
+            "overall_security": self.overall_security,
+            "truncated": self.truncated,
+            "evidence": self.evidence.to_dict(),
+        }
+
+
+def _check(
+    name: str,
+    status: CheckStatus,
+    detail: str,
+    extra: dict[str, Any] | None = None,
+) -> ElectronCheck:
+    """Build one rollup check with its evidence record."""
+    return ElectronCheck(
+        name=name,
+        status=status,
+        detail=detail,
+        evidence=Evidence(
+            source=EVIDENCE_SOURCE,
+            method="finding_rollup",
+            confidence=Confidence.HIGH,
+            detail=detail,
+            extra=extra or {},
+        ),
+    )
+
+
+def build_audit_result(report: ElectronAuditReport) -> ElectronAuditResult:
+    """Roll a report's findings up into named checks and one verdict.
+
+    The fixed core checks read the finding set (a check fails when its rule
+    fired anywhere in the app); the ``csp`` check passes when EA-010 (missing
+    CSP) did not fire. The ``preload`` check uses the inventory context: it
+    passes when at least one file was classified as a preload/mixed script
+    and warns otherwise -- a missing preload is not a vulnerability by
+    itself, but it usually means capabilities reach the renderer through
+    ``nodeIntegration`` or broad IPC. Every additional rule that fired
+    becomes one ``fail`` check in rule-id order, capped at
+    :data:`MAX_AUDIT_CHECKS`.
+    """
+    fired: set[str] = {finding.rule_id for finding in report.findings}
+    checks: list[ElectronCheck] = []
+    for name, rule_id in _CORE_CHECKS:
+        if rule_id in fired:
+            severity = next(
+                (
+                    finding.severity
+                    for finding in report.findings
+                    if finding.rule_id == rule_id
+                ),
+                "unknown",
+            )
+            checks.append(
+                _check(
+                    name,
+                    "fail",
+                    f"{rule_id}: misconfiguration literal in the sources "
+                    f"(severity {severity})",
+                    {"rule_id": rule_id},
+                )
+            )
+        elif name == "csp":
+            checks.append(_check(name, "pass", "a CSP marker was found in the app"))
+        else:
+            checks.append(
+                _check(name, "pass", f"{rule_id} not found: setting not weakened")
+            )
+    preload_files = report.role_counts.get("preload", 0) + report.role_counts.get(
+        "mixed", 0
+    )
+    if preload_files:
+        checks.append(
+            _check(
+                "preload",
+                "pass",
+                f"{preload_files} preload/mixed script(s) detected by the "
+                "inventory roles",
+                {"preload_files": preload_files},
+            )
+        )
+    else:
+        checks.append(
+            _check(
+                "preload",
+                "warning",
+                "no preload script detected: renderer capabilities likely come "
+                "from nodeIntegration or direct ipcRenderer use",
+            )
+        )
+    core_rule_ids = {rule_id for _name, rule_id in _CORE_CHECKS}
+    for rule_id in sorted(fired - core_rule_ids):
+        checks.append(
+            _check(
+                rule_id,
+                "fail",
+                f"{rule_id}: {RULES_BY_ID[rule_id].title.lower()}",
+                {"rule_id": rule_id},
+            )
+        )
+    truncated = len(checks) > MAX_AUDIT_CHECKS
+    kept = checks[:MAX_AUDIT_CHECKS]
+    any_fail = any(check.status == "fail" for check in kept)
+    if any_fail:
+        overall: OverallSecurity = "bad"
+    elif any(check.status == "warning" for check in kept) or report.summary.get(
+        "medium", 0
+    ) or report.summary.get("high", 0):
+        overall = "warning"
+    else:
+        overall = "good"
+    return ElectronAuditResult(
+        checks=tuple(kept),
+        overall_security=overall,
+        truncated=truncated,
+        evidence=Evidence(
+            source=EVIDENCE_SOURCE,
+            method="finding_rollup",
+            confidence=Confidence.HIGH,
+            detail=(
+                f"{len(report.findings)} finding(s) rolled up into {len(kept)} "
+                f"check(s); verdict {overall}"
+                + (" (check list cut)" if truncated else "")
+            ),
+            extra={
+                "finding_count": report.finding_count,
+                "summary": dict(sorted(report.summary.items())),
+            },
+        ),
     )

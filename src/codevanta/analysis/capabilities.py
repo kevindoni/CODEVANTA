@@ -28,6 +28,7 @@ the binary bytes and an optional JSON rule file.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Sequence
@@ -44,7 +45,10 @@ from codevanta.evidence.models import Evidence
 __all__ = [
     "BUILTIN_RULES",
     "BinaryFeatureSet",
+    "CAPABILITY_DOMAINS",
+    "Capability",
     "CapabilityMatch",
+    "CapabilityProfile",
     "CapabilityReport",
     "DEFAULT_STRING_LIMIT",
     "Feature",
@@ -58,6 +62,7 @@ __all__ = [
     "ImportRef",
     "MAX_CHILDREN",
     "MAX_LOCATIONS_PER_FEATURE",
+    "MAX_PROFILE_EVIDENCE",
     "MAX_STRING_LIMIT",
     "MAX_TREE_DEPTH",
     "MIN_STRING_LIMIT",
@@ -67,6 +72,7 @@ __all__ = [
     "detect_capabilities",
     "evaluate_feature",
     "load_rules",
+    "profile_capabilities",
 ]
 
 #: Allowed rule severities, ordered most to least severe.
@@ -1127,6 +1133,364 @@ def detect_capabilities(
         matches=tuple(matches),
         rule_count=len(rules),
         skipped_counts=skipped_counts,
+        warnings=tuple(warnings),
+        truncated=truncated,
+        evidence=evidence,
+    )
+
+
+# ---- domain capability profile (lane-cap2) ------------------------------------
+#
+# A second, deliberately coarse detector next to the rule engine above.
+# ``profile_capabilities`` scans the raw file bytes for eight fixed marker
+# sets and answers eight fixed questions: [network] (socket/winsock/curl/
+# reqwest/hyper URLs), [crypto] (bcrypt/crypt32/aes/rsa/sha patterns),
+# [file_system] (fopen/CreateFile/read/write patterns), [process]
+# (CreateProcess/exec/ptrace patterns), [registry] (RegOpenKey/RegQueryValue),
+# [service] (OpenSCManager/StartService), [gui] (CreateWindow/user32/cairo)
+# and [dynamic_loading] (dlopen/GetProcAddress/lazy_static). Each domain
+# reports ``detected`` plus at most eight evidence strings and a
+# high/medium confidence; the report carries a deterministic 0-100 risk
+# score over dangerous domain combinations. Markers are matched
+# case-insensitively over the whole (capped) file -- an inference from
+# file-scope evidence, hence medium report confidence.
+
+#: The eight fixed capability domains, in report order.
+CAPABILITY_DOMAINS: tuple[str, ...] = (
+    "network",
+    "crypto",
+    "file_system",
+    "process",
+    "registry",
+    "service",
+    "gui",
+    "dynamic_loading",
+)
+
+#: Lower-cased byte markers per domain as ``(marker, is_strong)`` pairs.
+#: A single strong marker lifts the domain's confidence to ``high``; weak
+#: markers alone report ``medium``.
+DOMAIN_MARKERS: dict[str, tuple[tuple[str, bool], ...]] = {
+    "network": (
+        ("ws2_32.dll", True),
+        ("wsastartup", True),
+        ("wininet.dll", True),
+        ("winhttp.dll", True),
+        ("libcurl", True),
+        ("curl_easy", True),
+        ("reqwest", True),
+        ("hyper", False),
+        ("socket", False),
+        ("https://", False),
+    ),
+    "crypto": (
+        ("bcrypt.dll", True),
+        ("crypt32.dll", True),
+        ("cryptacquirecontext", True),
+        ("bcryptgenrandom", True),
+        ("ncrypt.dll", True),
+        ("aes", False),
+        ("rsa", False),
+        ("sha256", False),
+        ("sha1", False),
+        ("md5", False),
+    ),
+    "file_system": (
+        ("createfilew", True),
+        ("createfilea", True),
+        ("createfile2", True),
+        ("fopen", True),
+        ("readfile", False),
+        ("writefile", False),
+        ("fread", False),
+        ("fwrite", False),
+    ),
+    "process": (
+        ("createprocessw", True),
+        ("createprocessa", True),
+        ("shellexecutew", True),
+        ("winexec", True),
+        ("ptrace", True),
+        ("execve", True),
+        ("system(", False),
+        ("fork(", False),
+    ),
+    "registry": (
+        ("regopenkeyexw", True),
+        ("regopenkeya", True),
+        ("regqueryvalueexw", True),
+        ("regsetvalueexw", True),
+        ("regcreatekeyexw", True),
+        ("regdeletekey", True),
+        ("advapi32.dll", False),
+    ),
+    "service": (
+        ("openscmanagerw", True),
+        ("openscmanagera", True),
+        ("startservicew", True),
+        ("startservicea", True),
+        ("createservicew", True),
+        ("controlservice", False),
+    ),
+    "gui": (
+        ("createwindowexw", True),
+        ("createwindowexa", True),
+        ("user32.dll", True),
+        ("cairo", False),
+        ("gtk_window", False),
+        ("xopendisplay", False),
+        ("showwindow", False),
+    ),
+    "dynamic_loading": (
+        ("getprocaddress", True),
+        ("loadlibraryw", True),
+        ("loadlibrarya", True),
+        ("dlopen", True),
+        ("dlsym", False),
+        ("lazy_static", False),
+    ),
+}
+
+#: Evidence-string cap per capability row.
+MAX_DOMAIN_EVIDENCE = 8
+
+#: Evidence-string cap on the report-level aggregate.
+MAX_PROFILE_EVIDENCE = 16
+
+#: Base risk contribution of each detected domain.
+DOMAIN_RISK_WEIGHTS: dict[str, int] = {
+    "network": 15,
+    "crypto": 10,
+    "file_system": 8,
+    "process": 18,
+    "registry": 10,
+    "service": 15,
+    "gui": 4,
+    "dynamic_loading": 10,
+}
+
+#: Bonus points when every domain of a pair is detected (dangerous combos).
+DANGEROUS_COMBOS: tuple[tuple[frozenset[str], int], ...] = (
+    (frozenset({"network", "process"}), 15),
+    (frozenset({"network", "crypto"}), 10),
+    (frozenset({"network", "dynamic_loading"}), 10),
+    (frozenset({"process", "dynamic_loading"}), 12),
+    (frozenset({"process", "registry"}), 8),
+    (frozenset({"service", "process"}), 8),
+    (frozenset({"service", "dynamic_loading"}), 6),
+    (frozenset({"crypto", "dynamic_loading"}), 6),
+)
+
+#: Hard ceiling of the risk score.
+MAX_RISK_SCORE = 100
+
+#: Byte cap on the marker scan (the digest still covers the whole file).
+MAX_PROFILE_SCAN_BYTES = 8 * 1024 * 1024
+
+_PROFILE_EVIDENCE_SOURCE = "codevanta.capability_profile"
+
+_PROFILE_FORMAT_MAGICS: tuple[tuple[bytes, str], ...] = (
+    (b"MZ", "PE"),
+    (b"\x7fELF", "ELF"),
+    (b"\xcf\xfa\xfe\xed", "MachO"),
+    (b"\xca\xfe\xba\xbe", "MachO"),
+)
+
+
+@dataclass(frozen=True)
+class Capability:
+    """One fixed capability domain's verdict for a binary (file scope only).
+
+    Attributes:
+        name: Domain name from :data:`CAPABILITY_DOMAINS`.
+        detected: ``True`` when at least one marker fired.
+        evidence_strings: The matched markers in first-occurrence order,
+            capped at :data:`MAX_DOMAIN_EVIDENCE`.
+        confidence: ``high`` when a strong marker fired, else ``medium``.
+    """
+
+    name: str
+    detected: bool
+    evidence_strings: tuple[str, ...]
+    confidence: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe projection."""
+        return {
+            "name": self.name,
+            "detected": self.detected,
+            "evidence_strings": list(self.evidence_strings),
+            "confidence": self.confidence,
+        }
+
+
+@dataclass(frozen=True)
+class CapabilityProfile:
+    """Outcome of :func:`profile_capabilities`; frozen and JSON-safe.
+
+    Attributes:
+        path: Analysed file path (as given).
+        sha256: SHA-256 over the whole file bytes.
+        format: Coarse container kind sniffed from the leading magic
+            (``PE`` / ``ELF`` / ``MachO`` / ``unknown``).
+        capabilities: One :class:`Capability` per domain, in
+            :data:`CAPABILITY_DOMAINS` order.
+        detected_domains: Names of detected domains, in domain order.
+        overall_risk_score: 0-100 deterministic score over detected domains
+            plus :data:`DANGEROUS_COMBOS` bonuses.
+        evidence_strings: Report-level aggregate (first marker of each
+            detected domain), capped at :data:`MAX_PROFILE_EVIDENCE`.
+        warnings: Bounded human-readable warnings.
+        truncated: ``True`` when the marker scan was cut by
+            :data:`MAX_PROFILE_SCAN_BYTES`.
+        evidence: Report-level evidence record (medium confidence: the
+            markers are certain, the capability conclusion is an inference).
+    """
+
+    path: str
+    sha256: str
+    format: str
+    capabilities: tuple[Capability, ...]
+    detected_domains: tuple[str, ...]
+    overall_risk_score: int
+    evidence_strings: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
+    truncated: bool = False
+    evidence: Evidence = field(
+        default_factory=lambda: Evidence(
+            source=_PROFILE_EVIDENCE_SOURCE, method="marker_scan"
+        )
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe projection."""
+        return {
+            "path": self.path,
+            "sha256": self.sha256,
+            "format": self.format,
+            "capabilities": [capability.to_dict() for capability in self.capabilities],
+            "detected_domains": list(self.detected_domains),
+            "detected_count": len(self.detected_domains),
+            "overall_risk_score": self.overall_risk_score,
+            "evidence_strings": list(self.evidence_strings),
+            "warnings": list(self.warnings),
+            "truncated": self.truncated,
+            "evidence": self.evidence.to_dict(),
+        }
+
+
+def _profile_format(data: bytes) -> str:
+    """Sniff the coarse container kind from the leading magic bytes."""
+    for magic, kind in _PROFILE_FORMAT_MAGICS:
+        if data[: len(magic)] == magic:
+            return kind
+    return "unknown"
+
+
+def _scan_domain_markers(data: bytes) -> dict[str, tuple[list[str], bool]]:
+    """Scan ``data`` for every domain's markers (case-insensitive).
+
+    Returns one row per domain: the matched markers in first-occurrence
+    order (capped at :data:`MAX_DOMAIN_EVIDENCE`) and whether any strong
+    marker fired.
+    """
+    lowered = data.lower()
+    rows: dict[str, tuple[list[str], bool]] = {}
+    for domain in CAPABILITY_DOMAINS:
+        hits: list[tuple[int, str]] = []
+        strong = False
+        for marker, is_strong in DOMAIN_MARKERS[domain]:
+            index = lowered.find(marker.encode("utf-8"))
+            if index >= 0:
+                hits.append((index, marker))
+                strong = strong or is_strong
+        hits.sort()
+        rows[domain] = ([text for _, text in hits[:MAX_DOMAIN_EVIDENCE]], strong)
+    return rows
+
+
+def _overall_risk_score(detected: set[str]) -> int:
+    """Deterministic 0-100 risk score over detected domains and combos."""
+    score = sum(DOMAIN_RISK_WEIGHTS[domain] for domain in detected)
+    for combo, bonus in DANGEROUS_COMBOS:
+        if combo.issubset(detected):
+            score += bonus
+    return min(score, MAX_RISK_SCORE)
+
+
+def profile_capabilities(path: str | Path) -> CapabilityProfile:
+    """Scan one binary and profile its fixed capability domains.
+
+    Reads the file bytes (capped at :data:`MAX_PROFILE_SCAN_BYTES` with an
+    honest truncation warning), matches each domain's marker set
+    case-insensitively and reports one :class:`Capability` per domain plus a
+    deterministic :data:`MAX_RISK_SCORE`-bounded risk score over dangerous
+    domain combinations. Nothing is executed and nothing beyond ``path`` is
+    read; the digest covers the whole file even when the scan was truncated.
+
+    Args:
+        path: Binary file to scan.
+
+    Returns:
+        The frozen :class:`CapabilityProfile` for ``path``.
+
+    Raises:
+        AnalysisError: When ``path`` does not exist or is not a file.
+    """
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise AnalysisError(f"no such binary file: {file_path}")
+    raw = file_path.read_bytes()
+    sha256 = hashlib.sha256(raw).hexdigest()
+    data = raw[:MAX_PROFILE_SCAN_BYTES]
+    truncated = len(raw) > MAX_PROFILE_SCAN_BYTES
+    warnings: list[str] = []
+    if truncated:
+        warnings.append(
+            f"marker scan truncated to the first {MAX_PROFILE_SCAN_BYTES} "
+            f"of {len(raw)} bytes"
+        )
+
+    rows = _scan_domain_markers(data)
+    capabilities: list[Capability] = []
+    detected: list[str] = []
+    profile_evidence: list[str] = []
+    for domain in CAPABILITY_DOMAINS:
+        hits, strong = rows[domain]
+        capability = Capability(
+            name=domain,
+            detected=bool(hits),
+            evidence_strings=tuple(hits),
+            confidence="high" if strong else "medium",
+        )
+        capabilities.append(capability)
+        if capability.detected:
+            detected.append(domain)
+            if len(profile_evidence) < MAX_PROFILE_EVIDENCE:
+                profile_evidence.append(hits[0])
+    evidence = Evidence(
+        source=_PROFILE_EVIDENCE_SOURCE,
+        method="marker_scan",
+        confidence=Confidence.MEDIUM,
+        detail=(
+            "matched markers are certain substrings of the file; the "
+            "capability conclusion and risk score are inferences from "
+            "file-scope evidence"
+        ),
+        extra={
+            "domains": len(CAPABILITY_DOMAINS),
+            "bytes_scanned": min(len(raw), MAX_PROFILE_SCAN_BYTES),
+            "detected_count": len(detected),
+        },
+    )
+    return CapabilityProfile(
+        path=str(file_path),
+        sha256=sha256,
+        format=_profile_format(data),
+        capabilities=tuple(capabilities),
+        detected_domains=tuple(detected),
+        overall_risk_score=_overall_risk_score(set(detected)),
+        evidence_strings=tuple(profile_evidence),
         warnings=tuple(warnings),
         truncated=truncated,
         evidence=evidence,

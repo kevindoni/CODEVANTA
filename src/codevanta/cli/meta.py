@@ -16,7 +16,15 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from codevanta.analysis import binmeta
+from codevanta.analysis import (
+    binmeta,
+    elf_dynamic,
+    macho_dylibs,
+    managed_meta,
+    pe_loadconfig,
+    pe_resources,
+    pyc_inspect,
+)
 from codevanta.analysis.codesign import inspect_codesign
 from codevanta.core.report import AnalysisError
 
@@ -31,6 +39,47 @@ meta_app = typer.Typer(
     ),
 )
 console = Console()
+
+# lane-depth2: one sub-app with a command per deep format inspector; the
+# registration lives in cli.main.py as a single add_typer line.
+deep2_app = typer.Typer(
+    help=(
+        "Deep format inspectors (lane-depth2): PE resources + version info, "
+        "PE load config + TLS callbacks, ELF dynamic section, Mach-O dylibs, "
+        ".pyc shallow marshal walk, .NET metadata members."
+    ),
+)
+
+
+def _deep_render(title: str, payload: dict[str, Any], evidence: Any) -> None:
+    """Render one deep inspector's summary dict + evidence (shared)."""
+    table = Table(title=title)
+    table.add_column("Field")
+    table.add_column("Value")
+    for field, value in _flatten({"summary": payload}):
+        table.add_row(escape(field), escape(value))
+    console.print(table)
+    data = evidence.to_dict()
+    console.print(
+        f"[dim]evidence: {escape(str(data['source']))} via {escape(str(data['method']))}"
+        f" · confidence: {escape(str(data['confidence']))}[/]"
+    )
+
+
+def _deep_entry(target: Path, json_output: bool, title: str, summary: Any) -> None:
+    """Shared output path for the deep commands (JSON or rendered table)."""
+    if json_output:
+        console.print_json(json.dumps(summary.to_dict()))
+        return
+    _deep_render(f"{title} · {escape(str(target))}", summary.to_dict(), summary.evidence)
+
+
+def _deep_runner(target: Path, json_output: bool, title: str, inspector: Any) -> None:
+    try:
+        summary = inspector(target)
+    except AnalysisError as exc:
+        _fail(str(exc))
+    _deep_entry(target, json_output, title, summary)
 
 
 def _fail(message: str) -> None:
@@ -174,3 +223,72 @@ def codesign(
         f"[dim]evidence: {escape(str(data['source']))} via {escape(str(data['method']))}"
         f" · confidence: {escape(str(data['confidence']))}[/]"
     )
+
+
+# ---- lane-depth2 deep inspector commands --------------------------------------
+
+
+@deep2_app.command("pe-resources")
+def deep_pe_resources(
+    path: Annotated[Path, typer.Argument(help="PE file to inspect")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Deep-walk a PE's resource directory tree (bounded, offline)."""
+    _deep_runner(path, json_output, "PE resources", pe_resources.inspect_pe_resources)
+
+
+@deep2_app.command("pe-loadconfig")
+def deep_pe_loadconfig(
+    path: Annotated[Path, typer.Argument(help="PE file to inspect")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Deep-read a PE's load config, TLS callbacks and DEP policy (offline)."""
+    _deep_runner(path, json_output, "PE load config", pe_loadconfig.inspect_pe_load_config)
+
+
+@deep2_app.command("elf-dynamic")
+def deep_elf_dynamic(
+    path: Annotated[Path, typer.Argument(help="ELF file to inspect")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Deep-read an ELF's dynamic section (DT_NEEDED, arrays, offline)."""
+    _deep_runner(path, json_output, "ELF dynamic", elf_dynamic.inspect_elf_dynamic)
+
+
+@deep2_app.command("macho-dylibs")
+def deep_macho_dylibs(
+    path: Annotated[Path, typer.Argument(help="Thin Mach-O file to inspect")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Deep-read a Mach-O's dylib load commands (versions, offline)."""
+    _deep_runner(path, json_output, "Mach-O dylibs", macho_dylibs.inspect_macho_dylibs)
+
+
+@deep2_app.command("pyc-inspect")
+def deep_pyc_inspect(
+    path: Annotated[Path, typer.Argument(help=".pyc file to inspect")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Shallow-walk a .pyc's constant/name tables (bytecode never decoded)."""
+    _deep_runner(path, json_output, "PYC inspect", pyc_inspect.inspect_pyc_code)
+
+
+@deep2_app.command("managed-meta")
+def deep_managed_meta(
+    path: Annotated[Path, typer.Argument(help=".NET PE file to inspect")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Shallow-walk a .NET assembly's #~/#Strings metadata (offline)."""
+    _deep_runner(path, json_output, "Managed metadata", managed_meta.inspect_managed_metadata)

@@ -1,12 +1,14 @@
 """MCP tools exposing the depth bridges (no MCP imports).
 
-Five tools: ``codevanta_apk_decode`` (apktool, skip-gated),
+Six tools: ``codevanta_apk_decode`` (apktool, skip-gated),
 ``codevanta_js_recover`` (Wakaru, skip-gated), ``codevanta_javascript``
 (pure-Python static app inventory, always available offline),
-``codevanta_electron_audit`` (pure-Python Electron security audit, always
-available offline) and ``codevanta_certs`` (pure-Python PE certificate
-table, always available offline). The registration import lives in
-:mod:`codevanta.mcp_server.tools`; the ``@server.tool`` wrappers live inside
+``codevanta_electron_audit`` (pure-Python Electron security audit with typed
+verdict, always available offline), ``codevanta_certs`` (pure-Python PE
+certificate table, always available offline) and ``codevanta_source_map``
+(pure-Python source-map/VLQ parser, always available offline). The
+registration import lives in :mod:`codevanta.mcp_server.tools`; the
+``@server.tool`` wrappers live inside
 :func:`codevanta.mcp_server.server.build_server` -- imports alone do not
 register anything.
 """
@@ -17,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from codevanta.analysis import apktool_bridge, electron_audit, javascript, pe_certs, wakaru_bridge
+from codevanta.core.report import AnalysisError
 
 
 def codevanta_apk_decode(apk_path: str, out_dir: str) -> dict[str, Any]:
@@ -62,8 +65,37 @@ def codevanta_electron_audit(
     confidence, file, line, snippet, recommendation and evidence; literal
     misconfigurations are certain, shape-based findings are medium. Nothing
     is executed and no Node.js is required.
+
+    On top of the forensic finding list the payload carries the typed
+    verdict: ``checks`` (bounded named BrowserWindow/CSP/preload checks plus
+    one check per extra fired rule) and ``overall_security``
+    (``good``/``warning``/``bad``).
     """
-    return electron_audit.audit_electron_app(Path(path), max_files=max_files).to_dict()
+    report = electron_audit.audit_electron_app(Path(path), max_files=max_files)
+    payload = report.to_dict()
+    result = electron_audit.build_audit_result(report).to_dict()
+    payload["checks"] = result["checks"]
+    payload["overall_security"] = result["overall_security"]
+    return payload
+
+
+def codevanta_source_map(path: str) -> dict[str, Any]:
+    """Parse a source map (``.map``) file offline (pure Python).
+
+    Reads the JSON document, validates the base64-VLQ ``mappings`` stream
+    (1/4/5-field segments, bounded decode budget) and reports the original
+    source files, their deduplicated basenames and the honest mapping count
+    with truncation flags. A non-map or malformed file is a typed error,
+    never a silent zero.
+    """
+    source = Path(path)
+    data = source.read_bytes()
+    if len(data) > javascript.MAX_FILE_BYTES:
+        raise AnalysisError(
+            f"source map {source} is larger than the "
+            f"{javascript.MAX_FILE_BYTES}-byte budget"
+        )
+    return javascript.parse_source_map(data.decode("utf-8-sig", "replace")).to_dict()
 
 
 def codevanta_js_recover(

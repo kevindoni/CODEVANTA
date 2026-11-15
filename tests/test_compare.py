@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from codevanta.analysis import compare as compare_module
 from codevanta.analysis.compare import (
     COMPARE_WHATS,
     DEFAULT_MAX_CHANGED_SECTIONS,
@@ -29,17 +30,21 @@ from codevanta.analysis.compare import (
     MAX_COMPARE_FUNCTIONS,
     MAX_COMPARE_HAR_PATHS,
     MAX_COMPARE_REGISTERS,
+    MAX_COMPARE_ROWS,
     PATH_COMPARE_WHATS,
     compare_artifacts,
+    compare_bridges,
     compare_bundles,
     compare_crash,
     compare_firmware,
     compare_har,
+    compare_imports,
     compare_inventories,
     compare_metadata,
     compare_nav,
     compare_reports,
     compare_screenshots,
+    compare_sections,
     compare_sessions,
     compare_strings,
     compare_wasm,
@@ -48,7 +53,7 @@ from codevanta.analysis.compare import (
 from codevanta.analysis.nav import NavStore
 from codevanta.analysis.png_diff import MAX_PNG_PIXELS, decode_png, load_png
 from codevanta.cli.main import app
-from codevanta.core.loader import BinaryInfo
+from codevanta.core.loader import BinaryInfo, ImportInfo, SectionInfo
 from codevanta.core.report import AnalysisError
 from codevanta.storage.session import SessionStore
 from test_crash import (
@@ -507,12 +512,13 @@ def _session_db(tmp_path: Path, name: str, session_id: str) -> Path:
 # ---- registry sanity ----------------------------------------------------------
 
 
-def test_registry_partitions_all_twelve_kinds() -> None:
-    assert len(COMPARE_WHATS) == 12
+def test_registry_partitions_all_fifteen_kinds() -> None:
+    assert len(COMPARE_WHATS) == 15
     assert set(JSON_COMPARE_WHATS) | set(PATH_COMPARE_WHATS) == set(COMPARE_WHATS)
     assert not set(JSON_COMPARE_WHATS) & set(PATH_COMPARE_WHATS)
     assert "functions" in JSON_COMPARE_WHATS and "firmware" in PATH_COMPARE_WHATS
     assert {"screenshots", "har"} <= set(PATH_COMPARE_WHATS)
+    assert {"sections", "imports", "bridges"} <= set(PATH_COMPARE_WHATS)
 
 
 # ---- compare_reports ----------------------------------------------------------
@@ -1431,6 +1437,14 @@ def test_dispatch_runs_every_registered_kind(tmp_path: Path) -> None:
     assert isinstance(compare_artifacts("screenshots", shot, shot), object)
     har_path = _write_har(tmp_path / "c.har", [_har_entry("GET", "https://h.test/x", 200)])
     assert isinstance(compare_artifacts("har", har_path, har_path), object)
+    assert isinstance(compare_artifacts("sections", PE_SAMPLE, PE_SAMPLE), object)
+    assert isinstance(compare_artifacts("imports", PE_SAMPLE, PE_SAMPLE), object)
+    bridges_path = tmp_path / "bridges.json"
+    bridges_path.write_text(
+        json.dumps([{"tool": "z3", "available": False, "reason": "missing"}]),
+        encoding="utf-8",
+    )
+    assert isinstance(compare_artifacts("bridges", bridges_path, bridges_path), object)
 
 
 def test_dispatch_bundles_rejects_non_bundle(tmp_path: Path) -> None:
@@ -1553,4 +1567,480 @@ def test_mcp_compare_reports_and_wasm(tmp_path: Path) -> None:
     assert har_payload["what"] == "har"
     assert har_payload["identical"] is True
     assert har_payload["evidence"]["source"] == "compare.har"
+
+
+# ---- compare_sections / compare_imports (lane-cap2) ----------------------------
+
+
+def _cap2_info(
+    path: Path,
+    *,
+    sections: list[SectionInfo] | None = None,
+    imports: list[ImportInfo] | None = None,
+) -> BinaryInfo:
+    """A synthetic :class:`BinaryInfo` with the given table rows."""
+    return BinaryInfo(
+        path=path,
+        format="ELF",
+        architecture="x86_64",
+        bitness=64,
+        endianness="little",
+        entry_point=None,
+        image_base=0,
+        sha256="ab" * 32,
+        file_size=path.stat().st_size,
+        sections=list(sections or []),
+        imports=list(imports or []),
+    )
+
+
+def _patch_infos(monkeypatch: pytest.MonkeyPatch, *infos: BinaryInfo) -> None:
+    """Point ``compare``'s loader at the given infos, keyed by their paths."""
+    by_path = {str(info.path): info for info in infos}
+
+    def _fake_load(path: str | Path, side: str) -> BinaryInfo:
+        info = by_path.get(str(Path(path)))
+        assert info is not None, f"unexpected load call for {side}: {path}"
+        return info
+
+    monkeypatch.setattr(compare_module, "_load_binary_info", _fake_load)
+
+
+def test_sections_identical_self_compare_on_pe_sample() -> None:
+    result = compare_sections(PE_SAMPLE, PE_SAMPLE)
+    assert result.left_sections == result.right_sections
+    assert result.left_sections >= 1  # pe64_text.bin ships one .text section
+    assert result.added == () and result.removed == () and result.changed == ()
+    assert result.identical is True and result.verdict == "identical"
+    payload = result.to_dict()
+    assert payload["what"] == "sections"
+    assert payload["changed_count"] == 0
+    assert payload["evidence"]["source"] == "compare.sections"
+    _assert_json_safe(payload)
+
+
+def test_sections_added_and_removed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    left_path = tmp_path / "left.bin"
+    right_path = tmp_path / "right.bin"
+    # identical filler bytes: the shared section must hash to the same entropy
+    left_path.write_bytes(b"\x00" * 32)
+    right_path.write_bytes(b"\x00" * 32)
+    one = [SectionInfo(".text", 0x401000, 16, 0, 16, None)]
+    two = [
+        SectionInfo(".text", 0x401000, 16, 0, 16, None),
+        SectionInfo(".data", 0x402000, 32, 16, 32, None),
+    ]
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(left_path, sections=one),
+        _cap2_info(right_path, sections=two),
+    )
+    result = compare_sections(left_path, right_path)
+    assert result.added == (".data",)
+    assert result.removed == () and result.changed == ()
+    assert result.identical is False and result.verdict == "changed"
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(left_path, sections=two),
+        _cap2_info(right_path, sections=one),
+    )
+    mirrored = compare_sections(left_path, right_path)
+    assert mirrored.removed == (".data",) and mirrored.added == ()
+    assert mirrored.identical is False
+
+
+def test_sections_size_change(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    left_path = tmp_path / "left.bin"
+    right_path = tmp_path / "right.bin"
+    left_path.write_bytes(b"\x00" * 16)
+    right_path.write_bytes(b"\x00" * 32)
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(left_path, sections=[SectionInfo(".text", 0x401000, 16, 0, 16, None)]),
+        _cap2_info(right_path, sections=[SectionInfo(".text", 0x401000, 32, 0, 32, None)]),
+    )
+    result = compare_sections(left_path, right_path)
+    assert result.changed_count == 1
+    delta = result.changed[0]
+    assert delta.name == ".text"
+    assert delta.to_dict()["size_delta"] == 16
+    assert delta.entropy_changed is False  # both sides all-zero -> same entropy
+    assert result.identical is False
+
+
+def test_sections_entropy_change_uses_fallback_hash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without loader entropies the comparator hashes the file slice itself."""
+    left_path = tmp_path / "left.bin"
+    right_path = tmp_path / "right.bin"
+    left_path.write_bytes(b"\x00" * 16)
+    right_path.write_bytes(bytes(range(16)))
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(left_path, sections=[SectionInfo(".text", 0x401000, 16, 0, 16, None)]),
+        _cap2_info(right_path, sections=[SectionInfo(".text", 0x401000, 16, 0, 16, None)]),
+    )
+    result = compare_sections(left_path, right_path)
+    assert result.changed_count == 1
+    delta = result.changed[0]
+    assert delta.left_entropy == 0.0
+    assert delta.right_entropy is not None and delta.right_entropy > 3.0
+    assert delta.entropy_changed is True
+    assert result.identical is False
+
+
+def test_sections_loader_entropy_and_empty_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Loader-provided entropies drive the delta; no sections means a warning."""
+    left_path = tmp_path / "left.bin"
+    right_path = tmp_path / "right.bin"
+    left_path.write_bytes(b"\x00" * 8)
+    right_path.write_bytes(b"\xff" * 8)
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(left_path, sections=[SectionInfo(".text", 0x401000, 8, 0, 8, 0.0)]),
+        _cap2_info(right_path, sections=[SectionInfo(".text", 0x401000, 8, 0, 8, 7.9)]),
+    )
+    result = compare_sections(left_path, right_path)
+    assert result.changed_count == 1
+    assert result.changed[0].entropy_changed is True
+    _patch_infos(monkeypatch, _cap2_info(left_path), _cap2_info(right_path))
+    empty = compare_sections(left_path, right_path)
+    assert empty.left_sections == 0 and empty.right_sections == 0
+    assert empty.identical is True
+    assert any("no section table" in warning for warning in empty.warnings)
+
+
+def test_sections_truncation_and_budget_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "one.bin"
+    other = tmp_path / "two.bin"
+    path.write_bytes(b"a")
+    other.write_bytes(b"b")
+    many = [
+        SectionInfo(f".s{index:02d}", 0x401000 + index * 16, 16, index * 16, 16, None)
+        for index in range(5)
+    ]
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(path, sections=many[:2]),
+        _cap2_info(other, sections=many),
+    )
+    result = compare_sections(path, other, max_rows=2)
+    assert result.added == (".s02", ".s03")  # detail list capped at max_rows
+    assert result.added_count == 3  # ... but the true count is reported
+    assert any("truncated" in warning for warning in result.warnings)
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(path, sections=many),
+        _cap2_info(other, sections=many[:2]),
+    )
+    mirrored = compare_sections(path, other, max_rows=2)
+    assert mirrored.removed == (".s02", ".s03")
+    assert mirrored.removed_count == 3
+    # changed-row truncation: three same-named sections grow beyond budget
+    grown = [
+        SectionInfo(f".g{index:02d}", 0x401000 + index * 16, 32, index * 16, 32, None)
+        for index in range(3)
+    ]
+    grown_right = [
+        SectionInfo(f".g{index:02d}", 0x401000 + index * 16, 64, index * 16, 64, None)
+        for index in range(3)
+    ]
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(path, sections=grown),
+        _cap2_info(other, sections=grown_right),
+    )
+    changed = compare_sections(path, other, max_rows=2)
+    assert changed.changed_count == 3
+    assert len(changed.changed) == 2
+    assert any("truncated" in warning for warning in changed.warnings)
+    with pytest.raises(AnalysisError):
+        compare_sections(path, other, max_rows=0)
+    with pytest.raises(AnalysisError):
+        compare_sections(path, other, max_rows=MAX_COMPARE_ROWS + 1)
+
+
+def test_sections_duplicate_names_warn_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    left = tmp_path / "dup.bin"
+    right = tmp_path / "plain.bin"
+    left.write_bytes(b"a" * 16)
+    right.write_bytes(b"b" * 16)
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(
+            left,
+            sections=[
+                SectionInfo(".dup", 0x401000, 8, 0, 8, None),
+                SectionInfo(".dup", 0x402000, 8, 8, 8, None),
+            ],
+        ),
+        _cap2_info(right, sections=[SectionInfo(".dup", 0x401000, 8, 0, 8, None)]),
+    )
+    result = compare_sections(left, right)
+    assert result.left_sections == 1  # the duplicate row was dropped
+    assert any("duplicate section name" in warning for warning in result.warnings)
+
+
+def test_sections_bad_paths(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.bin"
+    text = tmp_path / "plain.txt"
+    text.write_text("definitely not a binary", encoding="utf-8")
+    with pytest.raises(AnalysisError):
+        compare_sections(missing, missing)
+    with pytest.raises(AnalysisError):
+        compare_sections(text, text)
+
+
+def test_imports_added_removed_and_count_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    left_path = tmp_path / "left.bin"
+    right_path = tmp_path / "right.bin"
+    left_path.write_bytes(b"left")
+    right_path.write_bytes(b"right")
+
+    def _imports(*rows: tuple[str, int]) -> list[ImportInfo]:
+        infos: list[ImportInfo] = []
+        for library, count in rows:
+            for index in range(count):
+                infos.append(ImportInfo(name=f"{library[:-4]}_f{index}", library=library))
+        return infos
+
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(left_path, imports=_imports(("a.dll", 2), ("B.dll", 1))),
+        _cap2_info(right_path, imports=_imports(("a.dll", 3), ("c.dll", 1))),
+    )
+    result = compare_imports(left_path, right_path)
+    # library matching is case-insensitive: a.dll/a.dll share, B.dll removed
+    assert result.added_dlls == ("c.dll",)
+    assert result.removed_dlls == ("B.dll",)
+    assert result.changed_count == 1
+    delta = result.changed[0]
+    assert delta.library == "a.dll"
+    assert delta.to_dict()["function_delta"] == 1
+    assert result.left_dlls == 2 and result.right_dlls == 2
+    assert result.left_functions == 3 and result.right_functions == 4
+    assert result.identical is False and result.verdict == "changed"
+    payload = result.to_dict()
+    assert payload["what"] == "imports"
+    assert payload["evidence"]["source"] == "compare.imports"
+    _assert_json_safe(payload)
+
+
+def test_imports_dll_rows_groups_by_lower_name() -> None:
+    rows = compare_module._dll_rows(
+        [
+            ImportInfo(name="f1", library="KERNEL32.dll"),
+            ImportInfo(name="f2", library="kernel32.DLL"),
+            ImportInfo(name="g1", library=None),
+        ]
+    )
+    assert rows == {"kernel32.dll": ("KERNEL32.dll", 2), "unknown": ("unknown", 1)}
+
+
+def test_imports_identical_self_compare_on_real_pe(pe_path: Path) -> None:
+    """A real PE compared with itself is identical (loader-backed integration)."""
+    result = compare_imports(pe_path, pe_path)
+    assert result.identical is True
+    assert result.left_dlls == result.right_dlls
+    assert result.left_dlls >= 1  # the interpreter imports at least one DLL
+    assert result.left_functions >= result.left_dlls
+    assert result.verdict == "identical"
+
+
+def test_imports_budget_and_missing_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "one.bin"
+    other = tmp_path / "two.bin"
+    path.write_bytes(b"a")
+    other.write_bytes(b"b")
+    imports = [ImportInfo(name=f"f{index}", library=f"d{index:02d}.dll") for index in range(4)]
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(path, imports=imports[:1]),
+        _cap2_info(other, imports=imports),
+    )
+    result = compare_imports(path, other, max_rows=1)
+    assert result.added_dlls == ("d01.dll",)
+    assert result.added_count == 3
+    assert any("truncated" in warning for warning in result.warnings)
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(path, imports=imports),
+        _cap2_info(other, imports=imports[:1]),
+    )
+    mirrored = compare_imports(path, other, max_rows=1)
+    assert mirrored.removed_dlls == ("d01.dll",)
+    assert mirrored.removed_count == 3
+    # changed-row truncation: three shared libraries change their counts
+    shared = [ImportInfo(name=f"f{index}", library="s.dll") for index in range(3)]
+    other_shared = [ImportInfo(name=f"f{index}", library="s.dll") for index in range(6)]
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(path, imports=shared),
+        _cap2_info(other, imports=other_shared),
+    )
+    changed = compare_imports(path, other, max_rows=2)
+    assert changed.changed_count == 1  # one library row: s.dll 3 -> 6
+    assert changed.changed[0].library == "s.dll"
+    with pytest.raises(AnalysisError):
+        compare_imports(path, other, max_rows=0)
+
+
+# ---- compare_bridges (lane-cap2) -----------------------------------------------
+
+
+def _bridge(tool: str, available: bool, version: str | None = None) -> dict[str, Any]:
+    row: dict[str, Any] = {"tool": tool, "available": available}
+    if version is not None:
+        row["version"] = version
+    return row
+
+
+def _write_bridges(path: Path, rows: list[dict[str, Any]], *, wrap: bool = False) -> Path:
+    document: Any = rows
+    if wrap:
+        document = {"bridges": rows}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def test_bridges_identical_self_snapshot(tmp_path: Path) -> None:
+    snapshot = _write_bridges(
+        tmp_path / "a.json",
+        [_bridge("z3", True, "4.12"), _bridge("ghidra", False)],
+    )
+    result = compare_bridges(snapshot, snapshot)
+    assert result.left_tools == 2 and result.right_tools == 2
+    assert result.left_available == 1 and result.right_available == 1
+    assert result.changes == () and result.change_count == 0
+    assert result.identical is True and result.verdict == "identical"
+    payload = result.to_dict()
+    assert payload["what"] == "bridges"
+    assert payload["evidence"]["source"] == "compare.bridges"
+    _assert_json_safe(payload)
+
+
+def test_bridges_newly_available_unavailable_and_version(tmp_path: Path) -> None:
+    left = _write_bridges(
+        tmp_path / "left.json",
+        [
+            _bridge("z3", True, "4.8"),
+            _bridge("ghidra", False),
+            _bridge("frida", True, "16.0"),
+        ],
+    )
+    right = _write_bridges(
+        tmp_path / "right.json",
+        [
+            _bridge("z3", True, "4.12"),
+            _bridge("ghidra", True, "10.0"),
+            _bridge("rizin", True, "0.7"),
+        ],
+    )
+    result = compare_bridges(left, right)
+    kinds = {change.tool: change.kind for change in result.changes}
+    assert kinds == {
+        "z3": "version_changed",
+        "ghidra": "newly_available",
+        "frida": "newly_unavailable",
+        "rizin": "newly_available",
+    }
+    assert result.change_count == 4
+    assert result.identical is False and result.verdict == "changed"
+    wrapped = _write_bridges(tmp_path / "wrap.json", [], wrap=True)
+    empty_wrap = compare_bridges(wrapped, wrapped)
+    assert empty_wrap.left_tools == 0 and empty_wrap.identical is True
+
+
+def test_bridges_missing_tool_counts_as_unavailable(tmp_path: Path) -> None:
+    left = _write_bridges(tmp_path / "left.json", [_bridge("z3", True)])
+    right = _write_bridges(tmp_path / "right.json", [])
+    result = compare_bridges(left, right)
+    assert result.change_count == 1
+    change = result.changes[0]
+    assert change.tool == "z3" and change.kind == "newly_unavailable"
+    assert change.left_available is True and change.right_available is None
+
+
+def test_bridges_budget_and_malformed_inputs(tmp_path: Path) -> None:
+    left = _write_bridges(
+        tmp_path / "left.json",
+        [_bridge(f"t{index}", False) for index in range(3)],
+    )
+    right = _write_bridges(
+        tmp_path / "right.json",
+        [_bridge(f"t{index}", True) for index in range(3)],
+    )
+    result = compare_bridges(left, right, max_rows=2)
+    assert result.change_count == 3
+    assert len(result.changes) == 2
+    assert any("truncated" in warning for warning in result.warnings)
+    with pytest.raises(AnalysisError):
+        compare_bridges(left, right, max_rows=0)
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{not json", encoding="utf-8")
+    with pytest.raises(AnalysisError):
+        compare_bridges(bad_json, bad_json)
+    not_list = tmp_path / "obj.json"
+    not_list.write_text('{"tool": "z3"}', encoding="utf-8")
+    with pytest.raises(AnalysisError):
+        compare_bridges(not_list, not_list)
+    bad_row = tmp_path / "row.json"
+    bad_row.write_text('[{"tool": "z3"}]', encoding="utf-8")
+    with pytest.raises(AnalysisError):
+        compare_bridges(bad_row, bad_row)
+    missing = tmp_path / "missing.json"
+    with pytest.raises(AnalysisError):
+        compare_bridges(missing, missing)
+
+
+def test_bridges_snapshot_cap(tmp_path: Path) -> None:
+    rows = [{"tool": f"t{index}", "available": False} for index in range(4097)]
+    path = _write_bridges(tmp_path / "big.json", rows)
+    with pytest.raises(AnalysisError):
+        compare_bridges(path, path)
+
+
+def test_compare_lane_cap2_kinds_through_tools_and_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MCP ``compare`` and the CLI registry accept the three new kinds."""
+    from codevanta.mcp_server import tools
+
+    left = tmp_path / "l.bin"
+    right = tmp_path / "r.bin"
+    left.write_bytes(b"\x00" * 8)
+    right.write_bytes(b"\x00" * 8)
+    _patch_infos(
+        monkeypatch,
+        _cap2_info(left, sections=[SectionInfo(".text", 0x401000, 8, 0, 8, None)]),
+        _cap2_info(right, sections=[SectionInfo(".text", 0x401000, 8, 0, 8, None)]),
+    )
+    sections_payload = tools.compare(str(left), str(right), what="sections")
+    assert sections_payload["what"] == "sections"
+    assert sections_payload["identical"] is True
+    assert sections_payload["evidence"]["source"] == "compare.sections"
+
+    snapshot = _write_bridges(tmp_path / "b.json", [_bridge("z3", True, "4.12")])
+    bridges_payload = tools.compare(str(snapshot), str(snapshot), what="bridges")
+    assert bridges_payload["what"] == "bridges"
+    assert bridges_payload["identical"] is True
+
+    rendered = runner.invoke(app, ["compare", str(left), str(right), "--what", "sections"])
+    assert rendered.exit_code == 0
+    assert "identical: True" in rendered.output
+    as_json = runner.invoke(
+        app,
+        ["compare", str(snapshot), str(snapshot), "--what", "bridges", "--format", "json"],
+    )
+    assert as_json.exit_code == 0
+    assert json.loads(as_json.output)["what"] == "bridges"
 

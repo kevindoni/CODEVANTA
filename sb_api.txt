@@ -1,0 +1,363 @@
+=== ALL STOCKBIT API PATHS ===
+
+[(root).stockbit.com]
+  /
+
+[api-sekuritas.stockbit.com]
+  /cdn-cgi/tracehttps
+
+[carina.stockbit.com]
+  /cdn-cgi/tracehttps
+
+[correlationIdbaseUrlimagePreviewtimeoutMspageoauthdefaultFileNamesentinelUrlreportUrlfeatureprevurlsclearanceoriginschrono.stockbit.com]
+  /
+
+[exodus.stockbit.com]
+  /__health
+  /cdn-cgi/tracehttps
+
+[iplocation.stockbit.com]
+  /8
+
+[sda-updater.stockbit.com]
+  /manifestdW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJDMUY3MTYwOUFGQjExN0UKUldSK0VmdWFZSEVmTEduVUpIU0RvUTBjaEdaWmVoUHVoRFpCbVA4VGE2bytsZXVTWllkTys4QnoK
+
+[storage.stockbit.com]
+  /cdn-cgi/trace
+
+=== API ROUTE PATTERNS ===
+  /account
+  /api-sekuritas
+  /auth-Byb0fNmc
+  /authentication
+  /buy-order
+  /charting_library/broker-api
+  /charting_library/charting_library
+  /charting_library/datafeed-api
+  /charting_library/package
+  /info-grey
+  /login-illustration-1
+  /login-illustration-2
+  /login-illustration-3
+  /market-break
+  /market-close
+  /mfa/face-matching/sessions//results
+  /mfa/v1/non-login/face-matching/sessions/
+  /oauth/googlecore
+  /order-detail
+  /order-fully-matched
+  /order-partial-matched
+  /portfolio-sell-all
+  /portfolio-sell-all-disabled
+  /price-alert
+  /price-alert-match
+  /refresh-round
+  /sell-all-confirmation-illustration
+  /sell-all-disable-illustration
+  /sell-order
+  /sell-order-fully-matched
+  /sell-order-partial-matched
+  /session-timeout
+  /settings-inactive
+  /settings/
+  /settings/OTP-limit
+  /settings/WithdrawalRestriction
+  /settings/change-ba-illustration
+  /settings/change-email-illustration
+  /settings/change-password-icon
+  /settings/change-password-illustration
+  /settings/change-pin-illustration
+  /settings/change-pn-illustration
+  /settings/change-success
+  /settings/email-icon
+  /settings/enter-email
+  /settings/identity-verification-icon
+  /settings/kyc-restriction
+  /settings/leave-confirmation
+  /settings/sms-icon
+  /settings/success-illustration
+  /settings/token-email-verification
+  /settings/token-sms-verification
+  /settings/token-whatsapp-verification
+  /settings/try-again
+  /settings/whatsapp-icon
+  /statusdownloadeddownloadinglatest_versioncurrent_versioninstallingno
+  /stock-delisted
+  /stockbit-alt
+  /stockbit-download-app-store
+  /stockbit-download-google-play
+  /stockbit-logo
+  /stockbit-logo-black-bg-grey
+  /stockbit-logo-black-bg-white
+  /stockbit-logo-white
+  /stockbit-logo-white-bg-black
+  /stockbit-qr
+  /stockbit-white
+  /trade-active
+  /trade-inactive
+  /user-not-found
+  /user-suspended
+  /user_verified_gray
+  /v2
+  /v2Z
+  /v5A
+  /v5ir
+  /v6
+  /v9
+
+=== HTTP METHODS CONTEXT ===
+
+=== REQUEST/RESPONSE HEADERS ===
+  Accept
+  Access-Control-Allow-Headers
+  Access-Control-Allow-Origin
+  Authorization
+  Bearer
+  Content-Encoding
+  Content-Length
+  Content-Type
+  Cookie
+  Link
+  Origin
+  Referer
+  Retry-After
+  Set-Cookie
+  User-Agent
+  cf-clearance
+
+=== AUTHENTICATION PATTERNS ===
+  Authorization
+  Authorization: %.*s4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s
+%s%s
+  Authorization: Basic %s
+
+  Authorization: Bearer %s
+
+  Authorization: C:\Users\gitlab_runner\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hyper-util-0.1.20\src\cl
+  Authorization: Digest %s
+
+  Authorization: Negotiate %s
+
+  Authorizationfacematch-result
+  Basic Constraints
+  Basic OCSP Response
+  Basic authentication problem, ignoring.
+  Bearer 
+  Bearer authentication problem, ignoring.
+  Token failed: %s
+  Token failure: %s
+  Token functions
+  auth_state_changeopen_new_windowopen_window_positionopen_settings_windowopen_trading_windowopen_google_windowopen_upd
+  open_google_window
+
+=== JSON FIELD NAMES (API schema hints) ===
+  type                           (    2 occurrences)
+  length                         (    2 occurrences)
+  content_type                   (    2 occurrences)
+  filename                       (    1 occurrences)
+  attachment_type                (    1 occurrences)
+  item_count                     (    1 occurrences)
+
+=== ERROR CODES / STATUS PATTERNS ===
+  ERROR_ADDING_EXTENSION
+  ERROR_ADDING_RECIPIENT
+  ERROR_CONVERTING_PRIVATE_KEY
+  ERROR_CONVERTING_ZONE
+  ERROR_CREATING_EXTENSION
+  ERROR_GETTING_TIME
+  ERROR_IN_EXTENSION
+  ERROR_IN_NEXTUPDATE_FIELD
+  ERROR_IN_RECEIVED_CIPHER_LIST
+  ERROR_IN_THISUPDATE_FIELD
+  ERROR_PARSING_EXTENSION
+  ERROR_PARSING_URL
+  ERROR_SETTING_CIPHER
+  ERROR_SETTING_CIPHER_PARAMS
+  ERROR_SETTING_NBIO
+  ERROR_UNSUPPORTED_CERTIFICATE_TYPE
+  FAILED_OR_BAD_RECORD_MAC
+  INVALID_AD_SIZE
+  INVALID_ALPN_PROTOCOL
+  INVALID_ALPN_PROTOCOL_LIST
+  INVALID_ALPS_CODEPOINT
+  INVALID_ARGUMENT
+  INVALID_BIT_STRING_BITS_LEFT
+  INVALID_BIT_STRING_PADDING
+  INVALID_BMPSTRING
+  INVALID_BOOLEAN_STRING
+  INVALID_BUFFER_SIZE
+  INVALID_CHARACTERS
+  INVALID_CIPHER_ID
+  INVALID_CLIENT_HELLO_INNER
+  INVALID_COFACTOR
+  INVALID_COMMAND
+  INVALID_COMPRESSED_POINT
+  INVALID_COMPRESSION_BIT
+  INVALID_COMPRESSION_LIST
+  INVALID_DELEGATED_CREDENTIAL
+  INVALID_DIGEST_LENGTH
+  INVALID_DIGEST_TYPE
+  INVALID_DIGIT
+  INVALID_DIRECTORY
+  INVALID_ECH_CONFIG_LIST
+  INVALID_ECH_PUBLIC_NAME
+  INVALID_ENCODING
+  INVALID_EVP_AEAD_CTX
+  INVALID_EXTENSION_STRING
+  INVALID_FIELD
+  INVALID_FIELD_FOR_VERSION
+  INVALID_FIELD_NAME
+  INVALID_FORM
+  INVALID_GROUP_ORDER
+
+=== TRADING-SPECIFIC STRINGS ===
+  ARACTERS
+  ARAMETER
+  ARAMETERS
+  ARAMETERS2GROUP_FAILURE
+  ARAMETERS_FAILURE
+  ARAMETERS_MISCONFIGURED
+  ARAMETERS_SET
+  ARAMS
+  ARAMS_ALREADY_GIVEN
+  ARATOR
+  ask1px
+  askBuilder
+  askCanceledPoisonError
+  askConstraintInvalidSerialNumberI
+  askDialogIndirect
+  askFatMaskBuilder
+  askH3
+  askI
+  askInvalid
+  askInvalidUrlSchemeRegisterErrorD
+  askMemAlloc
+  askMemFree
+  askMissing
+  askMissingBitfieldMasksMissingBmp
+  askNonContiguousBitfieldMaskInval
+  ask_pool
+  askbarCreated
+  askbarH
+  askbarH3K
+  askbarI
+  askbarallow
+  askbardeny
+  askbarset_cursor_grabset_cursor_v
+  askbarset_cursor_visibr_events
+  askbarskipTaskbarwindowClassnamen
+  asked
+  askedwholesincestock
+  asketball
+  asketballboth
+  askkill
+  askpending_sendnext_pending_send_
+  askpush_taskpending_push_promises
+  asks
+  asksSlimC
+  asksURL
+  askuser
+  bidatribunaltenerifecanci
+
+=== MICRO-FRONTEND PAGE ROUTES ===
+  micro-frontend: stockbit
+  micro-frontend: buysell
+  micro-frontend: portoperformance
+  micro-frontend: historical
+  micro-frontend: buysell
+  micro-frontend: buysell
+  micro-frontend: financial
+  micro-frontend: movers
+  micro-frontend: eipo
+  micro-frontend: fasttrade
+  micro-frontend: stockbit
+  micro-frontend: financial
+  micro-frontend: backpack
+  micro-frontend: chartbit
+  micro-frontend: fasttrade
+  micro-frontend: insideractivity
+  micro-frontend: historical
+  micro-frontend: brokerposition
+  micro-frontend: financial
+  micro-frontend: tradebookchart
+  micro-frontend: topstocks
+  micro-frontend: financial
+  micro-frontend: financial
+  micro-frontend: brokerdistribution
+  micro-frontend: backpack
+  micro-frontend: buysell
+  micro-frontend: financial
+  micro-frontend: brokeractivitychart
+  micro-frontend: eipo
+  micro-frontend: financial
+  micro-frontend: fasttrade
+  micro-frontend: historical
+  micro-frontend: eipo
+  micro-frontend: fasttrade
+  micro-frontend: financial
+  micro-frontend: stockbit
+  micro-frontend: brokerflow
+  micro-frontend: movers
+  micro-frontend: financial
+  micro-frontend: financial
+
+=== SENTRY CONFIG ===
+  0x9986A9: sentry.rHCrust
+  0xD001C4: sentry: Sentry is not configured
+  0xD00204: sentry: gzip failed
+  0xD00254: sentry: no local logs to send
+  0xD00604: sentry-core-0.47.0\src\error.rs
+  0xD07AC1: sentry-core-0.47.0\src\clientoptions.rs
+  0xD07EF2: sentry client due to disabled or invalid DSN
+
+  0xD07F38: sentry client for DSN 
+  0xD09451: sentry.stockbit.io/39core\src\monitoring.rs
+  0x1760327: sentry response: vA
+  0x1760750: sentry-transport("vA
+  0x17608F3: sentry` crate.
+  0x1760B4C: sentry-0.47.0\src\defaults.rs
+  0x1760D88: SENTRY_DSNSENTRY_RELEASESENTRY_ENVIRONMENTproductionHTTP_PROXYHTTPS_PROXYSSL_VERIFYhttps_proxyhttp_proxyJxA
+  0x1760E74: sentry-0.47.0\src\transports\tokio_thread.rs
+  0x1760F0C: sentry-0.47.0\src\transports\reqwest.rs
+  0x1760F52: Sentry-Auth
+  0x1760F7A: sentry-rate-limits
+  0x1761171: sentry.items.log+jsonlogevent_iddsnsdksent_atitems
+  0x176149A: sentry-backtrace-0.47.0\src\utils.rs
+  0x1761A75: sentry::sentry_core::sentry_types::sentry_backtrace::sentry_tracing::__rust____rust_rust_begin_unwind_startanyhow::log::tokio::tracing_core::futures_core::futures_util::
+  0x1761C9C: sentry-backtrace-0.47.0\src\integration.rs
+  0x1761DBC: sentry-core-0.47.0\src\performance.rs
+  0x1761EA4: sentry-core-0.47.0\src\scope\real.rs
+  0x176204C: sentry-core-0.47.0\src\client.rs
+  0x176232C: sentry-core-0.47.0\src\hub.rs
+  0x17623FC: sentry-core-0.47.0\src\session.rs
+  0x1762468: sentry-session-flusher
+  0x17627E0: sentry.rust/0.47.0
+  0x1762854: sentry-debug-images-0.47.0\src\images.rs
+  0x1762A51: sentry-panic-0.47.0\src\lib.rs
+  0x1762C3C: sentry-types-0.47.0\src\protocol\envelope.rs
+  0x1762D38: Sentry sentry_key=, sentry_version=
+  0x1762D82: sentry_timestamp=
+  0x1762DAA: sentry_client=AvA
+  0x1762DCA: sentry_secret=AvA
+  0x1762EA3: sentry-types-0.47.0\src\dsn.rs
+
+=== TRADINGVIEW CONFIG ===
+  indicator.svg
+  indicator__mf_owner__1__loadRemote__-DtmQBhzZ.js-
+  indicatorrisbSentence_BreakscfSimple_Case_FoldingscriptscriptextensionsScript_Extensionsscxsdsentencebreaksen
+  overlay an existing cookie
+  overlay-iconallow-set-positionallow-set-progress-barallow-set-resizableallow-set-shadowallow-set-simple-ful
+  overlay-icondeny-set-positiondeny-set-progress-bardeny-set-resizabledeny-set-simple-fullscreendeny-set-size
+  overlay_icon_title_bar_styleset_title_bar_stn_all_workspacesset_visible_on_atall
+  overlay_iconset_visible_on_all_workspacesset_title_bar_styletoggle_maximizeinternal_toggle_maximizepoisoned
+  overlaypresentactions</ul>
+wrapperalreadycertainrealitystorageanotherdesktopofferedpatternunusualDigitalca
+  study of theon the otherexecution ofHuman Rightsterms of theassociationsresearch andsucceeded bydefeated 
+  study of<ul class="splace in thewhere he was<li class="fthere are nowhich becamehe publishedexpressed int
+  studytradefoundsenseundershownformsrangeaddedstillmovedtakenaboveflashfixedoftenotherviewschecklegalriver
+  tradingview/charting_library/broker-api.d.ts[cAY=
+  tradingview/charting_library/charting_library.d.ts[JEq
+  tradingview/charting_library/datafeed-api.d.ts"0nclZp^$N"CXĂQ=BJ`up
+  tradingview/charting_library/package.json
+
+=== DONE ===
