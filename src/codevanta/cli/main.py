@@ -19,6 +19,7 @@ from rich.text import Text
 
 from codevanta.analysis import debug_session, dynamic
 from codevanta.analysis import emulate as emulator
+from codevanta.analysis import sbom as sbom_engine
 from codevanta.analysis.binary_diff import (
     DEFAULT_MAX_FUNCTIONS as DIFF_MAX_FUNCTIONS,
 )
@@ -2812,6 +2813,238 @@ def dataflow(
         console.print_json(json.dumps(result.to_dict()))
         return
     _print_dataflow_summary(result)
+
+
+@app.command()
+def sbom(
+    paths: Annotated[
+        list[Path] | None,
+        typer.Argument(help="Binaries and/or JS app directories/.asar archives to inventory"),
+    ] = None,
+    max_components: Annotated[
+        int,
+        typer.Option(
+            "--max-components",
+            help=f"Ceiling on components kept (1..{sbom_engine.MAX_COMPONENTS})",
+        ),
+    ] = sbom_engine.DEFAULT_MAX_COMPONENTS,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write the CycloneDX JSON document to this file"),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the CycloneDX JSON document instead of a table")
+    ] = False,
+) -> None:
+    """Aggregate inventories into a CycloneDX 1.6 SBOM (offline, deterministic).
+
+    Each PATH is a PE/ELF/Mach-O binary or a JavaScript application
+    directory/.asar archive. Components come from JS external packages
+    (versions only when package.json pins them exactly) and binary import
+    libraries; nothing is executed and no version is ever guessed.
+    """
+    if not paths:
+        _fail("at least one PATH is required", 2)
+    try:
+        result = sbom_engine.build_sbom(paths, max_components=max_components)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if output is not None:
+        try:
+            output.write_text(result.to_json(), encoding="utf-8")
+        except OSError as exc:
+            _fail(f"cannot write {output}: {exc}", 2)
+        console.print(f"[dim]wrote {escape(str(output))}[/]")
+    if json_output or output is not None:
+        if json_output:
+            console.print_json(result.to_json())
+        console.print(
+            f"[dim]components: {result.component_count}"
+            f" · serial: {escape(result.serial_number)}"
+            f" · truncated: {'yes' if result.truncated else 'no'}[/]"
+        )
+        for warning in result.warnings:
+            console.print(f"[yellow]warning:[/] {escape(warning)}")
+        return
+    table = Table(title=f"SBOM · CycloneDX {escape(sbom_engine.SPEC_VERSION)}")
+    table.add_column("Type")
+    table.add_column("Name")
+    table.add_column("Version")
+    table.add_column("PURL")
+    for component in result.components:
+        table.add_row(
+            escape(component.type),
+            escape(component.name),
+            escape(component.version or "-"),
+            escape(component.purl or "-"),
+        )
+    console.print(table)
+    console.print(
+        f"[dim]components: {result.component_count}"
+        f" · serial: {escape(result.serial_number)}"
+        f" · truncated: {'yes' if result.truncated else 'no'}[/]"
+    )
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    evidence = result.evidence.to_dict()
+    console.print(
+        f"[dim]evidence: {escape(str(evidence.get('source')))} via "
+        f"{escape(str(evidence.get('method')))} · confidence: "
+        f"{escape(str(evidence.get('confidence')))}[/]"
+    )
+
+
+@app.command()
+def capabilities(
+    path: Annotated[Path, typer.Argument(help="Path to the binary to analyse")],
+    rules: Annotated[
+        Path | None,
+        typer.Option("--rules", help="Optional JSON file with extra capability rules"),
+    ] = None,
+    string_limit: Annotated[
+        int, typer.Option("--string-limit", help="Maximum strings scanned for features")
+    ] = 5000,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Detect file-scope capabilities via bounded rule matching (capa-style subset).
+
+    Evaluates the built-in rule pack (plus ``--rules`` extras) against the
+    binary's imports, strings, exports and section names. Every match lists
+    exactly which features fired and where; the feature evidence is certain,
+    the capability conclusion is medium confidence. File scope only -- no
+    function-level attribution, unlike full capa.
+    """
+    from codevanta.analysis.capabilities import detect_capabilities
+
+    try:
+        result = detect_capabilities(path, extra_rules=rules, string_limit=string_limit)
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    payload = result.to_dict()
+    if payload["matches"]:
+        table = Table(title=f"capabilities · {escape(str(path))}")
+        table.add_column("Severity", justify="right")
+        table.add_column("Rule")
+        table.add_column("Capability")
+        table.add_column("Evidence (fired features)")
+        for match in payload["matches"]:
+            fired = ", ".join(f["description"] for f in match["fired_features"][:4])
+            more = len(match["fired_features"]) - 4
+            if more > 0:
+                fired += f" (+{more})"
+            table.add_row(
+                escape(str(match["severity"])),
+                escape(str(match["rule_id"])),
+                escape(str(match["name"])),
+                escape(fired or "-"),
+            )
+        console.print(table)
+    else:
+        console.print(f"[green]no capability matches[/] · {escape(str(path))}")
+    console.print(
+        f"[dim]rules evaluated: {payload['rule_count']}"
+        f" · matches: {len(payload['matches'])}"
+        f" · sha256: {escape(str(payload['sha256'])[:16])}…[/]"
+    )
+    for warning in payload["warnings"]:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    match_evidence = payload.get("evidence") or {}
+    console.print(
+        f"[dim]evidence: {escape(str(match_evidence.get('source')))} via "
+        f"{escape(str(match_evidence.get('method')))} · confidence: "
+        f"{escape(str(match_evidence.get('confidence')))}[/]"
+    )
+
+
+@app.command(name="stackstrings")
+def stackstrings_cmd(
+    path: Annotated[Path, typer.Argument(help="Path to the binary to analyse")],
+    address: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--address",
+            "-a",
+            help="Function address to emulate (decimal or 0x hex); repeatable",
+        ),
+    ] = None,
+    max_functions: Annotated[
+        int, typer.Option("--max-functions", help="Function budget when no --address is given")
+    ] = 16,
+    max_instructions: Annotated[
+        int, typer.Option("--max-instructions", help="Instruction budget per function")
+    ] = 2000,
+    max_strings: Annotated[
+        int, typer.Option("--max-strings", help="Strings kept per function")
+    ] = 32,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of a table")
+    ] = False,
+) -> None:
+    """Recover stack-constructed strings by bounded offline emulation (FLOSS-style).
+
+    Each function's bytes run on a private unicorn CPU -- nothing executes on
+    the host. Memory writes to the emulated stack are tracked and, at the stop
+    reason, printable ASCII and UTF-16LE runs in the written stack span become
+    stackstrings: medium confidence (the run provably appeared in emulated
+    memory, but emulation is an approximation).
+    """
+    from codevanta.analysis.stackstrings import extract_stack_strings
+
+    addresses = None
+    if address:
+        addresses = [_parse_address(one) for one in address]
+    try:
+        result = extract_stack_strings(
+            path,
+            addresses=addresses,
+            max_functions=max_functions,
+            max_instructions=max_instructions,
+            max_strings_per_function=max_strings,
+        )
+    except AnalysisError as exc:
+        _fail(str(exc), 2)
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+    if result.strings:
+        table = Table(title=f"stackstrings · {escape(str(path))}")
+        table.add_column("Function", justify="right")
+        table.add_column("Offset", justify="right")
+        table.add_column("Enc")
+        table.add_column("String")
+        for item in result.strings:
+            table.add_row(
+                hex(item.function_address),
+                hex(item.stack_offset),
+                item.encoding,
+                escape(item.value),
+            )
+        console.print(table)
+    else:
+        console.print(f"[green]no stackstrings recovered[/] · {escape(str(path))}")
+    stops: dict[str, int] = {}
+    for function in result.functions:
+        stops[function.stop_reason] = stops.get(function.stop_reason, 0) + 1
+    stops_text = " ".join(f"{name}:{count}" for name, count in sorted(stops.items()))
+    console.print(
+        f"[dim]functions: {result.functions_emulated}/{result.functions_scanned}"
+        f" · strings: {len(result.strings)}"
+        f" · stops: {escape(stops_text or 'none')}"
+        f" · truncated: {'yes' if result.truncated else 'no'}[/]"
+    )
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {escape(warning)}")
+    report_evidence = result.evidence.to_dict()
+    console.print(
+        f"[dim]evidence: {escape(str(report_evidence.get('source')))} via "
+        f"{escape(str(report_evidence.get('method')))} · confidence: "
+        f"{escape(str(report_evidence.get('confidence')))}[/]"
+    )
 
 
 # ---- phase 7: analysis plugins ----------------------------------------------

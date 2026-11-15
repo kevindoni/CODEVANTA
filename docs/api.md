@@ -36,6 +36,11 @@ before you rely on it.
 - [`codevanta.analysis.evidence_bundle`: tamper-evident bundles](#codevantaanalysisevidence_bundle-tamper-evident-bundles)
 - [`codevanta.analysis.trace`: trace replay and attribution](#codevantaanalysistrace-trace-replay-and-attribution)
 - [`codevanta.analysis.dynamic`: provider probes and session scripts](#codevantaanalysisdynamic-provider-probes-and-session-scripts)
+- [`codevanta.analysis.javascript`: static JS/Electron inventory](#codevantaanalysisjavascript-static-jselectron-inventory)
+- [`codevanta.analysis.electron_audit`: Electron security rules](#codevantaanalysiselectron_audit-electron-security-rules)
+- [`codevanta.analysis.sbom`: CycloneDX export](#codevantaanalysissbom-cyclonedx-export)
+- [`codevanta.analysis.capabilities`: capability rules](#codevantaanalysiscapabilities-capability-rules)
+- [`codevanta.analysis.stackstrings`: stack-built string recovery](#codevantaanalysisstackstrings-stack-built-string-recovery)
 - [`codevanta.plugins`: the plugin SDK](#codevantaplugins-the-plugin-sdk)
 - [`codevanta.storage.session`: persisted sessions](#codevantastoragesession-persisted-sessions)
 - [`codevanta.gui`: local web dashboard](#codevantagui-local-web-dashboard)
@@ -1296,6 +1301,95 @@ print(script.entry_commands[:2])
 (Probe results are this Windows machine's answer.) The CLI surface is
 `codevanta attach`; replaying what such a session printed is
 [`codevanta.analysis.trace`](#codevantaanalysistrace-trace-replay-and-attribution).
+
+
+## `codevanta.analysis.javascript`: static JS/Electron inventory
+
+`analyze_javascript_app(path, *, max_files=512)` walks an extracted
+application directory or an `.asar` archive (through the same bounded parser
+as `codevanta asar`) and returns a `JsAppReport`. Per `.js`/`.cjs`/`.mjs`
+file: imports (`require`, `import`, `export-from`, `import-dynamic`)
+classified `relative`/`bare`/`builtin` and resolved Node-style against the
+scanned set when possible, `ipcMain.*`/`ipcRenderer.*` sites with literal
+channels, the referenced Electron APIs, and a heuristic process role
+(`main`/`renderer`/`preload`/`mixed`). Channels are paired across sides by
+exact name (`IpcPair`, medium confidence), with `main_only`/`renderer_only`
+leftovers reported instead of guessed. The root `package.json` contributes
+`name`, `main` and the declared `electron` version.
+
+Literal text findings are `certain`; classifications and pairings are
+`medium` and carry their own evidence. Bounds (rows, depth, per-file and
+whole-scan bytes, per-file import/IPC sites) all report through `truncated`
+flags, `skipped` counters and warnings. Nothing is executed and no Node.js is
+required. Malformed inputs raise `AnalysisError`.
+
+```python
+from codevanta.analysis.javascript import analyze_javascript_app
+
+report = analyze_javascript_app("path/to/app")
+payload = report.to_dict()
+print(payload["package"]["electron_version"])
+print([pair["channel"] for pair in payload["ipc"]["pairs"]])
+```
+
+CLI: `codevanta js analyze`; MCP: the `codevanta_javascript` tool; GUI: the
+`/api/js` route. See [docs/javascript.md](javascript.md) for the confidence
+table and the full bound list.
+
+
+## `codevanta.analysis.electron_audit`: Electron security rules
+
+`audit_electron_app(path, *, max_files=512)` runs the JavaScript inventory
+first (roles, package facts as context), then applies bounded regex rules
+over the JS/HTML sources of an app directory or `.asar` archive:
+`nodeIntegration: true`, `contextIsolation: false`, `sandbox: false`,
+`webSecurity: false`, `allowRunningInsecureContent: true`, missing or weak
+CSP, interpolated `exec`/`spawn` commands, caller-chosen IPC channels behind
+`contextBridge`, `shell.openExternal` with non-literal arguments and remote
+`loadURL` literals. Each finding carries a rule id, severity, confidence,
+file, line, snippet, recommendation and evidence; literal misconfigurations
+are `certain`, shape-based findings are `medium`. CLI: `codevanta js audit`;
+MCP: `codevanta_electron_audit`. See
+[docs/electron-audit.md](electron-audit.md).
+
+
+## `codevanta.analysis.sbom`: CycloneDX export
+
+`build_sbom(paths, *, max_components=2000) -> SbomReport` aggregates the
+existing inventories into a deterministic CycloneDX 1.6 document: JS
+external packages (versions only when `package.json` pins them exactly) and
+binary import libraries become components, every component carries its
+evidence as a property, the serial number is a `uuid5` over the input
+digests and there is no timestamp. Versions are never guessed. CLI:
+`codevanta sbom PATH... [-o file]`; MCP: `codevanta_sbom`. See
+[docs/sbom.md](sbom.md).
+
+
+## `codevanta.analysis.capabilities`: capability rules
+
+`detect_capabilities(path, *, extra_rules=None, string_limit=5000)` matches
+a bounded rule tree (imports / strings / exports / sections, `and`/`or`
+logic) against a binary: 14 built-in rules covering HTTP/TCP communication,
+process creation, registry writes, service installs, keylogging,
+screenshots, reverse-shell and injection candidates, packing hints and
+more, plus optional JSON extra rules. Every match lists exactly which
+features fired and where; features are `certain`, the capability conclusion
+is `medium`. File scope only — no function-level attribution, unlike full
+capa. CLI: `codevanta capabilities`; MCP: `codevanta_capabilities`. See
+[docs/capabilities.md](capabilities.md).
+
+
+## `codevanta.analysis.stackstrings`: stack-built string recovery
+
+`extract_stack_strings(path, *, addresses=None, max_functions=16,
+max_instructions=2000, max_strings_per_function=32)` runs each target
+function's bytes on a private unicorn CPU (nothing executes on the host),
+tracks memory writes to the emulated stack, and reports the printable
+ASCII / UTF-16LE runs in the written span with their function, stack
+offset, encoding and evidence. Medium confidence: the string provably
+appeared in emulated memory, but emulation is an approximation. Needs the
+optional ``emulation`` extra. CLI: `codevanta stackstrings`; MCP:
+`codevanta_stackstrings`. See [docs/stackstrings.md](stackstrings.md).
 
 
 ## `codevanta.storage.session`: persisted sessions

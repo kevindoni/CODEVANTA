@@ -66,7 +66,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
 def test_server_lists_fifty_five_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
-    assert len(names) == 55
+    assert len(names) == 60
     assert names == [
     "codevanta_adb",
     "codevanta_analyze",
@@ -75,6 +75,7 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_binmeta",
     "codevanta_bridges",
     "codevanta_callgraph",
+    "codevanta_capabilities",
     "codevanta_certs",
     "codevanta_cfg",
     "codevanta_codesign",
@@ -88,6 +89,7 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_disasm",
     "codevanta_dtb",
     "codevanta_dwarf",
+    "codevanta_electron_audit",
     "codevanta_entropy",
     "codevanta_firmware_extract",
     "codevanta_frida",
@@ -96,6 +98,7 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_gpu",
     "codevanta_il2cpp",
     "codevanta_info",
+    "codevanta_javascript",
     "codevanta_js_recover",
     "codevanta_jump_table",
     "codevanta_lldb_run",
@@ -107,11 +110,13 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_proto_decode",
     "codevanta_providers",
     "codevanta_rizin_functions",
+    "codevanta_sbom",
     "codevanta_session_list",
     "codevanta_session_save",
     "codevanta_signal_sr",
     "codevanta_similarity",
     "codevanta_sqlite",
+    "codevanta_stackstrings",
     "codevanta_strings",
     "codevanta_struct",
     "codevanta_symbolic",
@@ -1733,3 +1738,135 @@ def test_dataflow_rejects_bad_addresses_and_zero_budgets(const_elf_path: Path) -
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# codevanta_javascript (static JS/Electron app inventory, offline)
+
+
+@pytest.fixture
+def js_app_path(tmp_path: Path) -> Path:
+    """A two-file Electron-shaped app: one main and one renderer file."""
+    (tmp_path / "package.json").write_text(
+        '{"name": "mcp-js", "main": "main.js"}', encoding="utf-8"
+    )
+    (tmp_path / "main.js").write_text(
+        "const { ipcMain } = require('electron');\n"
+        "ipcMain.handle('ping', () => 1);\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "renderer.js").write_text(
+        "const { ipcRenderer } = require('electron');\n"
+        "ipcRenderer.invoke('ping');\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_javascript_inventory_reports_modules_and_ipc(js_app_path: Path) -> None:
+    payload = tools.codevanta_javascript(str(js_app_path))
+    assert payload["kind"] == "directory"
+    assert payload["package"]["name"] == "mcp-js"
+    assert [p["channel"] for p in payload["ipc"]["pairs"]] == ["ping"]
+    # Every other tool returns JSON-safe values; so must this one.
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_javascript_rejects_wrong_kind_and_bad_cap(js_app_path: Path) -> None:
+    plain = js_app_path / "notes.txt"
+    plain.write_text("hi", encoding="utf-8")
+    with pytest.raises(AnalysisError, match="neither a directory nor an .asar"):
+        tools.codevanta_javascript(str(plain))
+    with pytest.raises(AnalysisError, match="max_files must be between 1 and"):
+        tools.codevanta_javascript(str(js_app_path), max_files=0)
+
+
+def test_server_call_tool_javascript(js_app_path: Path) -> None:
+    result = asyncio.run(
+        build_server().call_tool("codevanta_javascript", {"path": str(js_app_path)})
+    )
+    payload = _payload(result)
+    assert payload["kind"] == "directory"
+    assert payload["package"]["name"] == "mcp-js"
+
+
+# ---------------------------------------------------------------------------
+# codevanta_electron_audit / codevanta_sbom / codevanta_capabilities
+
+
+def test_electron_audit_tool_reports_findings(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text('{"name": "vuln"}', encoding="utf-8")
+    (tmp_path / "main.js").write_text(
+        "new BrowserWindow({ webPreferences: { nodeIntegration: true } });\n",
+        encoding="utf-8",
+    )
+    payload = tools.codevanta_electron_audit(str(tmp_path))
+    ids = [f["rule_id"] for f in payload["findings"]]
+    assert "EA-001" in ids
+    assert payload["summary"]["critical"] >= 1
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_electron_audit_tool_rejects_bad_path(tmp_path: Path) -> None:
+    plain = tmp_path / "x.txt"
+    plain.write_text("hi", encoding="utf-8")
+    with pytest.raises(AnalysisError, match="neither a directory nor an .asar"):
+        tools.codevanta_electron_audit(str(plain))
+
+
+def test_sbom_tool_builds_cyclonedx_document(js_app_path: Path) -> None:
+    payload = tools.codevanta_sbom([str(js_app_path)])
+    assert payload["bomFormat"] == "CycloneDX"
+    assert payload["specVersion"] == "1.6"
+    names = [c["name"] for c in payload["components"]]
+    assert "electron" in names
+    assert payload["serialNumber"].startswith("urn:uuid:")
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_sbom_tool_rejects_missing_path(tmp_path: Path) -> None:
+    with pytest.raises(AnalysisError, match="cannot"):
+        tools.codevanta_sbom([str(tmp_path / "missing")])
+
+
+def test_server_call_tool_electron_audit_and_sbom(js_app_path: Path) -> None:
+    result = asyncio.run(
+        build_server().call_tool("codevanta_electron_audit", {"path": str(js_app_path)})
+    )
+    payload = _payload(result)
+    assert payload["kind"] == "directory"
+
+    result = asyncio.run(
+        build_server().call_tool("codevanta_sbom", {"paths": [str(js_app_path)]})
+    )
+    payload = _payload(result)
+    assert payload["bomFormat"] == "CycloneDX"
+
+
+def test_capabilities_tool_reports_no_false_matches(elf64_text_path: Path) -> None:
+    result = asyncio.run(
+        build_server().call_tool("codevanta_capabilities", {"path": str(elf64_text_path)})
+    )
+    payload = _payload(result)
+    assert payload["rule_count"] >= 14
+    assert payload["matches"] == []
+
+
+def test_stackstrings_tool_recovers_strings(tmp_path: Path) -> None:
+    pytest.importorskip("unicorn")
+    from test_stackstrings import CODE_HELLO_WORLD, _sample
+
+    sample = _sample(tmp_path, CODE_HELLO_WORLD)
+    payload = tools.codevanta_stackstrings(str(sample))
+    assert payload["functions_emulated"] >= 1
+    assert any(s["encoding"] == "ascii" for s in payload["strings"])
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_stackstrings_tool_rejects_bad_budget(tmp_path: Path) -> None:
+    pytest.importorskip("unicorn")
+    from test_stackstrings import CODE_HELLO_WORLD, _sample
+
+    sample = _sample(tmp_path, CODE_HELLO_WORLD)
+    with pytest.raises(AnalysisError, match="max_functions"):
+        tools.codevanta_stackstrings(str(sample), max_functions=0)

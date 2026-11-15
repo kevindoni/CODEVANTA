@@ -86,6 +86,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from codevanta.analysis import javascript
 from codevanta.analysis.binary_diff import (
     DEFAULT_SEMANTIC_THRESHOLD,
     MAX_SEMANTIC_THRESHOLD,
@@ -1183,6 +1184,115 @@ def _api_metadata(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
     return report.to_dict()
 
 
+def _api_javascript(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return the static JavaScript/Electron inventory for one app path.
+
+    :func:`~codevanta.analysis.javascript.analyze_javascript_app` accepts an
+    extracted application directory or an ``.asar`` archive and never executes
+    anything; wrong path kinds are the engine's typed ``AnalysisError``
+    (HTTP ``400``).
+    """
+    target = _query_path(params, "path", allow_paths)
+    max_files = _query_int(
+        params, "max_files", javascript.DEFAULT_MAX_FILES, 1, javascript.MAX_FILES
+    )
+    report = javascript.analyze_javascript_app(target, max_files=max_files)
+    return report.to_dict()
+
+
+def _api_js_audit(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return the Electron security audit for one app path.
+
+    :func:`~codevanta.analysis.electron_audit.audit_electron_app` reuses the
+    JavaScript inventory and applies bounded security rules; wrong path kinds
+    are the engine's typed ``AnalysisError`` (HTTP ``400``).
+    """
+    from codevanta.analysis import electron_audit
+
+    target = _query_path(params, "path", allow_paths)
+    max_files = _query_int(
+        params,
+        "max_files",
+        electron_audit.DEFAULT_MAX_FILES,
+        1,
+        electron_audit.MAX_FILES,
+    )
+    return electron_audit.audit_electron_app(target, max_files=max_files).to_dict()
+
+
+def _api_sbom(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return a CycloneDX 1.6 SBOM for one or more input paths.
+
+    ``paths`` (comma-joined when repeated) or a single ``path`` feeds
+    :func:`~codevanta.analysis.sbom.build_sbom`; binaries and JavaScript app
+    directories/.asar archives are accepted, nothing is executed.
+    """
+    from codevanta.analysis import sbom as sbom_engine
+
+    raw = _first(params, "paths") or _first(params, "path")
+    if raw is None:
+        raise _RouteError("paths (or path) is required")
+    if not allow_paths:
+        raise _RouteError("paths is not accepted by this server (path parameters are disabled)")
+    targets = [Path(part.strip()) for part in raw.split(",") if part.strip()]
+    if not targets:
+        raise _RouteError("paths is required")
+    max_components = _query_int(
+        params,
+        "max_components",
+        sbom_engine.DEFAULT_MAX_COMPONENTS,
+        1,
+        sbom_engine.MAX_COMPONENTS,
+    )
+    return sbom_engine.build_sbom(targets, max_components=max_components).to_dict()
+
+
+def _api_capabilities(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return file-scope capability matches for one binary path.
+
+    :func:`~codevanta.analysis.capabilities.detect_capabilities` evaluates
+    the built-in rule pack (plus an optional ``rules`` JSON file) over the
+    binary's imports/strings/exports/sections; wrong inputs are the engine's
+    typed ``AnalysisError`` (HTTP ``400``).
+    """
+    from codevanta.analysis import capabilities as capabilities_engine
+
+    target = _query_path(params, "path", allow_paths)
+    string_limit = _query_int(
+        params, "string_limit", 5000, 1, 50_000
+    )
+    rules_raw = _first(params, "rules")
+    return capabilities_engine.detect_capabilities(
+        target,
+        extra_rules=Path(rules_raw) if rules_raw else None,
+        string_limit=string_limit,
+    ).to_dict()
+
+
+def _api_stackstrings(params: dict[str, str], allow_paths: bool) -> dict[str, Any]:
+    """Return stack-built strings recovered by bounded offline emulation.
+
+    :func:`~codevanta.analysis.stackstrings.extract_stack_strings` runs the
+    target function's bytes on a private unicorn CPU (never the host); the
+    optional emulation extra's absence is the engine's typed error (HTTP
+    ``400``), matching ``/api/emulate``.
+    """
+    from codevanta.analysis import stackstrings as stackstrings_engine
+
+    target = _query_path(params, "path", allow_paths)
+    address = _query_address(params, "address") if _first(params, "address") else None
+    max_functions = _query_int(params, "max_functions", 16, 1, 64)
+    max_instructions = _query_int(params, "max_instructions", 2000, 1, 10_000)
+    max_strings = _query_int(params, "max_strings", 32, 1, 128)
+    return stackstrings_engine.extract_stack_strings(
+        target,
+        addresses=[address] if address is not None else None,
+        max_functions=max_functions,
+        max_instructions=max_instructions,
+        max_strings_per_function=max_strings,
+    ).to_dict()
+
+
 #: Route table: request path -> payload builder. Builders take the query
 #: parameters and the handler's ``paths_allowed`` flag.
 ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
@@ -1206,6 +1316,11 @@ ROUTES: dict[str, Callable[[dict[str, str], bool], dict[str, Any]]] = {
     "/compare": _api_compare,
     "/nav": _api_nav,
     "/metadata": _api_metadata,
+    "/api/js": _api_javascript,
+    "/api/js-audit": _api_js_audit,
+    "/api/sbom": _api_sbom,
+    "/api/capabilities": _api_capabilities,
+    "/api/stackstrings": _api_stackstrings,
 }
 
 def _json_default(value: Any) -> Any:

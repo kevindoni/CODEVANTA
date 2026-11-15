@@ -334,6 +334,14 @@ codevanta dataflow        samples\elf64_text.bin                       # def-use
 codevanta evidence-bundle samples\elf64_text.bin --entry report=samples\report_elf64.json -o bundle.json
 codevanta plugins list
 codevanta plugins run     metrics samples\elf64_text.bin
+
+# JavaScript / Electron applications (static, offline, no Node required)
+codevanta js analyze      path\to\app           # directory or .asar archive
+codevanta js analyze      app.asar --json       # modules, imports, IPC boundaries
+codevanta js audit        path\to\app           # security anti-patterns (EA-001..EA-042)
+codevanta sbom            path\to\app samples\pe64_text.bin -o sbom.json   # CycloneDX 1.6
+codevanta capabilities    samples\pe64_text.bin # capa-style rule matching
+codevanta stackstrings    samples\pe64_text.bin # FLOSS-style stack-built strings
 ```
 
 `diff --semantic` prints one dim
@@ -501,7 +509,9 @@ MCP tools: `codevanta_info`, `codevanta_functions`,
 `codevanta_jump_table`, `codevanta_function_hash`, `codevanta_similarity`,
 `codevanta_struct`, `codevanta_entropy`, `codevanta_decompile`,
 `codevanta_dwarf`, `codevanta_vtable`, `codevanta_trace`,
-`codevanta_symbolic`, `codevanta_dataflow`,
+`codevanta_symbolic`, `codevanta_dataflow`, `codevanta_javascript`,
+`codevanta_electron_audit`, `codevanta_sbom`, `codevanta_capabilities`,
+`codevanta_stackstrings`,
 `codevanta_session_save`, `codevanta_session_list`.
 `codevanta_analyze` mirrors
 the CLI flags (`include_xrefs` / `include_cfg` / `include_callgraph`, default off)

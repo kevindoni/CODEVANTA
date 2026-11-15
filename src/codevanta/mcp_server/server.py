@@ -1087,6 +1087,133 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Statically inventory a JavaScript/Electron application offline "
+            "(pure Python, nothing executed). Give it an extracted app "
+            "directory or an .asar archive and it returns bounded modules, "
+            "imports (require/import/export-from/dynamic, classified "
+            "relative/bare/builtin and resolved against the scanned set when "
+            "possible), package.json facts (name, main, electron version), a "
+            "heuristic per-file Electron process role "
+            "(main/renderer/preload/mixed), and ipcMain/ipcRenderer call "
+            "sites with literal channels paired across sides by exact name. "
+            "Literal text matches are certain; roles and channel pairs are "
+            "medium confidence and carry their own evidence. Bounds: file "
+            "rows, depth, per-file bytes and a whole-scan byte budget, every "
+            "cap reported through truncated flags and warnings."
+        )
+    )
+    def codevanta_javascript(
+        path: str, max_files: int = 512
+    ) -> dict:
+        try:
+            return tools.codevanta_javascript(path, max_files=max_files)
+        except AnalysisError as exc:
+            # A wrong path/kind or an out-of-range max_files is
+            # caller-correctable; surface the engine's typed message instead
+            # of the framework's generic error text.
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Audit a JavaScript/Electron application for security "
+            "anti-patterns, offline and pure Python (nothing executed, no "
+            "Node.js). Runs the static app inventory first, then bounded "
+            "regex rules over JS and HTML sources: nodeIntegration:true, "
+            "contextIsolation:false, sandbox:false, webSecurity:false, "
+            "missing or weak CSP, interpolated exec/spawn commands, "
+            "caller-chosen IPC channels behind contextBridge, "
+            "shell.openExternal with non-literal arguments, remote loadURL "
+            "literals. Each finding carries rule id, severity, confidence, "
+            "file, line, snippet, recommendation and evidence; literal "
+            "misconfigurations are certain, shape-based findings are medium."
+        )
+    )
+    def codevanta_electron_audit(
+        path: str, max_files: int = 512
+    ) -> dict:
+        try:
+            return tools.codevanta_electron_audit(path, max_files=max_files)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Aggregate CODEVANTA inventories into a deterministic CycloneDX "
+            "1.6 SBOM document. Each path is a PE/ELF/Mach-O binary or a "
+            "JavaScript application directory/.asar archive; components come "
+            "from JS external packages (versions only when package.json pins "
+            "them exactly) and binary import libraries. The serial number is "
+            "derived from the input hashes, there is no timestamp, versions "
+            "are never guessed, and every component carries its evidence as "
+            "a property. Bounded by max_components with honest truncation. "
+            "Nothing is executed."
+        )
+    )
+    def codevanta_sbom(
+        paths: list[str], max_components: int = 2000
+    ) -> dict:
+        try:
+            return tools.codevanta_sbom(paths, max_components=max_components)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Detect file-scope capabilities in a binary via bounded rule "
+            "matching over imports, strings, exports and section names: "
+            "HTTP/TCP communication, process creation, registry writes, "
+            "service installs, keylogging, screenshots, reverse-shell and "
+            "injection candidates, packing hints and more (14 built-in "
+            "rules; supply extra_rules as a JSON file to extend). Every "
+            "match lists exactly which features fired and where -- the "
+            "feature evidence is certain, the capability conclusion is "
+            "medium confidence. File scope only: no function-level "
+            "attribution, unlike full capa. Nothing is executed."
+        )
+    )
+    def codevanta_capabilities(
+        path: str, extra_rules: str | None = None, string_limit: int = 5000
+    ) -> dict:
+        try:
+            return tools.codevanta_capabilities(
+                path, extra_rules=extra_rules, string_limit=string_limit
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
+            "Recover stack-constructed strings by bounded offline emulation "
+            "(FLOSS-style). Each target function's bytes run on a private "
+            "unicorn CPU -- nothing executes on the host; emulated stack "
+            "writes are tracked and printable ASCII / UTF-16LE runs in the "
+            "written span become stackstrings with their function, stack "
+            "offset, encoding and evidence. Results are medium confidence: "
+            "the string provably appeared in emulated memory, but emulation "
+            "is an approximation. Needs the optional emulation extra (pip "
+            "install codevanta[emulation]); its absence is a typed error."
+        )
+    )
+    def codevanta_stackstrings(
+        path: str,
+        addresses: list[int] | None = None,
+        max_functions: int = 16,
+        max_instructions: int = 2000,
+        max_strings: int = 32,
+    ) -> dict:
+        try:
+            return tools.codevanta_stackstrings(
+                path,
+                addresses=addresses,
+                max_functions=max_functions,
+                max_instructions=max_instructions,
+                max_strings=max_strings,
+            )
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
             "Parse a PE file's certificate table offline with pure Python: "
             "WIN_CERTIFICATE entries and the PKCS#7 SignedData structure via "
             "a minimal hand-rolled DER walk - signer count, serial numbers "

@@ -4,6 +4,44 @@ All notable changes to CODEVANTA are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **JavaScript/Electron static analysis lane**: offline, pure-Python
+  inventory of an app directory or `.asar` archive - modules, imports
+  (require/import/export-from/dynamic, classified relative/bare/builtin,
+  Node-style resolution against the scanned set), `package.json` facts,
+  heuristic per-file Electron process roles, and `ipcMain`/`ipcRenderer`
+  call sites with literal channels paired across sides by exact name
+  (`codevanta js analyze`, MCP `codevanta_javascript`, GUI `/api/js`).
+- **Electron security audit** (`codevanta js audit`, MCP
+  `codevanta_electron_audit`, GUI `/api/js-audit`): ten bounded rules
+  (EA-001..EA-042) over JS/HTML sources - nodeIntegration, contextIsolation,
+  sandbox, webSecurity, missing/weak CSP, interpolated exec/spawn,
+  caller-chosen IPC channels, `shell.openExternal` with non-literals, remote
+  `loadURL` - each finding with severity, confidence, file, line, snippet,
+  recommendation and evidence.
+- **CycloneDX 1.6 SBOM export** (`codevanta sbom`, MCP `codevanta_sbom`,
+  GUI `/api/sbom`): deterministic document aggregated from JS external
+  packages (exact pinned versions only) and binary import libraries;
+  serial from input digests, no timestamps, versions never guessed,
+  evidence as component properties.
+- **Capability rules lane** (`codevanta capabilities`, MCP
+  `codevanta_capabilities`, GUI `/api/capabilities`): file-scope capa-style
+  rule matching over imports/strings/exports/sections - 14 built-in rules
+  plus optional JSON extra rules, and/or feature trees, ATT&CK tags where
+  confident, per-feature fired locations.
+- **Stackstring recovery lane** (`codevanta stackstrings`, MCP
+  `codevanta_stackstrings`, GUI `/api/stackstrings`): FLOSS-style recovery
+  of stack-constructed strings via the bounded offline unicorn emulator,
+  with per-record evidence (medium confidence).
+
+### Changed
+
+- MCP server registers **60 tools** (from 55 at v0.3.0); the dashboard
+  grows to **25 routes** (from 20).
+
 ## [0.3.0] - 2026-11-14
 
 ### Added
