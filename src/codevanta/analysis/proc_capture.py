@@ -42,7 +42,7 @@ import subprocess
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from codevanta.core.report import AnalysisError
@@ -376,7 +376,7 @@ def capture_process(
     warnings: list[str] = []
     timed_out = False
     exit_code: int | None = None
-    started = datetime.now(UTC)
+    started = datetime.now(timezone.utc)
     clock = time.monotonic()
     try:
         outcome = execute(list(argv), **kwargs)
@@ -400,7 +400,7 @@ def capture_process(
         raw_stdout = _as_bytes(getattr(outcome, "stdout", None), "stdout")
         raw_stderr = _as_bytes(getattr(outcome, "stderr", None), "stderr")
     elapsed_ms = (time.monotonic() - clock) * 1000.0
-    finished = datetime.now(UTC)
+    finished = datetime.now(timezone.utc)
 
     kept_stdout, stdout_truncated = _bound(raw_stdout, checked_bound)
     kept_stderr, stderr_truncated = _bound(raw_stderr, checked_bound)
