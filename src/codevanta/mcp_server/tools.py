@@ -342,6 +342,18 @@ from codevanta.mcp_server.ext_signal import (  # lane-signal: ONE MCP registrati
     codevanta_uart_decode,  # noqa: F401
 )
 from codevanta.mcp_server.ext_solver import codevanta_symbolic_solve  # noqa: F401 -- one-line registration of the ext solver MCP tool
+from codevanta.mcp_server.ext_ssa import (  # lane-ssa: ONE MCP registration line
+    DEFAULT_MAX_BLOCKS as DEFAULT_SSA_MAX_BLOCKS,  # noqa: F401 -- server wrapper default
+)
+from codevanta.mcp_server.ext_ssa import (
+    DEFAULT_MAX_INSTRUCTIONS as DEFAULT_SSA_MAX_INSTRUCTIONS,  # noqa: F401 -- server wrapper default
+)
+from codevanta.mcp_server.ext_ssa import (
+    TOOL_DESCRIPTION_SSA as TOOL_DESCRIPTION_SSA,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_ssa import (
+    codevanta_ssa as codevanta_ssa,  # noqa: F401 -- lane-ssa
+)
 from codevanta.mcp_server.ext_stackstrings import codevanta_stackstrings as codevanta_stackstrings  # noqa: F401 -- lane-stackstrings: ONE MCP registration line
 from codevanta.mcp_server.ext_stackstrings import (
     codevanta_static_strings as codevanta_static_strings,  # noqa: F401 -- lane-stackstrings: ONE MCP registration line

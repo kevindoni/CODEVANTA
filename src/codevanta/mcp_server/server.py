@@ -40,6 +40,7 @@ from .ext_fs import TOOL_DESCRIPTION_FS_SNAPSHOT as FS_SNAPSHOT_DESCRIPTION
 from .ext_netcapture import TOOL_DESCRIPTION_NET_CAPTURE as NET_CAPTURE_DESCRIPTION
 from .ext_netcapture import TOOL_DESCRIPTION_NET_INTERFACES as NET_INTERFACES_DESCRIPTION
 from .ext_solver import TOOL_DESCRIPTION as SYMBOLIC_SOLVE_DESCRIPTION
+from .ext_ssa import TOOL_DESCRIPTION_SSA as SSA_DESCRIPTION
 from .ext_uires import TOOL_DESCRIPTION_DIALOG_DECODE as UIRES_DIALOG_DESCRIPTION
 from .ext_uires import TOOL_DESCRIPTION_UI_PREVIEW as UIRES_PREVIEW_DESCRIPTION
 from .ext_webfw import TOOL_DESCRIPTION_SOURCEMAP as WEBFW_SOURCEMAP_DESCRIPTION
@@ -2186,6 +2187,26 @@ def build_server() -> MCPServer:
                 output_directory,
             )
         except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    # lane-ssa: read-only SSA IR view of one function (decompiler v2 increment 1).
+    @server.tool(description=SSA_DESCRIPTION)
+    def codevanta_ssa(
+        path: str,
+        address: int,
+        max_blocks: int = tools.DEFAULT_SSA_MAX_BLOCKS,
+        max_instructions: int = tools.DEFAULT_SSA_MAX_INSTRUCTIONS,
+    ) -> dict:
+        try:
+            return tools.codevanta_ssa(
+                path,
+                address,
+                max_blocks=max_blocks,
+                max_instructions=max_instructions,
+            )
+        except AnalysisError as exc:
+            # A bad address or an out-of-range budget is caller-correctable;
+            # keep the typed message instead of the framework's generic crash.
             raise ToolError(str(exc)) from exc
 
     return server
