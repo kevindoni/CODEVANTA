@@ -1860,6 +1860,27 @@ def build_server() -> MCPServer:
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
+    @server.tool(
+        description=(
+            "Auto-detect the mangling scheme of a bounded batch of symbols "
+            "and decode them offline with a pure-Python bounded parser: "
+            "Itanium C++ (_Z..., nested names, args, templates, "
+            "substitutions), MSVC C++ (?..., free/member functions, common "
+            "types), Rust legacy (_ZN...17h<hash>E), Rust v0 (_R..., RFC "
+            "2603 crate/nested paths) and Swift (_$s... / __T..., "
+            "best-effort identifiers + entity kind). Undecodable or exotic "
+            "input is never an error: it returns scheme='unknown' or "
+            "complete=false with a note naming exactly what was not "
+            "decoded; results carry evidence. Pure string parsing; nothing "
+            "is executed."
+        )
+    )
+    def codevanta_demangle(symbols: list[str]) -> dict:
+        try:
+            return tools.codevanta_demangle(symbols)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
     return server
 
 
