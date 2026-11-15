@@ -2232,6 +2232,29 @@ def build_server() -> MCPServer:
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
+    # lane-dload: ONE MCP wrapper for the PE delay-load decoder. Imports
+    # alone register nothing; this closure binds the tool to the server.
+    @server.tool(
+        description=(
+            "Decode a PE's delay-load import directory (data directory 13), "
+            "pure Python and offline (nothing executed). Per descriptor: the "
+            "DLL name, raw grAttrs with named trait bits (dlattrRva and the "
+            "CFG check bit), the layout version (v1 32-bit or v2 64-bit "
+            "fields, chosen by the directory size), the IAT/INT RVAs and the "
+            "bounded IMAGE_IMPORT_BY_NAME import list (hint/name entries "
+            "walked until NULL; bounded 32 DLLs x 512 imports x 128 name "
+            "chars, every bound reported). Descriptors without dlattrRva "
+            "carry bind-time addresses, treated as RVAs with an explicit "
+            "warning. An absent directory reports delay_load_present:false, "
+            "not an error; malformed structures raise typed errors."
+        )
+    )
+    def codevanta_delayload(path: str) -> dict:
+        try:
+            return tools.codevanta_delayload(path)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
     return server
 
 
