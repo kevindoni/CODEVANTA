@@ -137,14 +137,42 @@ def test_condition_renders_as_if_line(tmp_path: Path) -> None:
     assert "/* cmp rax, rbx */" in result.text
 
 
-def test_signed_and_unsigned_jcc_annotated(tmp_path: Path) -> None:
-    """jg renders 'taken: signed', ja renders 'taken: unsigned' -- same op."""
+def test_signed_and_unsigned_jcc_cast_operands(tmp_path: Path) -> None:
+    """jg casts at signed 64-bit, ja at unsigned 64-bit -- same operator."""
     signed = _emit(tmp_path / "signed.bin", bytes.fromhex("4839d87f029090"))
-    assert "if (rax.0 > rbx.0) { /* taken: signed */ }" in signed.text
+    assert (
+        "if ((int64_t)rax.0 > (int64_t)rbx.0) { /* taken: signed */ }"
+        in signed.text
+    )
     assert signed.condition_count == 1
     unsigned = _emit(tmp_path / "unsigned.bin", bytes.fromhex("4839d877029090"))
-    assert "if (rax.0 > rbx.0) { /* taken: unsigned */ }" in unsigned.text
+    assert (
+        "if ((uint64_t)rax.0 > (uint64_t)rbx.0) { /* taken: unsigned */ }"
+        in unsigned.text
+    )
     assert unsigned.condition_count == 1
+
+
+def test_hint_width_drives_the_cast(tmp_path: Path) -> None:
+    """A uint32_t-hinted rax.1 casts at 32 bits; untyped rbx.0 stays 64-bit.
+
+    `mov eax, 1` hints rax.1 as uint32_t; `cmp rax, rbx; jg` then renders the
+    hint width for the defined side and the register width for the untyped
+    side -- hint intent wins over full-register machine noise.
+    """
+    code = bytes.fromhex("b8010000004839d87f029090")
+    result = _emit(tmp_path / "hint.bin", code)
+    assert (
+        "if ((int32_t)rax.1 > (int64_t)rbx.0) { /* taken: signed */ }"
+        in result.text
+    )
+
+
+def test_immediate_operand_stays_uncased(tmp_path: Path) -> None:
+    """Immediates have no width, so only the register side takes the cast."""
+    code = bytes.fromhex("483d100000007f029090")
+    result = _emit(tmp_path / "imm.bin", code)
+    assert "if ((int64_t)rax.0 > 0x10) { /* taken: signed */ }" in result.text
 
 
 def test_loop_boundary_marker(tmp_path: Path) -> None:
