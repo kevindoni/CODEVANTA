@@ -676,3 +676,15 @@ steps.
 ## License
 
 MIT — see [LICENSE](LICENSE). Third-party components keep their own licenses.
+
+## Remote MCP access
+
+`codevanta mcp serve` speaks `stdio` by default — a local pipe with no auth,
+by design. The `sse`/`streamable-http` transports bind loopback (`127.0.0.1`)
+unless `--allow-remote` is passed. To require a shared token on the HTTP
+transports, set `CODEVANTA_MCP_TOKEN` to a non-empty value: every HTTP
+request must then carry `X-MCP-Token: <value>` (or the equivalent
+`Authorization: Bearer <value>`), and anything else is answered `401` before
+it reaches the MCP app. `stdio` is never affected by the token, and an unset
+or blank variable keeps the loopback-only default. If you expose a
+non-loopback bind, set a token — HTTP alone is not authentication.

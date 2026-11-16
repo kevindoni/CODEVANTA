@@ -2,18 +2,25 @@
 
 ``stdio`` is the default transport, so existing client configurations keep
 working. ``sse`` and ``streamable-http`` are also available for clients that
-speak HTTP; they bind a local TCP port and are opt-in.
+speak HTTP; they bind a local TCP port and are opt-in. Setting the
+``CODEVANTA_MCP_TOKEN`` environment variable additionally requires a shared
+token on every HTTP request; ``stdio`` never needs one.
 """
 
 from __future__ import annotations
 
+import hmac
 import ipaddress
+import os
+from collections.abc import Iterable
 from typing import Annotated, Any, Literal, cast
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
+from starlette.responses import PlainTextResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from codevanta.analysis.cdp_client import DEFAULT_ENDPOINT as WEB_DEFAULT_ENDPOINT
 from codevanta.analysis.cdp_client import DEFAULT_OBSERVE_MS as WEB_DEFAULT_OBSERVE_MS
@@ -77,6 +84,19 @@ HTTP_TRANSPORTS: frozenset[str] = frozenset({"sse", "streamable-http"})
 #: Default bind address for the HTTP transports; loopback keeps the tools local.
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
+
+#: Environment variable that switches on bearer-token auth for the HTTP
+#: transports. Unset or blank means "no token" - the loopback-only default.
+#: ``stdio`` never consults it: it is a local pipe between processes the user
+#: launched and has no auth by design, so it must not start failing when the
+#: variable happens to be set.
+MCP_TOKEN_ENV = "CODEVANTA_MCP_TOKEN"
+
+#: Header that must carry the token on every HTTP request once
+#: :data:`MCP_TOKEN_ENV` is configured. The standard
+#: ``Authorization: Bearer <token>`` form is accepted as an equivalent, and
+#: ASGI header names are lower-case on the wire.
+MCP_TOKEN_HEADER = "X-MCP-Token"
 
 #: The hosts the pinned MCP SDK hardens by itself. ``MCPServer.sse_app`` and
 #: ``MCPServer.streamable_http_app`` compare their ``host`` argument with exactly
@@ -2355,6 +2375,109 @@ def transport_security(host: str) -> TransportSecuritySettings | None:
     )
 
 
+def remote_token() -> str | None:
+    """Return the HTTP bearer token from ``CODEVANTA_MCP_TOKEN``, or ``None``.
+
+    The value is whitespace-trimmed; unset or blank disables token auth, which
+    is the default because the HTTP transports bind loopback. Only the HTTP
+    transports are ever gated by the result - :func:`run` consults it in the
+    ``sse``/``streamable-http`` branch only, so ``stdio`` behaviour does not
+    depend on this variable at all.
+    """
+    value = os.environ.get(MCP_TOKEN_ENV)
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed or None
+
+
+def _supplied_tokens(headers: Iterable[tuple[bytes, bytes]]) -> list[bytes]:
+    """Collect every token credential the request offered, as bytes.
+
+    Both accepted spellings are gathered: ``X-MCP-Token`` values verbatim and
+    the credential part of ``Authorization: Bearer <token>`` (scheme accepted
+    case-insensitively, as RFC 7235 allows). Any other ``Authorization``
+    scheme produces no candidate and therefore cannot authenticate.
+    """
+    supplied: list[bytes] = []
+    for name, value in headers:
+        lowered = name.lower()
+        if lowered == MCP_TOKEN_HEADER.lower().encode("ascii"):
+            supplied.append(value.strip())
+        elif lowered == b"authorization":
+            scheme, _, credential = value.partition(b" ")
+            if scheme.lower() == b"bearer":
+                supplied.append(credential.strip())
+    return supplied
+
+
+def _token_matches(headers: Iterable[tuple[bytes, bytes]], token: bytes) -> bool:
+    """Return True only when the request supplies exactly ``token``.
+
+    Every supplied credential must match: a request that repeats the header
+    with different values - e.g. splitting the secret across ``X-MCP-Token``
+    and ``Authorization`` - fails closed instead of smuggling one good value
+    past the check. Comparisons are constant-time.
+    """
+    supplied = _supplied_tokens(headers)
+    if not supplied:
+        return False
+    return all(hmac.compare_digest(candidate, token) for candidate in supplied)
+
+
+class TokenAuthMiddleware:
+    """Pure-ASGI bearer-token gate for the HTTP MCP transports.
+
+    Wraps the Starlette app produced by ``MCPServer.sse_app`` /
+    ``MCPServer.streamable_http_app`` so the check runs before the SDK's
+    routes, DNS-rebinding ``Host``/``Origin`` validation or any MCP session
+    handling can see the request. Missing or wrong credentials answer ``401``
+    with the plain-text body ``unauthorized`` and an RFC 6750
+    ``WWW-Authenticate: Bearer`` hint. Non-HTTP scopes (``lifespan``) pass
+    through untouched so the wrapped app still starts up.
+    """
+
+    def __init__(self, app: ASGIApp, token: str) -> None:
+        self.app = app
+        self.token = token.encode("utf-8")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or _token_matches(scope.get("headers") or (), self.token):
+            await self.app(scope, receive, send)
+            return
+        response = PlainTextResponse(
+            "unauthorized",
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        await response(scope, receive, send)
+
+
+def _apply_token_auth(server: MCPServer, token: str) -> None:
+    """Point ``server``'s HTTP app builders at token-guarded wrappers.
+
+    The pinned SDK builds its uvicorn app inside ``run_sse_async`` /
+    ``run_streamable_http_async`` by calling ``self.sse_app(...)`` /
+    ``self.streamable_http_app(...)``. Replacing those two bound methods on
+    the instance is the smallest seam that still lets the SDK drive uvicorn
+    (log level, explicit :class:`TransportSecuritySettings` and all): each
+    builder returns the SDK's Starlette app wrapped in
+    :class:`TokenAuthMiddleware`. :func:`run` calls this only for
+    ``sse``/``streamable-http``, never ``stdio``.
+    """
+    sse_app = server.sse_app
+    streamable_http_app = server.streamable_http_app
+
+    def guarded_sse_app(**kwargs: Any) -> ASGIApp:
+        return TokenAuthMiddleware(sse_app(**kwargs), token)
+
+    def guarded_streamable_http_app(**kwargs: Any) -> ASGIApp:
+        return TokenAuthMiddleware(streamable_http_app(**kwargs), token)
+
+    server.sse_app = guarded_sse_app  # type: ignore[method-assign, assignment]
+    server.streamable_http_app = guarded_streamable_http_app  # type: ignore[method-assign, assignment]
+
+
 def run(
     transport: str = "stdio",
     host: str = DEFAULT_HOST,
@@ -2372,6 +2495,12 @@ def run(
     The HTTP transports are network-exposed and these tools read arbitrary
     local files, so a non-loopback ``host`` is refused unless ``allow_remote``
     is set.
+
+    Setting the ``CODEVANTA_MCP_TOKEN`` environment variable to a non-empty
+    value adds one more layer for the HTTP transports only: every request
+    must then carry the shared token (``X-MCP-Token`` or
+    ``Authorization: Bearer``) or it is rejected with ``401`` before it
+    reaches the MCP app. ``stdio`` never requires a token.
 
     ``host`` is normalised once through :func:`normalise_host` - whitespace
     stripped, surrounding IPv6 brackets dropped, ``localhost`` mapped to
@@ -2422,7 +2551,11 @@ def run(
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
         raise AnalysisError(f"invalid MCP port {port!r}; expected an integer in 0..65535")
 
-    build_server().run(
+    server = build_server()
+    token = remote_token()
+    if token is not None:
+        _apply_token_auth(server, token)
+    server.run(
         transport=cast("HttpTransport", transport),
         host=bind_host,
         port=port,
