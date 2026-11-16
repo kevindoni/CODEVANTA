@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
@@ -30,6 +29,7 @@ from codevanta.analysis.frida_bridge import (
 from codevanta.analysis.lldb_bridge import DEFAULT_TIMEOUT as LLDB_DEFAULT_TIMEOUT
 from codevanta.analysis.lldb_bridge import run_under_lldb
 from codevanta.analysis.rizin_bridge import functions_of, info_of
+from codevanta.cli.console import make_console
 from codevanta.core.report import AnalysisError
 
 frida_app = typer.Typer(help="Frida live instrumentation (requires the frida CLI tools)")
@@ -48,7 +48,7 @@ def _lldb_group() -> None:
     """
 
 
-console = Console()
+console = make_console()
 
 
 def _fail(message: str, code: int = 2) -> NoReturn:

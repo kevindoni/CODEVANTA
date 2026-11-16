@@ -39,13 +39,13 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from codevanta.analysis.compare import compare_artifacts
+from codevanta.cli.console import make_console
 from codevanta.core.disassembler import DisassemblyError
 from codevanta.core.entropy import analyze_entropy
 from codevanta.core.functions import discover_functions
@@ -108,7 +108,7 @@ app = typer.Typer(
     help="Rebuild projects: Study → Build → Check → Ready.",
     no_args_is_help=True,
 )
-console = Console()
+console = make_console()
 
 
 # --------------------------------------------------------------------------- #

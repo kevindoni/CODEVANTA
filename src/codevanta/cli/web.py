@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
@@ -30,12 +29,13 @@ from codevanta.analysis.asar import (
 )
 from codevanta.analysis.har_capture import load_har
 from codevanta.analysis.proto_wire import decode_message, load_proto_bytes
+from codevanta.cli.console import make_console
 from codevanta.core.report import AnalysisError
 
 web_app = typer.Typer(help="Passive CDP inspection of a live Electron/Chromium")
 
-console = Console(stderr=False)
-_err_console = Console(stderr=True)
+console = make_console()
+_err_console = make_console(stderr=True)
 
 
 def _fail(message: str) -> NoReturn:

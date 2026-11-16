@@ -25,11 +25,11 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
 from codevanta.analysis.compare import is_bundle_document, load_document
+from codevanta.cli.console import make_console
 from codevanta.core.coverage import COVERAGE_VERDICTS, evaluate
 from codevanta.core.obligations import (
     DEFAULT_OBLIGATION_AUTHORITY,
@@ -52,7 +52,7 @@ app = typer.Typer(
     help="Obligation ledger: typed evidence debts with revision-controlled CAS mutations",
     no_args_is_help=True,
 )
-console = Console()
+console = make_console()
 
 ObligationAuthority = Literal["parsed", "computed", "verified"]
 ObligationConfidence = Literal["low", "medium", "high"]

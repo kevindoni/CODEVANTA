@@ -22,7 +22,6 @@ import json
 from typing import Annotated, Any, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
@@ -53,10 +52,11 @@ from codevanta.analysis.adb import (
     start_app,
     stop_app,
 )
+from codevanta.cli.console import make_console
 from codevanta.core.report import AnalysisError
 
 app = typer.Typer(help="Android device inspection over adb (requires adb on PATH)")
-console = Console()
+console = make_console()
 
 
 def _fail(message: str, code: int) -> NoReturn:

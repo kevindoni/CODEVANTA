@@ -8,15 +8,15 @@ import typer
 
 from codevanta.analysis.gpu_meta import inspect_gpu
 from codevanta.analysis.il2cpp_meta import parse_il2cpp_meta
+from codevanta.cli.console import make_console
 
 app = typer.Typer(help="IL2CPP metadata and GPU code-object inspection")
 
 
 def _emit(payload: dict, output_format: str, table_rows: list[tuple[str, str]]) -> None:
-    from rich.console import Console
     from rich.table import Table
 
-    console = Console()
+    console = make_console()
     if output_format == "json":
         import json
 

@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
@@ -26,6 +25,7 @@ from codevanta.analysis import (
     pyc_inspect,
 )
 from codevanta.analysis.codesign import inspect_codesign
+from codevanta.cli.console import make_console
 from codevanta.core.report import AnalysisError
 
 meta_app = typer.Typer(
@@ -38,7 +38,7 @@ meta_app = typer.Typer(
         "desktop app layouts."
     ),
 )
-console = Console()
+console = make_console()
 
 # lane-depth2: one sub-app with a command per deep format inspector; the
 # registration lives in cli.main.py as a single add_typer line.

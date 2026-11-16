@@ -23,16 +23,16 @@ from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
 from codevanta.analysis.apple_ips import IpsSummary, parse_ips_report
 from codevanta.analysis.crash_core import CoreDumpSummary, parse_core_dump
+from codevanta.cli.console import make_console
 from codevanta.core.report import AnalysisError
 
 app = typer.Typer(help="Crash-dump analysis: ELF core dumps and Apple .ips reports")
-console = Console()
+console = make_console()
 
 #: Human names for the signals a core dump's ``NT_SIGINFO``/``pr_cursig`` carries.
 _SIGNAL_NAMES: dict[int, str] = {

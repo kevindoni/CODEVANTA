@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
@@ -28,6 +27,7 @@ from codevanta.analysis.javascript import MAX_FILES as JS_MAX_FILES
 from codevanta.analysis.javascript import analyze_javascript_app
 from codevanta.analysis.pe_certs import inspect_cert_table
 from codevanta.analysis.wakaru_bridge import MODE_MINIFY, MODES, js_recover
+from codevanta.cli.console import make_console
 from codevanta.core.report import AnalysisError
 
 apk_app = typer.Typer(help="Android APK decoding via apktool (requires apktool on PATH)")
@@ -40,7 +40,7 @@ certs_app = typer.Typer(
     context_settings={"allow_interspersed_args": True},
     help="PE certificate table parsing (pure Python, offline).",
 )
-console = Console()
+console = make_console()
 
 
 def _fail(message: str, code: int = 2) -> NoReturn:

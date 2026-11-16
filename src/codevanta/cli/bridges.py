@@ -26,12 +26,12 @@ from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
 from codevanta.analysis import binwalk_bridge, objdump_bridge, tshark_bridge, wabt_bridge
 from codevanta.analysis.bridge import BridgeCapability, bridges_report
+from codevanta.cli.console import make_console
 from codevanta.core.report import AnalysisError
 
 #: The whole lane, registered by one loop in ``cli/main.py`` (deterministic order).
@@ -51,7 +51,7 @@ objdump_app = typer.Typer(
     context_settings={"allow_interspersed_args": True},
     help="Disassemble over GNU objdump (requires objdump on PATH)",
 )
-console = Console()
+console = make_console()
 
 
 def _fail(message: str) -> NoReturn:

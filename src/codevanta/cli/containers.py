@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
@@ -37,10 +36,11 @@ from codevanta.analysis.containers import (
     require_evm,
 )
 from codevanta.analysis.sqlite_view import inspect_sqlite
+from codevanta.cli.console import make_console
 from codevanta.core.report import AnalysisError
 
 app = typer.Typer(help="Container inspection: WASM, EVM, GGUF, safetensors, pcap, SQLite")
-console = Console()
+console = make_console()
 
 
 def _fail(message: str, code: int) -> NoReturn:

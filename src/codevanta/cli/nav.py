@@ -21,18 +21,18 @@ from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
 from codevanta.analysis.nav import NavStore, nav_evidence
 from codevanta.analysis.nav_providers import providers_report
+from codevanta.cli.console import make_console
 from codevanta.core.report import AnalysisError
 
 app = typer.Typer(
     help="Navigation state for persisted sessions (bookmarks, comments, cursor)"
 )
-console = Console()
+console = make_console()
 
 #: Evidence source of the provider probe report (probes are not session data).
 PROVIDERS_EVIDENCE_SOURCE = "nav.providers"

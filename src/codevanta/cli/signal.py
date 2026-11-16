@@ -19,7 +19,6 @@ import json
 from typing import Annotated, Any, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
@@ -35,11 +34,12 @@ from codevanta.analysis.uart_decode import (
     STOP_BITS_CHOICES,
     decode_uart_file,
 )
+from codevanta.cli.console import make_console
 from codevanta.core.report import AnalysisError
 
 app = typer.Typer(help="Signal/firmware lane: sigrok sessions, UART captures, devicetrees")
 signal_app = typer.Typer(help="Logic-capture inspection (sigrok sessions and raw UART)")
-console = Console()
+console = make_console()
 
 # One mount point for everything in this module: the nested "signal" typer
 # serves `codevanta signal sr|uart|decode`, while commands defined on ``app``
