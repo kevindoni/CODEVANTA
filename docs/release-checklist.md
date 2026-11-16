@@ -1,10 +1,11 @@
 # Release checklist (maintainers)
 
-The publishing pipeline in `.github/workflows/release.yml` is wired but has
-never run: no `v*` tag exists yet. Branch protection on `main` is applied (see
-[repository-settings.md](repository-settings.md)); the steps below are the ones
-that still need repository and PyPI admin access, in the order they should be
-done.
+The publishing pipeline in `.github/workflows/release.yml` is live and has
+published every release since `v0.1.0` (most recently `v0.6.0`) through PyPI
+trusted publishing (`environment: pypi`, no API token). Branch protection on
+`main` is applied (see
+[repository-settings.md](repository-settings.md)); the steps below are the
+checklist for cutting each release, in order.
 
 ## 1. Claim the project on PyPI (pending publisher)
 
