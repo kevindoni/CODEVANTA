@@ -8,6 +8,12 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+### Changed
+
+## [0.7.0] - 2026-11-17
+
+### Added
+
 - **Six guided investigations as MCP prompts**: `triage_binary`,
   `investigate_feature`, `diff_versions`, `audit_electron_app`, `trace_crash`
   and `prepare_rebuild`, exposed by both the flat server and the gateway.
