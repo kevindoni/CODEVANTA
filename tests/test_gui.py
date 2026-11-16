@@ -609,7 +609,8 @@ def test_decompile_returns_a_text_body(
     gui_server: ThreadingHTTPServer, sample_binary: Path
 ) -> None:
     status, payload = _get(
-        gui_server, f"/api/decompile?path={sample_binary.as_posix()}&address=0x401000"
+        gui_server,
+        f"/api/decompile?path={sample_binary.as_posix()}&address=0x401000&backend=native",
     )
 
     assert status == 200
@@ -621,8 +622,9 @@ def test_decompile_returns_a_text_body(
     assert isinstance(payload["text"], str)
     assert "sub_401000" in payload["text"]
     assert "blocks: 1" in payload["text"]
-    # The fallback is reported, not silent.
-    assert payload["warnings"]
+    # A strict backend request never falls back, so nothing is reported as
+    # skipped; the auto route keeps that reporting for its own tests.
+    assert payload["warnings"] == []
 
 
 def test_decompile_defaults_to_the_entry_point(
@@ -703,7 +705,7 @@ def test_decompile_reply_carries_the_security_headers(
 
     status, headers, body = _raw_get(
         gui_server,
-        f"/api/decompile?path={sample_binary.as_posix()}&address=0x401000",
+        f"/api/decompile?path={sample_binary.as_posix()}&address=0x401000&backend=native",
         f"127.0.0.1:{port}",
     )
 
@@ -728,7 +730,7 @@ def test_decompile_body_counts_toward_the_response_cap(
 
     status, headers, body = _raw_get(
         gui_server,
-        f"/api/decompile?path={sample_binary.as_posix()}&address=0x401000",
+        f"/api/decompile?path={sample_binary.as_posix()}&address=0x401000&backend=native",
         f"127.0.0.1:{port}",
     )
 

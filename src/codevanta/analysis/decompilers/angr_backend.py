@@ -2,9 +2,11 @@
 
 ``angr`` ships a decompiler analysis on top of its CFG recovery, so it is the
 cheapest way to get real pseudo-C without an external process. The package is
-*not* a hard requirement of CODEVANTA: nothing here is imported until
-:meth:`AngrBackend.availability` or :meth:`AngrBackend.decompile` runs, so
-``import codevanta.analysis.decompilers`` never fails on a machine without angr.
+*not* a hard requirement of CODEVANTA: :meth:`AngrBackend.availability` probes
+for it with ``find_spec`` (import-free), and the module itself is only
+imported inside :meth:`AngrBackend.decompile`, so
+``import codevanta.analysis.decompilers`` never fails -- and never pays the
+angr import cost -- on a machine without it.
 
 Pipeline: ``angr.Project(path)`` (no shared libraries, no DWARF) -> ``CFGFast``
 -> ``project.analyses.Decompiler(function, cfg=cfg.model)`` -> ``codegen.text``.
@@ -19,6 +21,8 @@ budgets are recorded in the evidence so a reader can see what was asked for.
 
 from __future__ import annotations
 
+import importlib.metadata
+import importlib.util
 from pathlib import Path
 from typing import Any
 
@@ -78,30 +82,26 @@ class AngrBackend:
     requires: tuple[str, ...] = ("angr",)
 
     def availability(self) -> BackendAvailability:
-        """Probe ``import angr``; never raises, never installs anything."""
-        try:
-            import angr
-        except ImportError as exc:
+        """Probe for ``angr``; never raises, never installs, never imports.
+
+        Importing angr is slow (it pulls the whole analysis stack), and
+        discovery runs on every ``available_backends()`` call. ``find_spec``
+        answers "is it installed" import-free, matching the Ghidra probe.
+        """
+        if importlib.util.find_spec("angr") is None:
             return BackendAvailability(
                 name=self.name,
                 available=False,
                 reason=(
-                    f"the 'angr' package is not installed ({type(exc).__name__}: {exc}); "
+                    "the 'angr' package is not installed (ModuleNotFoundError); "
                     f"install it with '{INSTALL_HINT}'"
                 ),
                 requires=self.requires,
             )
-        except Exception as exc:  # a broken install must not break discovery
-            return BackendAvailability(
-                name=self.name,
-                available=False,
-                reason=(
-                    f"importing 'angr' failed ({type(exc).__name__}: {exc}); "
-                    f"reinstall it with '{INSTALL_HINT}'"
-                ),
-                requires=self.requires,
-            )
-        version = str(getattr(angr, "__version__", "unknown"))
+        try:
+            version = importlib.metadata.version("angr")
+        except Exception:  # a broken dist-info must not break discovery
+            version = "unknown"
         return BackendAvailability(
             name=self.name,
             available=True,

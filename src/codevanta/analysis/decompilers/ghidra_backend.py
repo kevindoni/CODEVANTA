@@ -24,7 +24,10 @@ reported as a warning. Both budgets travel into the evidence record.
 from __future__ import annotations
 
 import contextlib
+import importlib.metadata
+import importlib.util
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +49,7 @@ from .base import (
     require_budget,
 )
 
-__all__ = ["GhidraBackend", "INSTALL_ENV", "INSTALL_HINT", "NAME"]
+__all__ = ["GhidraBackend", "INSTALL_ENV", "INSTALL_HINT", "NAME", "PROJECTS_DIR_ENV"]
 
 #: Backend identifier.
 NAME = "ghidra"
@@ -78,6 +81,32 @@ _INSTRUCTIONS_PER_SECOND = 200
 
 #: Comment emitted when Ghidra's decompiler produced no code.
 _EMPTY_TEXT = "/* ghidra produced no pseudocode for 0x{address:x} */"
+
+#: Environment override for the directory that holds Ghidra analysis projects.
+#: The default lives under the system temporary directory because Ghidra
+#: rejects project paths with an element starting with ``.`` (so ``~/.codevanta``
+#: is unusable) and because without an explicit ``project_location`` pyghidra
+#: creates a ``<binary>_ghidra`` directory next to every analysed file, which
+#: pollutes checkouts and sample folders. Projects are caches, so a cleaner
+#: temp sweep only costs a re-analysis.
+PROJECTS_DIR_ENV = "CODEVANTA_GHIDRA_PROJECTS_DIR"
+
+#: Default project root, kept out of the repository and out of dot-directories.
+_DEFAULT_PROJECTS_DIR = Path(tempfile.gettempdir()) / "codevanta" / "ghidra_projects"
+
+
+def _project_location() -> Path:
+    """Return an existing directory for Ghidra analysis projects."""
+    raw = os.environ.get(PROJECTS_DIR_ENV) or _DEFAULT_PROJECTS_DIR
+    location = Path(raw)
+    try:
+        location.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AnalysisError(
+            f"could not create the Ghidra project directory {location}: {exc}; "
+            f"set {PROJECTS_DIR_ENV} to a writable path"
+        ) from exc
+    return location
 
 
 def _unavailable(availability: BackendAvailability) -> AnalysisError:
@@ -121,19 +150,25 @@ class GhidraBackend:
     requires: tuple[str, ...] = ("pyghidra", "ghidra")
 
     def availability(self) -> BackendAvailability:
-        """Probe ``pyghidra`` and :data:`INSTALL_ENV`; never raises, never launches."""
+        """Probe ``pyghidra`` and :data:`INSTALL_ENV`; never raises, never launches.
+
+        The probe never *imports* pyghidra either: importing it pulls in JPype
+        (a native extension that may load the JVM's support libraries), and
+        discovery runs on every ``available_backends()`` call. ``find_spec``
+        plus ``importlib.metadata`` answer the same questions import-free.
+        """
         problems: list[str] = []
         version = "unknown"
-        try:
-            import pyghidra
-
-            version = str(getattr(pyghidra, "__version__", "unknown"))
-        except ImportError as exc:
-            problems.append(
-                f"the 'pyghidra' package is not installed ({type(exc).__name__}: {exc})"
-            )
-        except Exception as exc:  # a broken install must not break discovery
-            problems.append(f"importing 'pyghidra' failed ({type(exc).__name__}: {exc})")
+        spec = importlib.util.find_spec("pyghidra")
+        if spec is None:
+            problems.append("the 'pyghidra' package is not installed (ModuleNotFoundError)")
+        else:
+            try:
+                version = importlib.metadata.version("pyghidra")
+            except importlib.metadata.PackageNotFoundError:  # pragma: no cover - odd installs
+                version = "unknown"
+            except Exception as exc:  # a broken dist-info must not break discovery
+                problems.append(f"reading the 'pyghidra' version failed ({type(exc).__name__}: {exc})")
         problem = _installation_problem(os.environ.get(INSTALL_ENV, "").strip())
         if problem is not None:
             problems.append(problem)
@@ -202,8 +237,15 @@ class GhidraBackend:
         timeout = _timeout_seconds(instruction_budget)
         _ensure_started(pyghidra)
         try:
-            program_context = opener(str(path), analyze=True)
+            program_context = opener(
+                str(path),
+                analyze=True,
+                project_location=_project_location(),
+                nested_project_location=False,
+            )
         except TypeError:
+            # Older pyghidra builds without the project keyword set: fall back
+            # to the plain call rather than lose the backend entirely.
             program_context = opener(str(path))
 
         try:
@@ -269,6 +311,21 @@ def _ensure_started(pyghidra: Any) -> None:
         start()
 
 
+def _to_address(flat_api: Any, address: int) -> Any:
+    """Convert ``address`` to a Ghidra ``Address`` without a Jpype int overflow.
+
+    ``FlatProgramAPI.toAddr`` also accepts text, and its ``String`` overload
+    parses ``0x``-prefixed hexadecimal. Calling it with a Python ``int`` makes
+    Jpype bind to a 32-bit Java parameter on this Ghidra line, so any address
+    above ``0x7fffffff`` raises ``OverflowError``. The hex form is therefore
+    primary and the integer form is only a fallback for other builds.
+    """
+    try:
+        return flat_api.toAddr(hex(address))
+    except Exception:  # pragma: no cover - defensive across Ghidra builds
+        return flat_api.toAddr(address)
+
+
 def _decompile_in_program(
     flat_api: Any,
     address: int,
@@ -278,7 +335,7 @@ def _decompile_in_program(
     from ghidra.app.decompiler import DecompileOptions, DecompInterface
 
     program = flat_api.getCurrentProgram()
-    target = flat_api.toAddr(address)
+    target = _to_address(flat_api, address)
     function = flat_api.getFunctionAt(target)
     if function is None:
         function = flat_api.getFunctionContaining(target)

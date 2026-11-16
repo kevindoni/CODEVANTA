@@ -252,7 +252,10 @@ def _facts(result: Result) -> dict[str, str]:
 def test_decompile_renders_the_straight_line_fixture(tmp_path: Path) -> None:
     sample = _sample(tmp_path, "straight_line.bin", MOV_EAX_42)
 
-    result = runner.invoke(app, ["decompile", str(sample)])
+    # The assertions below are the native renderer's contract (heuristic
+    # naming, per-line instruction comments), so the backend is pinned even
+    # though a machine with Ghidra installed would route ``auto`` there.
+    result = runner.invoke(app, ["decompile", str(sample), "--backend", "native"])
 
     assert result.exit_code == 0, _output(result)
     output = _output(result)
@@ -271,10 +274,23 @@ def test_decompile_renders_the_straight_line_fixture(tmp_path: Path) -> None:
     assert "truncated: no" in output, output
 
 
+@pytest.mark.skipif(not GHIDRA_AVAILABLE, reason="pyghidra and a Ghidra installation are absent")
+def test_decompile_auto_prefers_ghidra_when_it_is_installed(tmp_path: Path) -> None:
+    sample = _sample(tmp_path, "auto_ghidra.bin", MOV_EAX_42)
+
+    result = runner.invoke(app, ["decompile", str(sample)])
+
+    assert result.exit_code == 0, _output(result)
+    output = _output(result)
+    assert "backend: ghidra" in output, output
+    # Ghidra answered, so it is never reported as skipped; only angr may be.
+    assert "backend 'ghidra' was unavailable" not in output, output
+
+
 def test_decompile_uses_the_symbol_name_when_the_binary_has_one(tmp_path: Path) -> None:
     sample = _sample(tmp_path, "symbol.bin", MOV_EAX_42, symbols=MAIN_SYMBOL)
 
-    result = runner.invoke(app, ["decompile", str(sample)])
+    result = runner.invoke(app, ["decompile", str(sample), "--backend", "native"])
 
     assert result.exit_code == 0, _output(result)
     output = _output(result)
@@ -297,7 +313,9 @@ def test_decompile_defaults_to_the_entry_point(tmp_path: Path) -> None:
 def test_decompile_resolves_a_function_name(tmp_path: Path) -> None:
     sample = _sample(tmp_path, "function_name.bin", MOV_EAX_42, symbols=MAIN_SYMBOL)
 
-    result = runner.invoke(app, ["decompile", str(sample), "--function", "main"])
+    result = runner.invoke(
+        app, ["decompile", str(sample), "--function", "main", "--backend", "native"]
+    )
 
     assert result.exit_code == 0, _output(result)
     assert "symbol: main" in _output(result), _output(result)
@@ -340,7 +358,7 @@ def test_decompile_auto_backend_reports_every_skipped_backend(tmp_path: Path) ->
 def test_decompile_json_carries_the_rendering(tmp_path: Path) -> None:
     sample = _sample(tmp_path, "rendering_json.bin", MOV_EAX_42)
 
-    result = runner.invoke(app, ["decompile", str(sample), "--json"])
+    result = runner.invoke(app, ["decompile", str(sample), "--json", "--backend", "native"])
 
     assert result.exit_code == 0, _output(result)
     payload = _payload(result)
@@ -372,7 +390,9 @@ def test_decompile_writes_the_rendering_to_output(tmp_path: Path) -> None:
     sample = _sample(tmp_path, "written.bin", MOV_EAX_42)
     target = tmp_path / "rendered.c"
 
-    result = runner.invoke(app, ["decompile", str(sample), "--output", str(target)])
+    result = runner.invoke(
+        app, ["decompile", str(sample), "--output", str(target), "--backend", "native"]
+    )
 
     assert result.exit_code == 0, _output(result)
     assert "rendering written:" in _output(result), _output(result)
@@ -387,7 +407,10 @@ def test_decompile_output_with_json_writes_the_payload(tmp_path: Path) -> None:
     sample = _sample(tmp_path, "written_json.bin", MOV_EAX_42)
     target = tmp_path / "rendered.json"
 
-    result = runner.invoke(app, ["decompile", str(sample), "--json", "--output", str(target)])
+    result = runner.invoke(
+        app,
+        ["decompile", str(sample), "--json", "--output", str(target), "--backend", "native"],
+    )
 
     assert result.exit_code == 0, _output(result)
     written = json.loads(target.read_text(encoding="utf-8"))

@@ -506,3 +506,26 @@ def test_backend_names_are_matched_case_insensitively_through_the_entry_point(
     result = decompile_function(binary, info, TEXT_VA, backend="  Native ")
 
     assert result.backend == "native"
+
+
+def test_ghidra_survives_addresses_above_31_bits() -> None:
+    """A PE64 entry point above ``0x7fffffff`` must reach Ghidra (regression).
+
+    ``FlatProgramAPI.toAddr`` called with a Python ``int`` binds to a 32-bit
+    Java parameter through Jpype, so the committed PE sample's entry point at
+    ``0x140001000`` used to raise ``OverflowError`` and silently fall back to
+    the native renderer under ``backend="auto"``. The hex-text form of the
+    address reaches the ``String`` overload and works.
+    """
+    pytest.importorskip("pyghidra", reason="pyghidra is not installed")
+    if not GHIDRA_AVAILABLE:
+        pytest.skip("GHIDRA_INSTALL_DIR does not point at a Ghidra installation")
+
+    sample = Path(__file__).resolve().parents[1] / "samples" / "pe64_text.bin"
+    assert sample.is_file(), f"missing sample: {sample}"
+
+    result = decompile_function(sample, BinaryLoader().load(sample), 0x140001000, backend="ghidra")
+
+    assert result.backend == "ghidra", result.warnings
+    assert result.text.strip()
+    assert "{" in result.text
