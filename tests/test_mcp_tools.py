@@ -66,7 +66,7 @@ def test_analyze_has_provenance(elf64_text_path: Path) -> None:
 def test_server_lists_fifty_five_tools() -> None:
     listed = asyncio.run(build_server().list_tools())
     names = sorted(tool.name for tool in listed)
-    assert len(names) == 124
+    assert len(names) == 125
     assert names == [
     "codevanta_adb",
     "codevanta_analyze",
@@ -125,6 +125,7 @@ def test_server_lists_fifty_five_tools() -> None:
     "codevanta_js_recover",
     "codevanta_jump_table",
     "codevanta_lldb_run",
+    "codevanta_macho_symbols",
     "codevanta_metadata",
     "codevanta_nav",
     "codevanta_nav_providers",
