@@ -18,6 +18,15 @@ All notable changes to CODEVANTA are documented here. The format follows
   honest warning; the SSA payload gains per-block `phis`, and the pseudo-C
   emitter renders joins as `id = phi(...)` statements. Evidence method
   renamed `cfg-straight-line-ssa` -> `cfg-dominance-ssa`.
+- **Structured control-flow rendering (pseudo-C increment 7)**: the emitter
+  now renders single-latch `while` loops -- from dominance back-edges, with
+  the header comparison (negated when the exit edge is the taken one) -- and
+  if/else diamonds whose arms are linear chains reconverging at one merge
+  block; every shape outside that vocabulary still falls back to the honest
+  linear rendering with annotated if-lines. Condition text is shared between
+  both paths (`_condition_expr`), so casts and signedness apply to `while`
+  conditions too. Evidence method renamed
+  `ssa-linear-lowering` -> `ssa-structured-lowering`.
 
 ### Changed
 

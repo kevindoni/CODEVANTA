@@ -101,6 +101,7 @@ __all__ = [
     "abi_name",
     "abi_volatile_registers",
     "build_ssa",
+    "compute_dominance",
 ]
 
 #: Cap on CFG blocks converted into SSA blocks (SSA construction stops after).
@@ -505,6 +506,8 @@ class SSABlock:
         phi_required: Registers locally live-in at the loop head; kept as a
             live-in hint alongside the real phi functions (increment 6).
         phis: Phi values this join block defines, register-sorted.
+        successors: Sorted in-window successor block indexes (direct branches
+            plus fallthrough), for control-flow structuring downstream.
     """
 
     index: int
@@ -513,6 +516,7 @@ class SSABlock:
     loop_boundary: bool = False
     phi_required: tuple[str, ...] = ()
     phis: tuple[SSAPhiValue, ...] = ()
+    successors: tuple[int, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the block for the JSON report."""
@@ -524,6 +528,7 @@ class SSABlock:
             "loop_boundary": self.loop_boundary,
             "phi_required": list(self.phi_required),
             "phis": [phi.to_dict() for phi in self.phis],
+            "successors": list(self.successors),
         }
 
 
@@ -1163,6 +1168,7 @@ class _SSABuilder:
                         key=lambda phi: phi.register,
                     )
                 ),
+                successors=successors.get(block_index, ()),
             )
             for block_index in order
         ]
@@ -1204,48 +1210,7 @@ class _SSABuilder:
         self, order: list[int], successors: dict[int, tuple[int, ...]]
     ) -> tuple[int, set[int], dict[int, set[int]], dict[int, int], dict[int, list[int]]]:
         """Entry, reachable set, preds, immediate dominators, dom-tree children."""
-        entry = order[0]
-        reachable = {entry}
-        pending = [entry]
-        while pending:
-            block_index = pending.pop()
-            for successor in successors.get(block_index, ()):
-                if successor not in reachable:
-                    reachable.add(successor)
-                    pending.append(successor)
-        preds: dict[int, set[int]] = {index: set() for index in reachable}
-        for block_index in reachable:
-            for successor in successors.get(block_index, ()):
-                if successor in reachable:
-                    preds[successor].add(block_index)
-        dom = {index: set(reachable) for index in reachable}
-        dom[entry] = {entry}
-        changed = True
-        while changed:
-            changed = False
-            for block_index in order:
-                if block_index not in reachable or block_index == entry:
-                    continue
-                pred_doms = [dom[p] for p in preds[block_index] if p in dom]
-                if not pred_doms:
-                    continue
-                new_dom = set.intersection(*pred_doms) | {block_index}
-                if new_dom != dom[block_index]:
-                    dom[block_index] = new_dom
-                    changed = True
-        idom: dict[int, int] = {}
-        for block_index in reachable:
-            if block_index == entry:
-                continue
-            strict = dom[block_index] - {block_index}
-            idom[block_index] = max(strict, key=lambda d: len(dom[d]))
-        position_of = {index: position for position, index in enumerate(order)}
-        children: dict[int, list[int]] = {}
-        for block_index in sorted(reachable, key=lambda i: position_of[i]):
-            parent = idom.get(block_index)
-            if parent is not None:
-                children.setdefault(parent, []).append(block_index)
-        return entry, reachable, preds, idom, children
+        return compute_dominance(order, successors)
 
     def _frontiers(
         self,
@@ -1465,6 +1430,60 @@ class _SSABuilder:
             if _reads_flags(mnemonic):
                 live.add(FLAGS_REGISTER)
         return live
+
+
+def compute_dominance(
+    order: list[int], successors: dict[int, tuple[int, ...]]
+) -> tuple[int, set[int], dict[int, set[int]], dict[int, int], dict[int, list[int]]]:
+    """Entry, reachable set, preds, immediate dominators, dom-tree children.
+
+    ``order`` is the deterministic address order of every block; ``successors``
+    maps ``block index -> sorted successor indexes``. Iterative dominators,
+    bounded by the block count (O(n^2) worst case). Shared with the pseudo-C
+    emitter's control-flow structuring.
+    """
+    entry = order[0]
+    reachable = {entry}
+    pending = [entry]
+    while pending:
+        block_index = pending.pop()
+        for successor in successors.get(block_index, ()):
+            if successor not in reachable:
+                reachable.add(successor)
+                pending.append(successor)
+    preds: dict[int, set[int]] = {index: set() for index in reachable}
+    for block_index in reachable:
+        for successor in successors.get(block_index, ()):
+            if successor in reachable:
+                preds[successor].add(block_index)
+    dom = {index: set(reachable) for index in reachable}
+    dom[entry] = {entry}
+    changed = True
+    while changed:
+        changed = False
+        for block_index in order:
+            if block_index not in reachable or block_index == entry:
+                continue
+            pred_doms = [dom[p] for p in preds[block_index] if p in dom]
+            if not pred_doms:
+                continue
+            new_dom = set.intersection(*pred_doms) | {block_index}
+            if new_dom != dom[block_index]:
+                dom[block_index] = new_dom
+                changed = True
+    idom: dict[int, int] = {}
+    for block_index in reachable:
+        if block_index == entry:
+            continue
+        strict = dom[block_index] - {block_index}
+        idom[block_index] = max(strict, key=lambda d: len(dom[d]))
+    position_of = {index: position for position, index in enumerate(order)}
+    children: dict[int, list[int]] = {}
+    for block_index in sorted(reachable, key=lambda i: position_of[i]):
+        parent = idom.get(block_index)
+        if parent is not None:
+            children.setdefault(parent, []).append(block_index)
+    return entry, reachable, preds, idom, children
 
 
 def _payload_address(payload: dict[str, Any]) -> int:
