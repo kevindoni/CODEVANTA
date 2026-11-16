@@ -8,6 +8,12 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+### Changed
+
+## [0.5.0] - 2026-11-16
+
+### Added
+
 - **Phi functions via dominance-ordered rename (SSA increment 6)**: reachable
   blocks now rename in dominator-tree pre-order; every multi-predecessor join
   at a dominance frontier defines `phi` values merging the versions each
