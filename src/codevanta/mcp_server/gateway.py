@@ -615,6 +615,12 @@ def build_gateway_server(source: MCPServer | None = None) -> MCPServer:
             max_matches=max_matches,
         )
 
+    # The same guided investigations the flat server exposes; a gateway client
+    # should not lose them just because the tool surface was compressed.
+    from codevanta.mcp_server.prompts import register_prompts
+
+    register_prompts(server)
+
     return server
 
 
