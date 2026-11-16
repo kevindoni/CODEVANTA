@@ -508,6 +508,7 @@ codevanta uninstall --client cursor
 codevanta mcp serve                              # run the server over stdio
 codevanta mcp serve --transport sse --port 8000  # HTTP transports are opt-in
 codevanta mcp serve --gateway                    # five meta-tools, ~0.8k schema tokens
+codevanta setup --client cursor --gateway --yes --verify   # register the gateway with an agent
 ```
 
 Supported clients: `claude` (Claude Code), `cursor`, `cline` (VS Code
@@ -533,7 +534,8 @@ same registry through five meta-tools instead (about 0.8k schema tokens):
 
 The gateway is loopback-only and never changes what a tool returns; it only
 bounds what enters the conversation. The flat 126-tool server remains the
-default for clients that prefer it.
+default for clients that prefer it. Register the gateway with a coding agent
+via `codevanta setup --gateway` (same clients and scopes as the flat server).
 
 The server registers **126 MCP tools** across analysis, dynamic/debug,
 platform/mobile, web/JavaScript, firmware, formats, rebuild, and session lanes;

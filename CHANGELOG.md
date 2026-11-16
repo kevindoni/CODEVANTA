@@ -8,6 +8,50 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- **Persistent Ghidra program session**: the ghidra backend imports and
+  auto-analyses a binary once per process and reuses the open program for
+  later calls on the same bytes (keyed by resolved path, mtime and size), so
+  the second and following decompiles in an MCP server, GUI or benchmark
+  process drop from ~10-20 s to well under a second. The reuse is recorded in
+  the evidence (`program_cached`) and the session is closed before the JVM
+  teardown at exit; `CODEVANTA_GHIDRA_SESSION=0` restores one private import
+  per call.
+- **`codevanta setup --gateway`**: registers the token-efficient meta-tool
+  server (`args: ["mcp", "serve", "--gateway"]`) with Claude Code, Cursor,
+  Cline and VS Code; `setup --list` reports a `registered (gateway)` status.
+- **Token-efficient MCP gateway** (`codevanta mcp serve --gateway`): the same
+  126-tool registry published through five meta-tools (`search`, `schema`,
+  `call`, `result_read`, `result_grep`) whose combined schema is about 765
+  tokens instead of ~26k. Replies over a clamped token budget (default 1500)
+  are stored under `~/.codevanta/mcp_results` and paged or grepped by id.
+- **Generated MCP tool reference**: `scripts/generate_tool_docs.py` writes
+  `docs/mcp-tools.md` from the live registry (126 tools, 9 categories) and
+  `--check` fails when the checked-in file is stale, so CI catches
+  undocumented registry changes.
+- **Per-task cost benchmark**: `bench/run_codevanta.py` runs 12 tasks over the
+  committed samples in-process, recording success, wall time, a chars/4 token
+  estimate and a SHA-256 of the normalized output; `--rea` merges externally
+  collected REA numbers into the same report.
+
+### Fixed
+
+- **Ghidra backend never ran on 64-bit images**: `FlatProgramAPI.toAddr`
+  called with a Python `int` binds to a 32-bit Java parameter through Jpype,
+  so every address above `0x7fffffff` (the PE64 default base range) raised
+  `OverflowError` and `auto` silently fell back to the native renderer. The
+  address now reaches the `String` overload via hex text.
+- Ghidra analysis projects are written under a temp-dir project root instead
+  of a `<binary>_ghidra` directory next to every analysed file.
+- The ghidra and angr availability probes answer through `find_spec` plus
+  `importlib.metadata` instead of importing the packages, so discovery no
+  longer pays the JPype/angr import cost.
+- `codevanta --help` crashed with `UnicodeEncodeError` on legacy Windows code
+  pages; every CLI console now uses `legacy_windows=False` and the standard
+  streams switch to UTF-8 when reconfigurable.
+- MCP tool addresses accept `"0x140001000"` hex text as well as integers.
+- `SERVER_VERSION` derives from the installed distribution metadata instead
+  of a hardcoded `"0.1.0"`.
+
 ### Changed
 
 ## [0.5.0] - 2026-11-16
