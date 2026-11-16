@@ -350,4 +350,62 @@ def test_tool_is_reexported_through_tools_module() -> None:
     assert tools.DEFAULT_SSA_MAX_INSTRUCTIONS == 2_000
 
 
+# ---- increment 2: expression folding + condition recovery ---------------------
+
+
+def test_fold_binary_with_undefined_operand(tmp_path: Path) -> None:
+    """`add rax, rbx` with an undefined rbx folds honestly against rbx.0."""
+    fn = _ssa(tmp_path / "fold1.bin", bytes.fromhex("4889c04801d84889c3"))
+    values = {value.id: value for value in fn.values}
+    assert values["rax.2"].expr == "rax.1 + rbx.0"
+
+
+def test_fold_immediate_and_self_clear(tmp_path: Path) -> None:
+    """`add rax, 0x10` folds the constant; `xor rcx, rcx` clears to '0'."""
+    fn = _ssa(tmp_path / "fold2.bin", bytes.fromhex("4883c0104831c9"))
+    values = {value.id: value for value in fn.values}
+    assert values["rax.1"].expr == "rax.0 + 0x10"
+    assert values["rcx.1"].expr == "0"
+
+
+def test_fold_copy_chain(tmp_path: Path) -> None:
+    """mov chains collapse one link per move, ending at the root value."""
+    fn = _ssa(tmp_path / "fold3.bin", STRAIGHT_LINE)
+    values = {value.id: value for value in fn.values}
+    assert values["rax.1"].expr == "rax.0"
+    assert values["rax.2"].expr == "rax.1 + rbx.0"
+    assert values["rbx.1"].expr == "rax.2"
+
+
+def test_condition_recovery_on_jcc(tmp_path: Path) -> None:
+    """cmp rax, rbx; je -> the jump carries the recovered condition."""
+    fn = _ssa(tmp_path / "cond.bin", bytes.fromhex("4839d874029090"))
+    je = fn.blocks[0].instructions[-1]
+    assert je.mnemonic == "je"
+    assert je.condition == {
+        "cond": "je",
+        "left": "rax.0",
+        "right": "rbx.0",
+        "raw": "cmp rax, rbx",
+    }
+
+
+def test_condition_cleared_by_flags_writer(tmp_path: Path) -> None:
+    """cmp; add (rewrites FLAGS); je -> the comparison is stale, je has none."""
+    code = bytes.fromhex("4839d84883c3017402")
+    fn = _ssa(tmp_path / "cond2.bin", code)
+    je = fn.blocks[0].instructions[-1]
+    assert je.mnemonic == "je"
+    assert je.condition is None
+
+
+def test_folded_expr_is_json_safe_and_deterministic(tmp_path: Path) -> None:
+    """Folded expressions survive JSON round-trips deterministically."""
+    first = _ssa(tmp_path / "d1.bin", bytes.fromhex("4889c04801d84889c3"))
+    payload = json.dumps(first.to_dict())
+    assert "rax.1 + rbx.0" in payload
+    second = _ssa(tmp_path / "d2.bin", bytes.fromhex("4889c04801d84889c3"))
+    assert json.dumps(second.to_dict()) == payload
+
+
 

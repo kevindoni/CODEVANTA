@@ -1,4 +1,4 @@
-"""Typed SSA intermediate representation over the CFG (decompiler v2, increment 1).
+"""Typed SSA intermediate representation over the CFG (decompiler v2, increments 1-2).
 
 This module is one *decompiler-v2 foundation* step between the CFG (phase 2)
 and the future pseudo-C lowering: it re-walks the blocks a recursive CFG
@@ -42,6 +42,23 @@ Implemented semantics (increment 1 -- deliberately narrow):
    ABI argument registers get whatever
    :func:`~codevanta.analysis.type_propagation.infer_argument_types` infers
    from use evidence. Absent evidence -> ``None``.
+6. **Expression folding (increment 2).** Arithmetic writes carry a bounded
+   symbolic ``expr`` string on the SSA value: ``add rax, 0x10`` -> ``"rax.1 +
+   0x10"``, ``and rcx, rbx`` -> ``"rax.1 & rbx.1"``, ``xor reg, reg`` folds to
+   the constant ``"0"`` (self-clear), ``add/sub/or/xor/shift by 0`` folds to
+   the input value, ``mov reg, reg`` aliases the source's version (mov chains
+   collapse one link per move) and ``lea`` builds a ``ptr(...)`` expression
+   with base/index/displacement. Unknown sources (memory loads, width-changing
+   moves, call clobbers, FLAGS) keep ``expr = None`` -- honest, never guessed.
+   Every expression is clipped to :data:`MAX_EXPR_CHARS` characters.
+7. **Condition recovery (increment 2).** A ``cmp``/``test`` followed by a
+   conditional jump from the supported ``je/jne/jg/jl/jge/jle/ja/jb/jae/jbe``
+   set *within the same block* attaches a ``condition`` dict to the block's
+   terminator instruction: ``{"cond", "left", "right", "raw"}`` with SSA
+   value ids (or the immediate token) and the raw instruction text.
+   ``test X, X`` compares ``X`` against itself. Any intervening instruction
+   that writes ``FLAGS`` (or a call) invalidates the pending comparison, and
+   a conditional jump without one keeps ``condition = None``.
 
 Every step is bounded (:data:`MAX_BLOCKS`, :data:`MAX_INSTRUCTIONS`,
 :data:`MAX_VALUES`, :data:`MAX_USES_PER_VALUE`); hitting a bound sets a
@@ -72,6 +89,7 @@ __all__ = [
     "DEFAULT_MAX_INSTRUCTIONS",
     "FLAGS_REGISTER",
     "MAX_BLOCKS",
+    "MAX_EXPR_CHARS",
     "MAX_INSTRUCTIONS",
     "MAX_USES_PER_VALUE",
     "MAX_VALUES",
@@ -95,6 +113,10 @@ MAX_VALUES = 4_096
 
 #: Cap on recorded uses per value; further uses are dropped and flagged.
 MAX_USES_PER_VALUE = 64
+
+#: Cap on a folded symbolic expression string. Longer expressions are clipped
+#: with a trailing ``"..."`` -- bounded output, never silently unbounded.
+MAX_EXPR_CHARS = 128
 
 #: Default block budget for :func:`build_ssa` (also the MCP tool default).
 DEFAULT_MAX_BLOCKS = 512
@@ -177,6 +199,47 @@ _FLAGS_FREE_BRANCHES = frozenset({"jmp", "ljmp", "jrcxz", "jecxz"})
 
 #: Mnemonics that transfer control to a subroutine.
 _CALL_MNEMONICS = frozenset({"call", "callq"})
+
+#: Two-operand arithmetic mnemonics -> the symbolic operator they fold to.
+_ARITHMETIC_OPERATORS: dict[str, str] = {
+    "add": "+",
+    "sub": "-",
+    "and": "&",
+    "or": "|",
+    "xor": "^",
+    "shl": "<<",
+    "shr": ">>",
+    "sal": "<<",
+    "sar": ">>",
+}
+
+#: Symbolic operators with an ``x <op> 0 == x`` identity (constants fold away).
+_IDENTITY_WITH_ZERO = frozenset({"+", "-", "|", "^", "<<", ">>"})
+
+#: One-operand arithmetic mnemonics -> symbolic rendering of their effect.
+_UNARY_EXPRESSIONS: dict[str, str] = {
+    "inc": " + 1",
+    "dec": " - 1",
+    "neg": "-",
+    "not": "~",
+}
+
+#: Mnemonics whose destination is a plain copy of the source operand.
+_MOV_COPIES = frozenset({"mov", "movabs"})
+
+#: Conditional jumps condition recovery understands (bounded, increment 2).
+_CONDITION_JUMPS = frozenset(
+    {"je", "jne", "jg", "jl", "jge", "jle", "ja", "jb", "jae", "jbe"}
+)
+
+#: Immediate operand token scanner (hex or decimal, optionally negative).
+_IMMEDIATE_TOKEN = re.compile(r"-?(?:0x[0-9a-f]+|\d+)")
+
+#: Bracketed memory expression of a ``lea`` operand.
+_LEA_MEMORY = re.compile(r"\[([^\]]*)\]")
+
+#: ``index*scale`` suffix inside a lea memory expression.
+_LEA_SCALE = re.compile(r"\*(\d+)\Z")
 
 #: Win64 ABI (Microsoft x64): caller-saved registers a call clobbers.
 _WIN64_VOLATILE: tuple[str, ...] = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")
@@ -295,6 +358,24 @@ def _direct_target(operands: str) -> int | None:
         return None
 
 
+def _clip_expr(expr: str) -> str:
+    """Clip a folded expression to :data:`MAX_EXPR_CHARS` (deterministic)."""
+    if len(expr) <= MAX_EXPR_CHARS:
+        return expr
+    return f"{expr[: MAX_EXPR_CHARS - 3]}..."
+
+
+def _immediate_value(token: str) -> int | None:
+    """Parse an immediate operand token (hex or decimal), else ``None``."""
+    text = token.strip()
+    if _IMMEDIATE_TOKEN.fullmatch(text) is None:
+        return None
+    try:
+        return int(text, 16) if text.lower().startswith(("0x", "-0x")) else int(text, 10)
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # public SSA dataclasses (all JSON-safe, deterministic ordering)
 # ---------------------------------------------------------------------------
@@ -312,6 +393,9 @@ class SSAValue:
             ``"arg"`` (ABI argument register at function entry).
         type_hint: Optional C type from :mod:`codevanta.analysis.type_propagation`,
             ``None`` when nothing types the definition.
+        expr: Bounded symbolic expression the definition folds to (increment 2),
+            e.g. ``"rax.1 + 0x10"``, ``"0"`` for ``xor reg, reg`` or
+            ``"ptr(rbx.0 + 0x10)"`` for ``lea``; ``None`` when unknown.
         def_block: Index of the defining SSA block, ``None`` for undef/arg
             values (defined outside the walked region).
         def_insn_index: Index of the defining instruction within its block.
@@ -324,6 +408,7 @@ class SSAValue:
     def_block: int | None
     def_insn_index: int | None
     uses: tuple[tuple[int, int], ...]
+    expr: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the value for the JSON report."""
@@ -331,6 +416,7 @@ class SSAValue:
             "id": self.id,
             "kind": self.kind,
             "type_hint": self.type_hint,
+            "expr": self.expr,
             "def_block": self.def_block,
             "def_insn_index": self.def_insn_index,
             "uses": [[block, insn] for block, insn in self.uses],
@@ -349,6 +435,9 @@ class SSAInstruction:
         text: Raw ``"mnemonic operands"`` text of the instruction.
         call_args: For a ``call``, the argument-register value ids in ABI
             order; ``None`` for every other instruction.
+        condition: For a conditional-jump terminator, the recovered
+            ``{"cond", "left", "right", "raw"}`` comparison from the preceding
+            ``cmp``/``test`` (increment 2); ``None`` when there is none.
     """
 
     address: int
@@ -357,6 +446,7 @@ class SSAInstruction:
     writes: tuple[str, ...]
     text: str
     call_args: tuple[str, ...] | None = None
+    condition: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the instruction for the JSON report."""
@@ -369,6 +459,8 @@ class SSAInstruction:
         }
         if self.call_args is not None:
             data["call_args"] = list(self.call_args)
+        if self.condition is not None:
+            data["condition"] = dict(self.condition)
         return data
 
 
@@ -486,6 +578,7 @@ class _ValueRecord:
     def_block: int | None
     def_insn_index: int | None
     uses: list[tuple[int, int]] = field(default_factory=list)
+    expr: str | None = None
 
 
 class _BudgetStopError(Exception):
@@ -520,6 +613,7 @@ class _SSABuilder:
         self._values: dict[str, _ValueRecord] = {}
         self._warnings: list[str] = []
         self._cursor = 0
+        self._pending_condition: dict[str, str] | None = None
         self.truncated_blocks = False
         self.truncated_instructions = False
         self.truncated_values = False
@@ -540,6 +634,7 @@ class _SSABuilder:
         block_index: int | None,
         insn_index: int | None,
         type_hint: str | None,
+        expr: str | None = None,
     ) -> str:
         """Create the next version of ``canonical`` or stop on the value cap."""
         if len(self._values) >= self._max_values:
@@ -558,6 +653,7 @@ class _SSABuilder:
             type_hint=type_hint,
             def_block=block_index,
             def_insn_index=insn_index,
+            expr=expr,
         )
         return value_id
 
@@ -645,6 +741,192 @@ class _SSABuilder:
             return POINTER_C_TYPES.get(pointer_width)
         return INTEGER_C_TYPES.get(writes[0][2])
 
+    # -- expression folding (increment 2) ------------------------------------
+
+    def _expr_read_ids(self, parts: list[str]) -> dict[str, str]:
+        """Map canonical register -> current value id for the operand text.
+
+        Registers without a prior version seed their ``.0`` undef value (the
+        SSA convention already names honest unknowns ``<reg>.0``), so an
+        ``add rax, rbx`` with an undefined ``rbx`` still folds to
+        ``"rax.N + rbx.0"`` instead of a ``None`` operand.
+        """
+        ids: dict[str, str] = {}
+        for part in parts:
+            for canonical in _register_mentions(part, self._aliases):
+                if canonical not in ids:
+                    version = self._versions.get(canonical, 0)
+                    ids[canonical] = f"{canonical}.{version}"
+        return ids
+
+    def _expr_for(
+        self, mnemonic: str, parts: list[str], read_ids: dict[str, str]
+    ) -> str | None:
+        """Fold one definition into a bounded symbolic expression, or ``None``."""
+        if mnemonic in _CALL_MNEMONICS or not parts:
+            return None
+        if mnemonic in _MOV_COPIES:
+            return self._copy_expr(parts[1], read_ids) if len(parts) > 1 else None
+        if mnemonic == "lea":
+            return self._lea_expr(parts[1], read_ids) if len(parts) > 1 else None
+        if mnemonic in _ARITHMETIC_OPERATORS:
+            return self._binary_expr(mnemonic, parts, read_ids)
+        if mnemonic in _UNARY_EXPRESSIONS:
+            return self._unary_expr(mnemonic, parts, read_ids)
+        return None
+
+    def _copy_expr(self, operand: str, read_ids: dict[str, str]) -> str | None:
+        """``mov`` source expression: the source value id or immediate token."""
+        regs = _register_mentions(operand, self._aliases)
+        if regs:
+            return read_ids.get(regs[0])
+        token = (operand or "").strip()
+        if _IMMEDIATE_TOKEN.fullmatch(token):
+            return token
+        return None  # memory source or exotic operand: honest unknown
+
+    def _binary_expr(
+        self, mnemonic: str, parts: list[str], read_ids: dict[str, str]
+    ) -> str | None:
+        """``op dst, src`` -> ``"{left} {operator} {right}"`` with folds."""
+        if len(parts) < 2:
+            return None
+        dest = _register_mentions(_MEMORY.sub(" ", parts[0]), self._aliases)
+        if not dest:
+            return None
+        left = read_ids.get(dest[0])
+        if left is None:
+            return None
+        source_regs = _register_mentions(_MEMORY.sub(" ", parts[1]), self._aliases)
+        if source_regs:
+            right = read_ids.get(source_regs[0])
+            right_value: int | None = None
+        else:
+            right = parts[1].strip()
+            right_value = _immediate_value(right)
+            if right_value is None:
+                return None  # memory source: honest unknown
+        operator = _ARITHMETIC_OPERATORS[mnemonic]
+        if mnemonic == "xor" and source_regs and source_regs[0] == dest[0]:
+            return "0"  # xor reg, reg self-clears to the zero constant
+        if right_value == 0:
+            if operator == "&":
+                return "0"  # and x, 0 clears to the zero constant
+            if operator in _IDENTITY_WITH_ZERO:
+                return left  # x + 0 / x | 0 / shifts by 0 keep x
+        return _clip_expr(f"{left} {operator} {right}")
+
+    def _unary_expr(
+        self, mnemonic: str, parts: list[str], read_ids: dict[str, str]
+    ) -> str | None:
+        """``inc/dec/neg/not dst`` -> a one-operand symbolic expression."""
+        dest = _register_mentions(_MEMORY.sub(" ", parts[0]), self._aliases)
+        if not dest:
+            return None
+        left = read_ids.get(dest[0])
+        if left is None:
+            return None
+        suffix = _UNARY_EXPRESSIONS[mnemonic]
+        if suffix.startswith(" "):
+            return _clip_expr(f"{left}{suffix}")
+        return _clip_expr(f"{suffix}{left}")
+
+    def _lea_expr(self, operand: str, read_ids: dict[str, str]) -> str | None:
+        """``lea`` -> ``ptr(base + index*scale + disp)`` with zero terms dropped."""
+        match = _LEA_MEMORY.search(operand)
+        if match is None:
+            return None
+        terms: list[tuple[str, str]] = []
+        for piece in re.findall(r"[+-]?[^+-]+", match.group(1).replace(" ", "")):
+            sign = ""
+            if piece.startswith("+"):
+                piece = piece[1:]
+            elif piece.startswith("-"):
+                sign = "-"
+                piece = piece[1:]
+            if not piece:
+                continue
+            regs = _register_mentions(piece, self._aliases)
+            if regs:
+                if len(regs) != 1:
+                    return None
+                base_id = read_ids.get(regs[0])
+                if base_id is None:
+                    return None
+                scale = _LEA_SCALE.search(piece)
+                term = (
+                    base_id
+                    if scale is None or scale.group(1) == "1"
+                    else f"{base_id}*{scale.group(1)}"
+                )
+                terms.append((sign, term))
+                continue
+            immediate = _immediate_value(piece)
+            if immediate is None:
+                return None  # rip-relative or unmatched shape: honest unknown
+            if immediate == 0:
+                continue  # zero displacement folds away
+            terms.append((sign, piece))
+        if not terms:
+            return None
+        head_sign, head = terms[0]
+        body = f"-{head}" if head_sign == "-" else head
+        for sign, term in terms[1:]:
+            body += f" {sign} {term}" if sign == "-" else f" + {term}"
+        return _clip_expr(f"ptr({body})")
+
+    # -- condition recovery (increment 2) -------------------------------------
+
+    def _comparison_operands(
+        self, parts: list[str], read_ids: dict[str, str]
+    ) -> tuple[str, str] | None:
+        """``(left, right)`` value ids / immediate token of a ``cmp``/``test``.
+
+        Memory operands are not expressible as SSA ids, so comparisons over
+        them stay ``None``; ``test X, X`` naturally yields ``X`` twice.
+        """
+        if len(parts) < 2:
+            return None
+        left_regs = _register_mentions(_MEMORY.sub(" ", parts[0]), self._aliases)
+        left = read_ids.get(left_regs[0]) if left_regs else None
+        if left is None:
+            return None
+        right_regs = _register_mentions(_MEMORY.sub(" ", parts[1]), self._aliases)
+        if right_regs:
+            right = read_ids.get(right_regs[0])
+            return None if right is None else (left, right)
+        token = parts[1].strip()
+        if _IMMEDIATE_TOKEN.fullmatch(token):
+            return left, token
+        return None
+
+    def _advance_condition(
+        self, mnemonic: str, parts: list[str], text: str
+    ) -> dict[str, str] | None:
+        """Track the pending ``cmp``/``test`` and attach it to a ``jcc``.
+
+        Returns the ``condition`` dict for the current instruction when it is
+        a supported conditional jump consuming the pending comparison (which
+        is then marked consumed); otherwise ``None``.
+        """
+        if mnemonic in ("cmp", "test"):
+            pair = self._comparison_operands(parts, self._expr_read_ids(parts))
+            self._pending_condition = (
+                {"left": pair[0], "right": pair[1], "raw": text} if pair else None
+            )
+        elif mnemonic in _FLAGS_WRITERS or mnemonic in _CALL_MNEMONICS:
+            self._pending_condition = None  # FLAGS rewritten: comparison stale
+        if mnemonic in _CONDITION_JUMPS and self._pending_condition is not None:
+            pending = self._pending_condition
+            self._pending_condition = None  # consumed by the first jump only
+            return {
+                "cond": mnemonic,
+                "left": pending["left"],
+                "right": pending["right"],
+                "raw": pending["raw"],
+            }
+        return None
+
     # -- driver -------------------------------------------------------------
 
     def run(self) -> tuple[list[SSABlock], dict[str, _ValueRecord]]:
@@ -667,6 +949,7 @@ class _SSABuilder:
                         f"{len(order) - position} CFG block(s) left out of the SSA view"
                     )
                 break
+            self._pending_condition = None  # comparisons never cross block edges
             for local_index, payload in enumerate(raw_blocks[position]):
                 if total >= self._max_instructions:
                     self.truncated_instructions = True
@@ -740,7 +1023,11 @@ class _SSABuilder:
         local_index: int,
     ) -> SSAInstruction | None:
         """Convert one instruction, or return ``None`` when the value cap hit."""
+        text = payload.get("text") or f"{mnemonic} {' '.join(parts)}".strip()
         try:
+            # Expression reads resolve BEFORE the writes create new versions.
+            read_ids = self._expr_read_ids(parts)
+            condition = self._advance_condition(mnemonic, parts, text)
             if mnemonic in _CALL_MNEMONICS:
                 reads, writes, call_args = self._convert_call(parts, block_index, local_index)
             else:
@@ -748,11 +1035,14 @@ class _SSABuilder:
                 reads = self._resolve_reads(mnemonic, parts)
                 if _reads_flags(mnemonic):
                     self._read(FLAGS_REGISTER, reads)
+                expr = self._expr_for(mnemonic, parts, read_ids)
                 writes = []
                 for canonical, alias, width in self._register_writes(mnemonic, parts):
                     hint = self._type_hint_for(mnemonic, [(canonical, alias, width)])
                     writes.append(
-                        self._new_value(canonical, "def", block_index, local_index, hint)
+                        self._new_value(
+                            canonical, "def", block_index, local_index, hint, expr=expr
+                        )
                     )
                 if mnemonic in _FLAGS_WRITERS:
                     writes.append(
@@ -764,7 +1054,6 @@ class _SSABuilder:
                 self._record_use(value_id, block_index, local_index)
         except _BudgetStopError:
             return None
-        text = payload.get("text") or f"{mnemonic} {' '.join(parts)}".strip()
         return SSAInstruction(
             address=_payload_address(payload),
             mnemonic=mnemonic,
@@ -772,6 +1061,7 @@ class _SSABuilder:
             writes=tuple(writes),
             text=text,
             call_args=call_args,
+            condition=condition,
         )
 
     def _convert_call(
@@ -914,6 +1204,7 @@ def build_ssa(
             id=record.id,
             kind=record.kind,
             type_hint=record.type_hint,
+            expr=record.expr,
             def_block=record.def_block,
             def_insn_index=record.def_insn_index,
             uses=tuple(record.uses),
