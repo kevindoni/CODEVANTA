@@ -22,6 +22,8 @@ valid, empty result -- never an error.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
 import json
 import struct
@@ -44,6 +46,8 @@ from codevanta.evidence.models import Evidence
 __all__ = [
     "EVIDENCE_SOURCE",
     "MAX_DIALOGS",
+    "MAX_EMBEDDED_ASSETS",
+    "MAX_EMBEDDED_ASSET_BYTES",
     "MAX_ITEMS_PER_DIALOG",
     "MAX_MENU_ITEMS",
     "MAX_STRING_CHARS",
@@ -51,6 +55,8 @@ __all__ = [
     "WinResUiSummary",
     "decode_ui_resources",
     "layout_json_bytes",
+    "load_assets_manifest",
+    "plan_icon_embeds",
     "render_preview_html",
 ]
 
@@ -71,6 +77,12 @@ MAX_STRINGTABLE_ENTRIES = 512
 
 #: Characters kept per string-table entry (bounded output).
 MAX_STRING_CHARS = 256
+
+#: ``SS_ICON`` statics embedded as PNG data URIs per preview (bounded output).
+MAX_EMBEDDED_ASSETS = 32
+
+#: One embedded asset's PNG budget; larger assets keep their placeholder box.
+MAX_EMBEDDED_ASSET_BYTES = 64 * 1024
 
 #: ``DS_SETFONT``: the template carries a font block after the title.
 DS_SETFONT = 0x40
@@ -946,16 +958,221 @@ def decode_ui_resources(path: str | Path) -> WinResUiSummary:
     )
 
 
+# ---- icon embedding (lane-iconprev): manifest -> data URIs -------------------
+
+
+def load_assets_manifest(path: str | Path) -> dict[str, Any]:
+    """Load one ``codevanta_pe_assets`` manifest JSON for icon embedding.
+
+    Raises:
+        AnalysisError: When the file is missing, unreadable, too large or not
+            a JSON object with an ``assets`` list (malformed manifest).
+    """
+    target = Path(path)
+    if not target.is_file():
+        raise AnalysisError(f"file not found: {target}")
+    size = target.stat().st_size
+    if size > MAX_FILE_BYTES:
+        raise AnalysisError(f"file too large: {size} bytes (limit {MAX_FILE_BYTES})")
+    try:
+        raw = target.read_bytes().decode("utf-8")
+    except OSError as exc:
+        raise AnalysisError(f"cannot read {str(target)!r}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise AnalysisError(f"malformed assets manifest {str(target)!r}: {exc}") from exc
+    try:
+        manifest = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise AnalysisError(f"malformed assets manifest {str(target)!r}: {exc}") from exc
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("assets"), list):
+        raise AnalysisError(
+            f"malformed assets manifest {str(target)!r}: "
+            "expected an object with an 'assets' list"
+        )
+    return manifest
+
+
+def _match_icon_asset(
+    item: dict[str, Any],
+    icons: list[dict[str, Any]],
+    fallback: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Match one ``SS_ICON`` static to an icon asset (deterministic, first hit).
+
+    A numeric title (string digits or an ordinal ``sz_Or_Ord`` reference)
+    matches the icon asset with that ``resource_id``; a string title matches
+    an icon asset group name case-insensitively; anything else falls back to
+    the manifest's first icon asset (its array order, which the extractor
+    already sorts deterministically).
+    """
+    title = item.get("title")
+    if title in (None, ""):
+        return fallback
+    if isinstance(title, int):
+        for asset in icons:
+            if asset.get("resource_id") == title:
+                return asset
+        return fallback
+    text = str(title)
+    try:
+        resource_id = int(text)
+    except ValueError:
+        resource_id = None
+    if resource_id is not None:
+        for asset in icons:
+            if asset.get("resource_id") == resource_id:
+                return asset
+    lowered = text.lower()
+    for asset in icons:
+        group = asset.get("group")
+        if isinstance(group, str) and group.lower() == lowered:
+            return asset
+    return fallback
+
+
+def _resolve_asset_png(
+    asset: dict[str, Any], label: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read + verify one manifest asset's PNG, or return ``(None, reason)``.
+
+    Bounded: assets larger than :data:`MAX_EMBEDDED_ASSET_BYTES` are rejected
+    (their placeholder box stays); the recorded sha256 must match the file
+    bytes before anything is embedded.
+    """
+    path_text = asset.get("path")
+    if not isinstance(path_text, str) or not path_text:
+        return None, f"{label}: asset record has no path"
+    png_path = Path(path_text)
+    if not png_path.is_file():
+        return None, f"{label}: asset file not found: {path_text}"
+    try:
+        png_bytes = png_path.read_bytes()
+    except OSError as exc:
+        return None, f"{label}: asset file unreadable: {exc}"
+    if len(png_bytes) > MAX_EMBEDDED_ASSET_BYTES:
+        return None, (
+            f"{label}: asset {png_path.name} is {len(png_bytes)} bytes "
+            f"(limit {MAX_EMBEDDED_ASSET_BYTES})"
+        )
+    digest = hashlib.sha256(png_bytes).hexdigest()
+    expected = asset.get("sha256")
+    if isinstance(expected, str) and expected and expected != digest:
+        return None, f"{label}: sha256 mismatch for {png_path.name}"
+    width = asset.get("width")
+    height = asset.get("height")
+    return {
+        "data_uri": "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii"),
+        "sha256": digest,
+        "width": width if isinstance(width, int) and 0 < width <= 4096 else None,
+        "height": height if isinstance(height, int) and 0 < height <= 4096 else None,
+        "group": str(asset.get("group") or ""),
+        "resource_id": asset.get("resource_id"),
+    }, None
+
+
+def plan_icon_embeds(
+    summary: WinResUiSummary, assets_manifest: dict[str, Any]
+) -> dict[str, Any]:
+    """Match every ``SS_ICON`` static against an asset manifest (pure function).
+
+    The returned plan feeds :func:`render_preview_html`'s ``icon_plan``
+    parameter: ``embeds`` maps ``(dialog index, item position)`` to a resolved
+    ``data:image/png;base64`` URI, and ``embedded`` / ``skipped`` /
+    ``skipped_reasons`` carry the honest budget accounting (at most
+    :data:`MAX_EMBEDDED_ASSETS` images, each at most
+    :data:`MAX_EMBEDDED_ASSET_BYTES`). Deterministic: identical summary and
+    manifest give an identical plan.
+    """
+    assets_raw = assets_manifest.get("assets")
+    icons = (
+        [
+            asset
+            for asset in assets_raw
+            if isinstance(asset, dict) and asset.get("kind") == "icon"
+        ]
+        if isinstance(assets_raw, list)
+        else []
+    )
+    fallback = icons[0] if icons else None
+    embeds: dict[tuple[int, int], dict[str, Any]] = {}
+    embedded = 0
+    skipped = 0
+    reasons: list[str] = []
+    resolved_cache: dict[str, tuple[dict[str, Any] | None, str | None]] = {}
+
+    def note_skip(dialog_index: int, item: dict[str, Any], reason: str) -> None:
+        nonlocal skipped
+        skipped += 1
+        if len(reasons) < MAX_EMBEDDED_ASSETS:
+            reasons.append(f"dialog {dialog_index} item {item.get('id')}: {reason}")
+        elif len(reasons) == MAX_EMBEDDED_ASSETS:
+            reasons.append(f"... further skip reasons omitted (cap {MAX_EMBEDDED_ASSETS})")
+
+    for dialog_index, dialog in enumerate(summary.dialogs):
+        for position, item in enumerate(dialog["items"]):
+            if item.get("type") != "static:icon":
+                continue
+            if embedded >= MAX_EMBEDDED_ASSETS:
+                note_skip(
+                    dialog_index, item, f"embed budget {MAX_EMBEDDED_ASSETS} reached"
+                )
+                continue
+            asset = _match_icon_asset(item, icons, fallback)
+            if asset is None:
+                note_skip(dialog_index, item, "no icon assets in the manifest")
+                continue
+            key = str(asset.get("path"))
+            if key not in resolved_cache:
+                resolved_cache[key] = _resolve_asset_png(
+                    asset, f"dialog {dialog_index} item {item.get('id')}"
+                )
+            resolved, reason = resolved_cache[key]
+            if resolved is None:
+                note_skip(dialog_index, item, reason or "unusable icon asset")
+                continue
+            embeds[(dialog_index, position)] = resolved
+            embedded += 1
+    return {
+        "embeds": embeds,
+        "embedded": embedded,
+        "skipped": skipped,
+        "skipped_reasons": reasons,
+    }
+
+
+def _img_tag(embed: dict[str, Any], label: str) -> str:
+    """Render one embedded icon as a self-contained deterministic ``<img>``."""
+    dims = ""
+    width, height = embed.get("width"), embed.get("height")
+    if width is not None and height is not None:
+        dims = f' width="{width}" height="{height}"'
+    return (
+        f'<img src="{embed["data_uri"]}" alt="{html.escape(label)}"{dims} '
+        f'data-icon-sha256="{embed["sha256"]}">'
+    )
+
+
 # ---- deterministic HTML preview ------------------------------------------------
 
 
-def render_preview_html(summary: WinResUiSummary, title: str = "UI preview") -> str:
+def render_preview_html(
+    summary: WinResUiSummary,
+    title: str = "UI preview",
+    icon_plan: dict[str, Any] | None = None,
+) -> str:
     """Render one summary as a deterministic, self-contained HTML page.
 
-    Pure function of ``summary`` and ``title``: no timestamps, no random ids,
-    stable ordering -- identical evidence produces byte-identical HTML. Pixel
-    rects use the documented DLU approximation (4 px per x-DLU, 8 px per
-    y-DLU) and every dialog item carries its ``data-id``.
+    Pure function of ``summary``, ``title`` and ``icon_plan``: no timestamps,
+    no random ids, stable ordering -- identical evidence produces
+    byte-identical HTML. Pixel rects use the documented DLU approximation
+    (4 px per x-DLU, 8 px per y-DLU) and every dialog item carries its
+    ``data-id``.
+
+    ``icon_plan`` (optional, from :func:`plan_icon_embeds`) replaces each
+    matched ``SS_ICON`` static's placeholder box with an ``<img>`` whose
+    ``src`` is the asset's PNG as a ``data:image/png;base64`` URI; unmatched
+    or oversized assets keep their placeholder. ``None`` (the default)
+    renders exactly the historical placeholder-only markup.
     """
     esc = html.escape
     parts: list[str] = [
@@ -971,10 +1188,20 @@ def render_preview_html(summary: WinResUiSummary, title: str = "UI preview") -> 
         f"{summary.stringtable_entry_count} string(s). Pixel rects approximate "
         "DLUs (4 px per x-DLU, 8 px per y-DLU).</p>\n",
     ]
-    if summary.warnings:
+    warnings = list(summary.warnings)
+    if icon_plan is not None:
+        warnings.extend(icon_plan.get("skipped_reasons", ()))
+    if warnings:
         parts.append("<p class=\"warnings\">warnings: ")
-        parts.append(esc("; ".join(summary.warnings)))
+        parts.append(esc("; ".join(warnings)))
         parts.append("</p>\n")
+    if icon_plan is not None:
+        parts.append(
+            "<p class=\"assets\">"
+            f"{icon_plan.get('embedded', 0)} icon(s) embedded from the asset "
+            f"manifest, {icon_plan.get('skipped', 0)} static(s) kept as "
+            "placeholders.</p>\n"
+        )
     for index, dialog in enumerate(summary.dialogs):
         width, height = dialog["rect_px"][2], dialog["rect_px"][3]
         heading = dialog["title"] or f"(unnamed {dialog['name']})"
@@ -1000,7 +1227,7 @@ def render_preview_html(summary: WinResUiSummary, title: str = "UI preview") -> 
         checkbox_types = {"button:checkbox", "button:autocheckbox", "button:3state",
                           "button:auto3state"}
         radio_types = {"button:radiobutton", "button:autoradiobutton"}
-        for item in dialog["items"]:
+        for position, item in enumerate(dialog["items"]):
             css_class = str(item["class"] or "control").lower()
             itype = item.get("type")
             flags = set(item.get("style_flags", ()))
@@ -1029,8 +1256,14 @@ def render_preview_html(summary: WinResUiSummary, title: str = "UI preview") -> 
                 glyph = "\u2610 "
             elif itype in radio_types:
                 glyph = "\u25CB "
+            embed = None
+            if icon_plan is not None:
+                embed = icon_plan["embeds"].get((index, position))
             if itype in ("static:icon", "static:bitmap"):
-                css_class += " placeholder"
+                if embed is not None:
+                    content = _img_tag(embed, label)  # real icon replaces the box
+                else:
+                    css_class += " placeholder"
             if itype == "button:groupbox":
                 css_class += " groupbox"
                 content = f"<span class=\"legend\">{esc(label)}</span>"

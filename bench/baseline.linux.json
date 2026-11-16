@@ -1,31 +1,31 @@
 {
-  "benchmarks": {
-    "build_call_graph (samples/elf64_text.bin)": 0.111,
-    "build_call_graph (samples/pe64_text.bin)": 0.463,
-    "build_cfg (samples/elf64_text.bin)": 0.117,
-    "build_cfg (samples/pe64_text.bin)": 0.575,
-    "diff_binaries (samples/pe64_text.bin -> samples/elf64_text.bin)": 0.203,
-    "disassemble_entry (samples/elf64_text.bin)": 0.03,
-    "disassemble_entry (samples/pe64_text.bin)": 0.31,
-    "discover_functions (samples/elf64_text.bin)": 0.004,
-    "discover_functions (samples/pe64_text.bin)": 0.006,
-    "extract_strings (samples/elf64_text.bin)": 0.036,
-    "extract_strings (samples/pe64_text.bin)": 0.061,
-    "find_xrefs (samples/elf64_text.bin)": 0.097,
-    "find_xrefs (samples/pe64_text.bin)": 0.452,
-    "function_fingerprint (samples/elf64_text.bin)": 0.106,
-    "function_fingerprint (samples/pe64_text.bin)": 0.504,
-    "load (samples/elf64_text.bin)": 0.073,
-    "load (samples/pe64_text.bin)": 0.07,
-    "suggest_struct (samples/elf64_text.bin)": 0.104,
-    "suggest_struct (samples/pe64_text.bin)": 0.665
-  },
-  "format": "codevanta-bench-gate",
-  "limits": {
-    "limit_functions": 64,
-    "max_instructions": 2000
-  },
-  "repeat": 15,
-  "unit": "ms",
-  "version": 1
+"benchmarks": {
+"build_call_graph (samples/elf64_text.bin)": 0.078,
+"build_call_graph (samples/pe64_text.bin)": 0.361,
+"build_cfg (samples/elf64_text.bin)": 0.083,
+"build_cfg (samples/pe64_text.bin)": 0.444,
+"diff_binaries (samples/pe64_text.bin -> samples/elf64_text.bin)": 0.129,
+"disassemble_entry (samples/elf64_text.bin)": 0.019,
+"disassemble_entry (samples/pe64_text.bin)": 0.235,
+"discover_functions (samples/elf64_text.bin)": 0.003,
+"discover_functions (samples/pe64_text.bin)": 0.005,
+"extract_strings (samples/elf64_text.bin)": 0.022,
+"extract_strings (samples/pe64_text.bin)": 0.041,
+"find_xrefs (samples/elf64_text.bin)": 0.066,
+"find_xrefs (samples/pe64_text.bin)": 0.34,
+"function_fingerprint (samples/elf64_text.bin)": 0.073,
+"function_fingerprint (samples/pe64_text.bin)": 0.383,
+"load (samples/elf64_text.bin)": 0.044,
+"load (samples/pe64_text.bin)": 0.041,
+"suggest_struct (samples/elf64_text.bin)": 0.073,
+"suggest_struct (samples/pe64_text.bin)": 0.534
+},
+"format": "codevanta-bench-gate",
+"limits": {
+"limit_functions": 64,
+"max_instructions": 2000
+},
+"repeat": 15,
+"unit": "ms",
+"version": 1
 }

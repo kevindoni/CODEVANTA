@@ -632,3 +632,134 @@ def test_fidelity_unknown_item_class_type_none(tmp_path: Path) -> None:
     assert item["type"] is None  # no invented semantics for custom classes
     assert item["style_flags"] == ["WS_CHILD", "WS_VISIBLE"]
     assert item["style_hex"] == "0x50000000"
+
+
+# ---- icon embedding (lane-iconprev) -------------------------------------------
+
+
+def build_dialog_icon() -> bytes:
+    """DLGTEMPLATEEX with one SS_ICON static, string title '3'."""
+    blob = bytearray()
+    blob += struct.pack("<HH", 1, 0xFFFF)  # dlgVer, signature
+    blob += struct.pack("<III", 7, 0, WS_POPUP | WS_VISIBLE | DS_SETFONT)
+    blob += struct.pack("<H", 1)  # cDlgItems
+    blob += struct.pack("<hhhh", 10, 20, 120, 80)
+    blob += struct.pack("<H", 0x0000)  # menu: none
+    blob += struct.pack("<H", 0x0000)  # class: none
+    blob += _u16("Icons")
+    blob += struct.pack("<HHBB", 8, 400, 0, 0)  # EX font block
+    blob += _u16("Segoe UI")
+    _align_blob(blob)
+    # item: STATIC with SS_ICON (style low bits 0x03 = SS_ICON), title '3'
+    blob += struct.pack(
+        "<IIIhhhhI",
+        0, 0, WS_CHILD | WS_VISIBLE | 0x00000003, 4, 4, 32, 32, 9,
+    )
+    blob += struct.pack("<HH", 0xFFFF, 0x82)  # class ordinal STATIC
+    blob += _u16("3")
+    blob += struct.pack("<H", 0)  # extraCount
+    blob += struct.pack("<H", 0)  # template terminator
+    return bytes(blob)
+
+
+def _write_icon_png(tmp_path: Path) -> tuple[Path, str]:
+    from codevanta.analysis.win_gui import encode_png
+
+    pixels = [
+        [(255, 0, 0, 255), (0, 255, 0, 255)],
+        [(0, 0, 255, 255), (255, 255, 0, 255)],
+    ]
+    png = encode_png(2, 2, pixels, color_type=6)
+    path = tmp_path / "appicon.png"
+    path.write_bytes(png)
+    import hashlib
+
+    return path, hashlib.sha256(png).hexdigest()
+
+
+def _assets_manifest(png: Path, digest: str) -> dict:
+    return {
+        "assets": [
+            {
+                "kind": "icon",
+                "group": "APPICON",
+                "resource_id": 3,
+                "path": str(png),
+                "bytes": png.stat().st_size,
+                "sha256": digest,
+                "width": 2,
+                "height": 2,
+            }
+        ]
+    }
+
+
+def test_preview_embeds_matched_icon(tmp_path: Path) -> None:
+    payload = build_resource_section({5: [(1, build_dialog_icon())]})
+    pe = make_pe(
+        tmp_path / "icon.exe",
+        data_dirs={2: (SECTION_VA, len(payload))},
+        section_payload=payload,
+    )
+    png, digest = _write_icon_png(tmp_path)
+    manifest_path = tmp_path / "assets.json"
+    manifest_path.write_text(json.dumps(_assets_manifest(png, digest)), encoding="utf-8")
+    out = tmp_path / "out"
+    result = tools.codevanta_ui_preview(
+        str(pe), str(out), assets_manifest_path=str(manifest_path)
+    )
+    assert result["assets"]["embedded"] == 1
+    assert result["assets"]["skipped"] == 0
+    html = (out / "ui_preview.html").read_text(encoding="utf-8")
+    assert "data:image/png;base64," in html
+    assert 'data-icon-sha256="' + digest in html
+
+
+def test_preview_sha_mismatch_keeps_placeholder(tmp_path: Path) -> None:
+    payload = build_resource_section({5: [(1, build_dialog_icon())]})
+    pe = make_pe(
+        tmp_path / "icon2.exe",
+        data_dirs={2: (SECTION_VA, len(payload))},
+        section_payload=payload,
+    )
+    png, _digest = _write_icon_png(tmp_path)
+    manifest_path = tmp_path / "assets.json"
+    manifest_path.write_text(json.dumps(_assets_manifest(png, "0" * 64)), encoding="utf-8")
+    out = tmp_path / "out"
+    result = tools.codevanta_ui_preview(
+        str(pe), str(out), assets_manifest_path=str(manifest_path)
+    )
+    assert result["assets"]["embedded"] == 0
+    assert result["assets"]["skipped"] == 1
+    assert result["assets"]["skipped_reasons"]
+    html = (out / "ui_preview.html").read_text(encoding="utf-8")
+    assert "data:image/png;base64," not in html
+
+
+def test_preview_missing_manifest_is_typed_error(tmp_path: Path) -> None:
+    payload = build_resource_section({5: [(1, build_dialog_icon())]})
+    pe = make_pe(
+        tmp_path / "icon3.exe",
+        data_dirs={2: (SECTION_VA, len(payload))},
+        section_payload=payload,
+    )
+    with pytest.raises(AnalysisError, match="file not found"):
+        tools.codevanta_ui_preview(
+            str(pe),
+            str(tmp_path / "out"),
+            assets_manifest_path=str(tmp_path / "ghost.json"),
+        )
+
+
+def test_preview_without_manifest_stays_backward_compatible(tmp_path: Path) -> None:
+    payload = build_resource_section({5: [(1, build_dialog_icon())]})
+    pe = make_pe(
+        tmp_path / "plain.exe",
+        data_dirs={2: (SECTION_VA, len(payload))},
+        section_payload=payload,
+    )
+    out = tmp_path / "out"
+    result = tools.codevanta_ui_preview(str(pe), str(out))
+    assert "assets" not in result
+    html = (out / "ui_preview.html").read_text(encoding="utf-8")
+    assert "data:image/png;base64," not in html
