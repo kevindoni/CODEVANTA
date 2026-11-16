@@ -23,6 +23,21 @@ All notable changes to CODEVANTA are documented here. The format follows
   records the head, so verification names the first entry where the chain
   breaks instead of only reporting that the table changed. Bundles without
   a chain (built before this change) still verify.
+- **Persistent interactive gdb MI sessions** (`codevanta_mi_start` /
+  `console` / `status` / `close` / `sessions`): one live
+  `gdb --interpreter=mi2` process per deterministic id, a raw-MI console lane
+  that returns `^error` as data and refuses `-gdb-exit`, and a close that
+  verifies the debugger's exit and never kills an attached inferior,
+  reporting the inferior's disposition as `unknown` with the platform reason
+  outside `/proc`-verifiable Linux. The bounded registry evicts the oldest
+  live session with a verified quit. `DebugSession.launch` now accepts no
+  target (a bare session loaded later through MI) and gained a public
+  `console()` method.
+- **Benchmark runtime lane**: `bench/tasks.json` grows to 16 tasks with
+  offline, deterministic runtime questions -- `codevanta_emulate` and
+  `symbolic` on the PE sample plus `trace` replay over the committed gdb and
+  Frida logs. All 16 keep stable SHA-256 hashes across reruns; no REA
+  mapping is claimed for the runtime lane yet.
 
 ### Changed
 

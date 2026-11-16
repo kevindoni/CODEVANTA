@@ -547,7 +547,21 @@ Each one returns a step-by-step playbook that names the tool for every step,
 the bound to pass it, and what the result does and does not prove, so an agent
 follows the same observation/inference discipline the payloads carry.
 
-The server registers **127 MCP tools** across analysis, dynamic/debug,
+### Persistent gdb MI sessions
+
+`codevanta_mi_start` launches one interactive `gdb --interpreter=mi2` process
+the server owns and registers it under a deterministic id (`mi-001`, ...);
+`codevanta_mi_console` sends one raw MI command and returns the transcript
+(an MI `^error` comes back as data, only `-gdb-exit`/`kill` are refused — the
+close lane owns shutdown); `codevanta_mi_status` reports the lifecycle state
+and bounded command history; `codevanta_mi_close` quits gdb and **verifies**
+the debugger process went away (`clean: true` only on a self-exit with code
+0), never kills an attached inferior, and reports the inferior's disposition
+as `unknown` with the platform reason everywhere but a `/proc`-verifiable
+Linux. Sessions live in the server process; the registry holds eight records
+and evicts the oldest live session with a verified quit when full.
+
+The server registers **132 MCP tools** across analysis, dynamic/debug,
 platform/mobile, web/JavaScript, firmware, formats, rebuild, and session lanes;
 [docs/mcp-tools.md](docs/mcp-tools.md) is the generated reference with every
 tool's parameters and description. `codevanta_analyze` mirrors the CLI flags
