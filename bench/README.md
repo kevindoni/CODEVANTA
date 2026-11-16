@@ -35,6 +35,28 @@ Entry-point addresses (`bench/tasks.json`, integer `address` arguments):
 as integers because `decompile` and `cfg` currently accept only `int` addresses;
 the harness is written against that contract.
 
+## Filling the REA column
+
+`--rea bench/results/rea.json` merges an external document shaped
+`{"task_id": {"ok": bool, "tokens": int, "ms": int}}`. Collect it from an agent
+session that runs the same questions through REA and record the reply-token
+delta per call. The mapping used for the committed comparison:
+
+| Task type | REA calls |
+| --- | --- |
+| `*-info` | `open_binary` + `binary_overview` (open cost attributed to this task) |
+| `*-functions` | `analyze_function` (`detail="summary"`) at the entry point |
+| `*-xrefs` / `*-cfg` | `analyze_function` (complete dossier: calls and references) |
+| `*-decompile` | `procedure_pseudo_code` at the entry point |
+
+Two caveats keep the table honest. REA tokens are gateway-budgeted reply sizes,
+not model billing; CODEVANTA tokens are `chars / 4` estimates of the raw JSON
+payload. And provider availability is environment truth, not noise: on this
+Windows machine REA's Ghidra bridge answers PE only (`target_format_unsupported`
+for ELF and Mach-O unless Hopper/IDA are installed), so its ELF/Mach-O rows
+carry ~670-token error envelopes with `ok: false` -- exactly the situation the
+`ok` column exists to show.
+
 ## Run it
 
 From the repository root (works on Windows, macOS, and Linux):
