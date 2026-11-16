@@ -360,3 +360,85 @@ def test_update_baseline_writes_the_platform_file(
     document = json.loads((bench_dir / "baseline.linux.json").read_text(encoding="utf-8"))
     assert document["format"] == "codevanta-bench-gate"
     assert "(platform linux)" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# The bench-gate lane: the committed default is the CI gate policy (25%).
+# ---------------------------------------------------------------------------
+
+
+def test_default_tolerance_is_the_ci_gate_policy() -> None:
+    """The tool's default tolerance is the 25% regression budget CI enforces."""
+    assert bench_gate.DEFAULT_TOLERANCE == 0.25
+
+
+def test_25_percent_boundary_passes_and_just_beyond_fails() -> None:
+    """The lane's rule at the boundary: exactly 1.25x a baseline passes, 1.2501x fails."""
+    row = make_row(1.25)
+    key = bench_gate.row_key(row)
+
+    at_limit = bench_gate.compare([row], {key: 1.0}, 0.25)
+    assert [(verdict.status, verdict.failed) for verdict in at_limit] == [("ok", False)]
+    assert at_limit[0].delta_pct == 25.0
+
+    above = bench_gate.compare([make_row(1.2501)], {key: 1.0}, 0.25)
+    assert [(verdict.status, verdict.failed) for verdict in above] == [("regressed", True)]
+
+
+def test_failure_summary_names_benchmark_with_measured_and_allowed() -> None:
+    """A regression is named with both sides of the rule: measured and allowed."""
+    row = make_row(2.0)
+    key = bench_gate.row_key(row)
+
+    verdicts = bench_gate.compare([row], {key: 1.0}, 0.25)
+    summary = bench_gate.summarise(verdicts, 0.25, "linux")
+    assert summary.startswith("bench_gate: FAIL 1/1 beyond 25% tolerance")
+    assert f"{key}: measured 2.000ms > allowed 1.250ms" in summary
+    assert "(platform linux)" in summary
+
+    # A benchmark absent from the baseline is named without inventing numbers.
+    unlisted = bench_gate.summarise(bench_gate.compare([row], {}, 0.25), 0.25, "linux")
+    assert f"{key}: measured 2.000ms, no baseline entry" in unlisted
+
+
+def test_malformed_baseline_exits_two(tmp_path: Path) -> None:
+    """A baseline that is not JSON is a typed 'unusable baseline' error, exit 2."""
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text("{not json at all", encoding="utf-8")
+
+    result = run_gate(*TINY_ARGS, "--baseline", str(baseline))
+
+    assert result.returncode == 2
+    assert "unusable baseline" in result.stderr
+    assert "not valid JSON" in result.stderr
+    assert result.stdout == ""
+
+
+def test_baseline_with_wrong_format_exits_two(tmp_path: Path) -> None:
+    """Valid JSON that is not a bench-gate document is rejected before measuring."""
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps({"benchmarks": {}}), encoding="utf-8")
+
+    result = run_gate(*TINY_ARGS, "--baseline", str(baseline))
+
+    assert result.returncode == 2
+    assert "unusable baseline" in result.stderr
+    assert "codevanta-bench-gate" in result.stderr
+    assert "--update-baseline" in result.stderr
+    assert result.stdout == ""
+
+
+def test_gate_happy_path_at_the_committed_tolerance(tmp_path: Path) -> None:
+    """A fresh baseline then a run at the 25% default passes on the same machine.
+
+    No ``--tolerance`` is passed: this also pins the default end to end, the way
+    CI's benchmark job runs it.
+    """
+    baseline = tmp_path / "baseline.json"
+    record_baseline(baseline)
+
+    result = run_gate(*TINY_ARGS, "--baseline", str(baseline), "--platform", "linux")
+
+    assert result.returncode == 0, result.stderr
+    assert "PASS" in result.stderr
+    assert "within 25% tolerance" in result.stderr
