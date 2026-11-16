@@ -1,0 +1,146 @@
+{
+  "format": "codevanta-bench-tasks",
+  "version": 1,
+  "description": "Twelve questions across three committed samples and four evidence types.",
+  "sample_dir": "samples",
+  "tasks": [
+    {
+      "id": "pe64-info",
+      "sample": "pe64_text.bin",
+      "question": "What format, architecture, entry point, and sections does the PE64 sample expose?",
+      "tool": "binary_info",
+      "args": {
+        "path": "{sample_dir}/pe64_text.bin"
+      },
+      "required_keys": ["format", "architecture", "entry_point", "sha256", "sections"],
+      "min_list": {"sections": 1}
+    },
+    {
+      "id": "pe64-functions",
+      "sample": "pe64_text.bin",
+      "question": "Which function candidates can be recovered from the PE64 sample?",
+      "tool": "functions",
+      "args": {
+        "path": "{sample_dir}/pe64_text.bin",
+        "limit": 20
+      },
+      "required_keys": ["count", "items"],
+      "min_list": {"items": 1}
+    },
+    {
+      "id": "pe64-xrefs",
+      "sample": "pe64_text.bin",
+      "question": "Which direct calls and branches cross-reference code in the PE64 sample?",
+      "tool": "xrefs",
+      "args": {
+        "path": "{sample_dir}/pe64_text.bin",
+        "limit": 20
+      },
+      "required_keys": ["count", "items"],
+      "min_list": {"items": 1}
+    },
+    {
+      "id": "pe64-decompile",
+      "sample": "pe64_text.bin",
+      "question": "What does the PE64 entry point look like as C-like pseudocode?",
+      "tool": "decompile",
+      "args": {
+        "path": "{sample_dir}/pe64_text.bin",
+        "address": 5368713216
+      },
+      "required_keys": ["text", "backend", "language"]
+    },
+    {
+      "id": "elf64-info",
+      "sample": "elf64_text.bin",
+      "question": "What format, architecture, entry point, and sections does the ELF64 sample expose?",
+      "tool": "binary_info",
+      "args": {
+        "path": "{sample_dir}/elf64_text.bin"
+      },
+      "required_keys": ["format", "architecture", "entry_point", "sha256", "sections"],
+      "min_list": {"sections": 1}
+    },
+    {
+      "id": "elf64-functions",
+      "sample": "elf64_text.bin",
+      "question": "Which function candidates can be recovered from the stripped ELF64 sample?",
+      "tool": "functions",
+      "args": {
+        "path": "{sample_dir}/elf64_text.bin",
+        "limit": 20
+      },
+      "required_keys": ["count", "items"],
+      "min_list": {"items": 1}
+    },
+    {
+      "id": "elf64-cfg",
+      "sample": "elf64_text.bin",
+      "question": "How does control flow split into basic blocks from the ELF64 entry point?",
+      "tool": "cfg",
+      "args": {
+        "path": "{sample_dir}/elf64_text.bin",
+        "address": 4198400
+      },
+      "required_keys": ["start", "blocks", "instruction_count"],
+      "min_list": {"blocks": 1}
+    },
+    {
+      "id": "elf64-decompile",
+      "sample": "elf64_text.bin",
+      "question": "What does the ELF64 entry point look like as C-like pseudocode?",
+      "tool": "decompile",
+      "args": {
+        "path": "{sample_dir}/elf64_text.bin",
+        "address": 4198400
+      },
+      "required_keys": ["text", "backend", "language"]
+    },
+    {
+      "id": "macho64-info",
+      "sample": "macho64_text.bin",
+      "question": "What format, architecture, entry point, and sections does the Mach-O sample expose?",
+      "tool": "binary_info",
+      "args": {
+        "path": "{sample_dir}/macho64_text.bin"
+      },
+      "required_keys": ["format", "architecture", "entry_point", "sha256", "sections"],
+      "min_list": {"sections": 1}
+    },
+    {
+      "id": "macho64-functions",
+      "sample": "macho64_text.bin",
+      "question": "Which function candidates can be recovered from the Mach-O sample?",
+      "tool": "functions",
+      "args": {
+        "path": "{sample_dir}/macho64_text.bin",
+        "limit": 20
+      },
+      "required_keys": ["count", "items"],
+      "min_list": {"items": 1}
+    },
+    {
+      "id": "macho64-xrefs",
+      "sample": "macho64_text.bin",
+      "question": "Which direct calls and branches cross-reference code in the Mach-O sample?",
+      "tool": "xrefs",
+      "args": {
+        "path": "{sample_dir}/macho64_text.bin",
+        "limit": 20
+      },
+      "required_keys": ["count", "items"],
+      "min_list": {"items": 1}
+    },
+    {
+      "id": "macho64-decompile",
+      "sample": "macho64_text.bin",
+      "question": "What does the Mach-O entry point look like as C-like pseudocode?",
+      "tool": "decompile",
+      "args": {
+        "path": "{sample_dir}/macho64_text.bin",
+        "address": 4294967680
+      },
+      "required_keys": ["text", "backend", "language"]
+    }
+  ]
+}
