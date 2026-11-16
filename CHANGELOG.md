@@ -30,6 +30,14 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Changed
 
+- **Benchmark gate gains a deliberate recalibration path**: `workflow_dispatch`
+  now accepts `update_baseline=true`, which re-records
+  `bench/baseline.linux.json` on the dispatch runner (best-of-15) and commits
+  the refreshed baseline before gating -- the committed numbers then come
+  from the same machine class the gate runs on. PR/push events never touch
+  the baseline; the benchmark job is the only one granted `contents: write`,
+  and the stale "(25% tolerance)" step name is now "(committed slack)".
+
 - The pseudo-C emitter's `if` lines now carry the comparison's true C
   semantics: operands are cast to the jump's signedness at the SSA type-hint
   width when a hint exists (`(int32_t)rax.1` for a `uint32_t`-hinted value),
