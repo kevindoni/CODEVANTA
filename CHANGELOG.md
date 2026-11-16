@@ -10,12 +10,13 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Changed
 
-- The pseudo-C emitter's `if` lines are now annotated with the comparison's
-  signedness read from the jump mnemonic -- `/* taken: signed */` for
-  `jg/jge/jl/jle` (and aliases), `/* taken: unsigned */` for
-  `ja/jae/jb/jbe` (and aliases), and plain `/* taken */` for `je/jne`.
-  Casts to typed widths stay deferred (type hints are next); the raw `cmp`
-  text remains on the SSA instruction.
+- The pseudo-C emitter's `if` lines now carry the comparison's true C
+  semantics: operands are cast to the jump's signedness at the SSA type-hint
+  width when a hint exists (`(int32_t)rax.1` for a `uint32_t`-hinted value),
+  otherwise at the canonical register's width (`(uint64_t)rbx.0` for an
+  untyped 64-bit register); immediates and equality jumps (`je/jne`) stay
+  uncased, and the taken-annotation (`/* taken: signed */` / `/* taken:
+  unsigned */`) remains. The raw `cmp` text stays on the SSA instruction.
 
 ## [0.4.0] - 2026-11-16
 

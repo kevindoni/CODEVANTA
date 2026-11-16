@@ -5,9 +5,9 @@ instructions that :func:`codevanta.analysis.ir_ssa.build_ssa` produced and
 prints one pseudo-C statement per definition, reusing the increment-2 folded
 ``expr`` strings verbatim (``rax.2 = rax.1 + rbx.0;``, ``rcx.1 = 0;``,
 ``rax.1 = ptr(rbx.0 + 0x10);``). Recovered conditions render as bounded
-``if (left == right) { /* taken */ }`` lines annotated with the comparison's
-signedness (``/* taken: signed */`` / ``/* taken: unsigned */`` for the
-order-comparison jumps); calls render their SSA argument
+``if (...) { /* taken: signed */ }`` lines whose operands are cast to the
+jump's signedness at the SSA type-hint width (or the canonical register's
+width when untyped; immediates stay uncased); calls render their SSA argument
 registers and a bounded clobber note; loop-boundary blocks and undefined
 reads are flagged as honest comments, never guessed away.
 
@@ -20,6 +20,7 @@ and the clobber/undef note lists are clipped so the text stays bounded
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -92,6 +93,93 @@ _UNSIGNED_JCC: frozenset[str] = frozenset(
     {"ja", "jnbe", "jae", "jnb", "jnc", "jb", "jnae", "jc", "jbe", "jna"}
 )
 
+#: Canonical x86 GP register -> width in bytes. SSA ids use the canonical
+#: name for the binary's bitness (64-bit names on a 64-bit binary, 32-bit
+#: ones on a 32-bit binary), so the name itself is the honest width source
+#: when a value carries no type hint.
+_REGISTER_WIDTHS: dict[str, int] = {
+    "rax": 8,
+    "rbx": 8,
+    "rcx": 8,
+    "rdx": 8,
+    "rsi": 8,
+    "rdi": 8,
+    "rbp": 8,
+    "rsp": 8,
+    "r8": 8,
+    "r9": 8,
+    "r10": 8,
+    "r11": 8,
+    "r12": 8,
+    "r13": 8,
+    "r14": 8,
+    "r15": 8,
+    "eax": 4,
+    "ebx": 4,
+    "ecx": 4,
+    "edx": 4,
+    "esi": 4,
+    "edi": 4,
+    "ebp": 4,
+    "esp": 4,
+}
+
+#: C integer types by width in bytes, per comparison signedness.
+_SIGNED_C_TYPES: dict[int, str] = {
+    1: "int8_t",
+    2: "int16_t",
+    4: "int32_t",
+    8: "int64_t",
+}
+_UNSIGNED_C_TYPES: dict[int, str] = {
+    1: "uint8_t",
+    2: "uint16_t",
+    4: "uint32_t",
+    8: "uint64_t",
+}
+
+#: An SSA value id: ``<register>.<version>`` (immediates never match).
+_SSA_ID_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)\.(0|[1-9][0-9]*)$")
+
+#: A bit width inside a type-propagation hint (``int32_t``, ``uint64_t *``).
+_HINT_WIDTH_RE = re.compile(r"(8|16|32|64)")
+
+
+def _operand_width(operand: str, hint_by_id: dict[str, str | None]) -> int | None:
+    """Width in bytes for one condition operand, or ``None`` to leave it uncased.
+
+    A type hint wins (its stated width, pointers included); an untyped SSA id
+    falls back to its canonical register's width; immediates and other tokens
+    have no width at all.
+    """
+    match = _SSA_ID_RE.match(operand)
+    if match is None:
+        return None
+    hint = hint_by_id.get(operand)
+    if hint:
+        width_match = _HINT_WIDTH_RE.search(hint)
+        if width_match:
+            return int(width_match.group(1)) // 8
+    return _REGISTER_WIDTHS.get(match.group(1))
+
+
+def _cast_operand(
+    operand: str,
+    c_types: dict[int, str],
+    hint_by_id: dict[str, str | None],
+) -> str:
+    """Prefix ``operand`` with the signedness's C type at its resolved width.
+
+    Operands without a width (immediates, FLAGS, unknown tokens) render
+    unchanged -- the comparison keeps its meaning through the other operand's
+    cast plus the taken annotation.
+    """
+    width = _operand_width(operand, hint_by_id)
+    c_type = c_types.get(width) if width is not None else None
+    if c_type is None:
+        return operand
+    return f"({c_type}){operand}"
+
 
 @dataclass(frozen=True)
 class PseudoCResult:
@@ -157,6 +245,7 @@ def emit_pseudo_c(fn: SSAFunction) -> PseudoCResult:
     else prints as a comment. No statement is ever guessed.
     """
     expr_by_id = {value.id: value.expr for value in fn.values}
+    hint_by_id = {value.id: value.type_hint for value in fn.values}
     undef_markers = sorted(
         value.id for value in fn.values if value.kind == "undef"
     )
@@ -226,16 +315,24 @@ def emit_pseudo_c(fn: SSAFunction) -> PseudoCResult:
                 if op is not None:
                     if mnemonic in _SIGNED_JCC:
                         note = " /* taken: signed */"
+                        c_types = _SIGNED_C_TYPES
                     elif mnemonic in _UNSIGNED_JCC:
                         note = " /* taken: unsigned */"
+                        c_types = _UNSIGNED_C_TYPES
                     else:
                         note = " /* taken */"
-                    lines.append(
-                        _clip(
-                            f"if ({cond.get('left', '???')} {op} "
-                            f"{cond.get('right', '???')}) {{{note} }}"
+                        c_types = None
+                    if c_types is None:
+                        left = cond.get("left", "???")
+                        right = cond.get("right", "???")
+                    else:
+                        left = _cast_operand(
+                            cond.get("left", "???"), c_types, hint_by_id
                         )
-                    )
+                        right = _cast_operand(
+                            cond.get("right", "???"), c_types, hint_by_id
+                        )
+                    lines.append(_clip(f"if ({left} {op} {right}) {{{note} }}"))
                 else:
                     # An unsupported mnemonic keeps its honest raw form.
                     lines.append(_clip(f"/* {cond.get('raw', instruction.text)} */"))
@@ -287,9 +384,10 @@ def emit_pseudo_c(fn: SSAFunction) -> PseudoCResult:
         detail=(
             "linear pseudo-C lowering over the SSA IR: definitions reuse the "
             "folded expressions verbatim, recovered conditions render as "
-            "bounded if-lines annotated with the comparison's signedness "
-            "(casts deliberately deferred; the raw cmp text stays in the "
-            "SSA), calls note their SSA arguments and clipped clobbers, "
+            "bounded if-lines whose operands are cast to the jump's "
+            "signedness at hint-or-register width (immediates and equality "
+            "jumps stay uncased; the raw cmp text stays in the SSA), calls "
+            "note their SSA arguments and clipped clobbers, "
             "loop boundaries and undefined reads stay honest comments; "
             "nothing is executed"
         ),
