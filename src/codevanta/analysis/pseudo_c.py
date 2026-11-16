@@ -5,7 +5,9 @@ instructions that :func:`codevanta.analysis.ir_ssa.build_ssa` produced and
 prints one pseudo-C statement per definition, reusing the increment-2 folded
 ``expr`` strings verbatim (``rax.2 = rax.1 + rbx.0;``, ``rcx.1 = 0;``,
 ``rax.1 = ptr(rbx.0 + 0x10);``). Recovered conditions render as bounded
-``if (left == right) { /* taken */ }`` lines; calls render their SSA argument
+``if (left == right) { /* taken */ }`` lines annotated with the comparison's
+signedness (``/* taken: signed */`` / ``/* taken: unsigned */`` for the
+order-comparison jumps); calls render their SSA argument
 registers and a bounded clobber note; loop-boundary blocks and undefined
 reads are flagged as honest comments, never guessed away.
 
@@ -51,9 +53,10 @@ MAX_CLOBBER_NOTES = 8
 _SOURCE = "pseudo_c.emit"
 _METHOD = "ssa-linear-lowering"
 
-#: Bounded conditional-jump mnemonic -> C comparison operator. Signedness
-#: distinction is intentionally dropped in v1 (``ja`` and ``jg`` both map to
-#: ``>``); the raw ``cmp`` text is kept in the evidence for disambiguation.
+#: Bounded conditional-jump mnemonic -> C comparison operator. The operator
+#: itself is sign-agnostic; the signedness comes from the jump mnemonic and is
+#: rendered as a taken-annotation on the if-line (casts are deliberately
+#: deferred -- the raw ``cmp`` text stays in the SSA for disambiguation).
 _CONDITION_OPS: dict[str, str] = {
     "je": "==",
     "jne": "!=",
@@ -76,6 +79,18 @@ _CONDITION_OPS: dict[str, str] = {
     "jbe": "<=",
     "jna": "<=",
 }
+
+#: Order-comparison jumps whose operands the CPU compares as signed integers
+#: (``jg``/``jge``/``jl``/``jle`` plus their negated aliases).
+_SIGNED_JCC: frozenset[str] = frozenset(
+    {"jg", "jnle", "jge", "jnl", "jl", "jnge", "jle", "jng"}
+)
+
+#: Order-comparison jumps whose operands the CPU compares as unsigned
+#: integers (``ja``/``jae``/``jb``/``jbe`` plus their negated aliases).
+_UNSIGNED_JCC: frozenset[str] = frozenset(
+    {"ja", "jnbe", "jae", "jnb", "jnc", "jb", "jnae", "jc", "jbe", "jna"}
+)
 
 
 @dataclass(frozen=True)
@@ -206,12 +221,19 @@ def emit_pseudo_c(fn: SSAFunction) -> PseudoCResult:
             elif instruction.condition is not None:
                 condition_count += 1
                 cond = instruction.condition
-                op = _CONDITION_OPS.get(cond.get("cond", ""))
+                mnemonic = cond.get("cond", "")
+                op = _CONDITION_OPS.get(mnemonic)
                 if op is not None:
+                    if mnemonic in _SIGNED_JCC:
+                        note = " /* taken: signed */"
+                    elif mnemonic in _UNSIGNED_JCC:
+                        note = " /* taken: unsigned */"
+                    else:
+                        note = " /* taken */"
                     lines.append(
                         _clip(
                             f"if ({cond.get('left', '???')} {op} "
-                            f"{cond.get('right', '???')}) {{ /* taken */ }}"
+                            f"{cond.get('right', '???')}) {{{note} }}"
                         )
                     )
                 else:
@@ -265,8 +287,9 @@ def emit_pseudo_c(fn: SSAFunction) -> PseudoCResult:
         detail=(
             "linear pseudo-C lowering over the SSA IR: definitions reuse the "
             "folded expressions verbatim, recovered conditions render as "
-            "bounded if-lines with signedness dropped (raw cmp text kept in "
-            "the SSA), calls note their SSA arguments and clipped clobbers, "
+            "bounded if-lines annotated with the comparison's signedness "
+            "(casts deliberately deferred; the raw cmp text stays in the "
+            "SSA), calls note their SSA arguments and clipped clobbers, "
             "loop boundaries and undefined reads stay honest comments; "
             "nothing is executed"
         ),

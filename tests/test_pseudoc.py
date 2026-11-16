@@ -137,6 +137,16 @@ def test_condition_renders_as_if_line(tmp_path: Path) -> None:
     assert "/* cmp rax, rbx */" in result.text
 
 
+def test_signed_and_unsigned_jcc_annotated(tmp_path: Path) -> None:
+    """jg renders 'taken: signed', ja renders 'taken: unsigned' -- same op."""
+    signed = _emit(tmp_path / "signed.bin", bytes.fromhex("4839d87f029090"))
+    assert "if (rax.0 > rbx.0) { /* taken: signed */ }" in signed.text
+    assert signed.condition_count == 1
+    unsigned = _emit(tmp_path / "unsigned.bin", bytes.fromhex("4839d877029090"))
+    assert "if (rax.0 > rbx.0) { /* taken: unsigned */ }" in unsigned.text
+    assert unsigned.condition_count == 1
+
+
 def test_loop_boundary_marker(tmp_path: Path) -> None:
     """The one-back-edge loop sample marks its loop-boundary block."""
     result = _emit(tmp_path / "loop.bin", LOOP)
