@@ -1192,6 +1192,27 @@ def build_server() -> MCPServer:
 
     @server.tool(
         description=(
+            "Diff two builds of one JavaScript/Electron application "
+            "(static, offline, nothing executed). Both sides are inventoried "
+            "with the same bounds, then set-diffed: modules by path, imports "
+            "by (kind, spec), package.json dependency pins by name and "
+            "version, and IPC channels by literal name -- including a paired "
+            "channel that lost its renderer or main side in the newer build. "
+            "Every list is capped at 200 rows with the cut reported; the "
+            "comparison is a shape measure over two static inventories, so "
+            "an unchanged module list does not mean unchanged behaviour."
+        )
+    )
+    def codevanta_js_diff(
+        left: str, right: str, max_files: int = 512
+    ) -> dict:
+        try:
+            return tools.codevanta_js_diff(left, right, max_files=max_files)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        description=(
             "Audit a JavaScript/Electron application for security "
             "anti-patterns, offline and pure Python (nothing executed, no "
             "Node.js). Runs the static app inventory first, then bounded "
@@ -2327,6 +2348,12 @@ def build_server() -> MCPServer:
             return tools.codevanta_macho_symbols(path)
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
+
+    # Guided investigations: six prompts that script a whole analysis instead
+    # of one tool call. Registered last so every tool they name already exists.
+    from codevanta.mcp_server.prompts import register_prompts
+
+    register_prompts(server)
 
     return server
 

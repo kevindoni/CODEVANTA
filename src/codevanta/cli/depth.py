@@ -25,6 +25,7 @@ from codevanta.analysis.electron_audit import audit_electron_app
 from codevanta.analysis.javascript import DEFAULT_MAX_FILES as JS_DEFAULT_MAX_FILES
 from codevanta.analysis.javascript import MAX_FILES as JS_MAX_FILES
 from codevanta.analysis.javascript import analyze_javascript_app
+from codevanta.analysis.js_diff import compare_js_apps
 from codevanta.analysis.pe_certs import inspect_cert_table
 from codevanta.analysis.wakaru_bridge import MODE_MINIFY, MODES, js_recover
 from codevanta.cli.console import make_console
@@ -290,6 +291,92 @@ def js_audit_cmd(
             console.print(
                 f"[dim]fix {escape(str(finding['rule_id']))}: {escape(str(recommendation))}[/]"
             )
+    _warnings_lines(payload["warnings"])
+    _evidence_footer(payload["evidence"])
+
+
+@js_app.command("diff")
+def js_diff_cmd(
+    left_path: Annotated[
+        Path,
+        typer.Argument(help="Older app side: extracted directory or .asar archive"),
+    ],
+    right_path: Annotated[
+        Path,
+        typer.Argument(help="Newer app side: extracted directory or .asar archive"),
+    ],
+    max_files: Annotated[
+        int,
+        typer.Option(
+            "--max-files",
+            help=f"File-row ceiling passed to both inventories (1..{JS_MAX_FILES})",
+        ),
+    ] = JS_DEFAULT_MAX_FILES,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the JSON result instead of tables")
+    ] = False,
+) -> None:
+    """Diff two builds of one JavaScript/Electron app (offline, bounded)."""
+    try:
+        result = compare_js_apps(left_path, right_path, max_files=max_files)
+    except AnalysisError as exc:
+        _fail(str(exc))
+    payload = result.to_dict()
+    if json_output:
+        console.print_json(json.dumps(payload))
+        return
+    console.print(
+        f"[bold]js diff[/] · {escape(payload['left']['root'])} -> "
+        f"{escape(payload['right']['root'])}"
+    )
+    files = payload["files"]
+    console.print(
+        f"[dim]files: {files['left_count']} -> {files['right_count']}"
+        f" · added: {len(files['added'])}"
+        f" · removed: {len(files['removed'])}"
+        f" · changed: {len(files['changed'])}"
+        f" · role changes: {len(files['role_changes'])}"
+        f" · packages: {len(payload['packages'])}"
+        f" · ipc: {len(payload['ipc'])}[/]"
+    )
+    if payload["identical"]:
+        console.print("[green]no bounded delta observed[/]")
+    if files["changed"]:
+        table = Table(title="Changed modules")
+        table.add_column("File")
+        table.add_column("Role", justify="right")
+        table.add_column("Imports +", justify="right")
+        table.add_column("Imports -", justify="right")
+        for row in files["changed"]:
+            table.add_row(
+                escape(str(row["path"])),
+                f"{escape(str(row['role_left']))} -> {escape(str(row['role_right']))}",
+                str(len(row["imports_added"])),
+                str(len(row["imports_removed"])),
+            )
+        console.print(table)
+    if payload["packages"]:
+        table = Table(title="Dependencies")
+        table.add_column("Package")
+        table.add_column("Change", justify="right")
+        for row in payload["packages"]:
+            if row["kind"] == "version":
+                change = f"{escape(str(row['version_left']))} -> {escape(str(row['version_right']))}"
+            else:
+                change = escape(row["kind"])
+            table.add_row(escape(str(row["name"])), change)
+        console.print(table)
+    if payload["ipc"]:
+        table = Table(title="IPC boundary changes")
+        table.add_column("Channel")
+        table.add_column("Change", justify="right")
+        table.add_column("Files")
+        for row in payload["ipc"]:
+            files_text = ", ".join(row.get("files", ())) or "-"
+            table.add_row(escape(str(row["channel"])), escape(row["kind"]), escape(files_text))
+        console.print(table)
+    if payload["truncated"]:
+        console.print("[yellow]truncated: one or more lists hit the row cap[/]")
     _warnings_lines(payload["warnings"])
     _evidence_footer(payload["evidence"])
 

@@ -84,6 +84,11 @@ __all__ = [
 #: beyond this (totals stay honest) but no more rows are collected.
 MAX_FILES = 512
 
+#: Ceiling on dependency pins kept from one package.json, so a pathological
+#: manifest cannot flood the inventory (or a version diff) with thousands of
+#: rows. The cap is reported through the package evidence, never silent.
+MAX_PACKAGE_PINS = 200
+
 #: Hard ceiling on directory-walk depth (path components below the root).
 MAX_DEPTH = 64
 
@@ -274,12 +279,14 @@ class PackageFacts:
     main: str | None
     electron_version: str | None
     evidence: Evidence
+    dependencies: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "main": self.main,
             "electron_version": self.electron_version,
+            "dependencies": dict(self.dependencies),
             "evidence": self.evidence.to_dict(),
         }
 
@@ -487,7 +494,7 @@ def _decode(data: bytes, path: str) -> str:
 
 
 def _parse_package_json(text: str) -> PackageFacts:
-    """Read name/main/electron from ``package.json`` text (typed errors)."""
+    """Read name/main/electron/dependencies from ``package.json`` (typed errors)."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -497,21 +504,36 @@ def _parse_package_json(text: str) -> PackageFacts:
     name = data.get("name")
     main = data.get("main")
     version = None
+    pins: dict[str, str] = {}
+    pin_truncated = False
     for section in ("dependencies", "devDependencies", "optionalDependencies"):
         block = data.get(section)
-        if isinstance(block, dict) and isinstance(block.get("electron"), str):
+        if not isinstance(block, dict):
+            continue
+        if isinstance(block.get("electron"), str):
             version = block["electron"]
-            break
+        for dep, pin in block.items():
+            if len(pins) >= MAX_PACKAGE_PINS:
+                pin_truncated = True
+                break
+            if isinstance(dep, str) and dep and isinstance(pin, str):
+                # First section wins: a dev pin never shadows a runtime pin.
+                pins.setdefault(dep, pin)
     evidence = Evidence(
         source=EVIDENCE_SOURCE,
         method="package_json",
         confidence=Confidence.CERTAIN,
-        extra={"electron_version": version},
+        extra={
+            "electron_version": version,
+            "dependency_count": len(pins),
+            "dependency_truncated": pin_truncated,
+        },
     )
     return PackageFacts(
         name=name if isinstance(name, str) else None,
         main=main if isinstance(main, str) else None,
         electron_version=version,
+        dependencies=tuple(sorted(pins.items())),
         evidence=evidence,
     )
 

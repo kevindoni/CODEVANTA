@@ -50,6 +50,25 @@ def codevanta_javascript(path: str, max_files: int = javascript.DEFAULT_MAX_FILE
     return javascript.analyze_javascript_app(Path(path), max_files=max_files).to_dict()
 
 
+def codevanta_js_diff(
+    left: str, right: str, max_files: int = javascript.DEFAULT_MAX_FILES
+) -> dict[str, Any]:
+    """Diff two builds of one JavaScript/Electron application (offline).
+
+    Inventories both sides with the same bounds (nothing executed), then
+    set-diffs: modules by path, imports by (kind, spec), ``package.json``
+    dependency pins by name and version, and IPC channels by literal name --
+    including a paired channel that lost one side in the newer build
+    (``main_only`` / ``renderer_only``). Every list is capped at 200 rows and
+    the cut is reported; the comparison is a shape measure over two static
+    inventories, so an unchanged module list does not mean unchanged
+    behaviour.
+    """
+    from codevanta.analysis.js_diff import compare_js_apps
+
+    return compare_js_apps(left, right, max_files=max_files).to_dict()
+
+
 def codevanta_electron_audit(
     path: str, max_files: int = electron_audit.DEFAULT_MAX_FILES
 ) -> dict[str, Any]:
