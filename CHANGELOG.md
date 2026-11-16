@@ -8,7 +8,27 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- **Six guided investigations as MCP prompts**: `triage_binary`,
+  `investigate_feature`, `diff_versions`, `audit_electron_app`, `trace_crash`
+  and `prepare_rebuild`, exposed by both the flat server and the gateway.
+  Each returns a playbook that names the tool for every step and what its
+  result does and does not prove.
+- **JavaScript application version diff** (`codevanta js diff`,
+  `codevanta_js_diff`): two builds inventoried with the same bounds, then
+  set-diffed by module path, import signature, `package.json` dependency pin
+  and literal IPC channel -- including a paired channel that lost one side
+  (`main_only` / `renderer_only`). Every list is capped at 200 rows.
+- **Linked-digest chain on evidence bundles** (`sha256-linked-v1`): every
+  entry digest links to its predecessor in name order and the manifest
+  records the head, so verification names the first entry where the chain
+  breaks instead of only reporting that the table changed. Bundles without
+  a chain (built before this change) still verify.
+
 ### Changed
+
+- `package.json` inventories carry the dependency pins (bounded at 200,
+  first-pinned-wins across dependency sections) so a version diff has
+  something to compare; the package evidence records the count and any cap.
 
 ## [0.6.0] - 2026-11-16
 

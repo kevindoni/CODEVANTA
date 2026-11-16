@@ -339,6 +339,7 @@ codevanta plugins run     metrics samples\elf64_text.bin
 codevanta js analyze      path\to\app           # directory or .asar archive
 codevanta js analyze      app.asar --json       # modules, imports, IPC boundaries
 codevanta js audit        path\to\app           # 11 rules (EA-001..EA-005, EA-010, EA-011, EA-020, EA-031, EA-040, EA-042)
+codevanta js diff        v1 v2                 # modules, imports, dependency pins, IPC changes
 codevanta sbom            path\to\app samples\pe64_text.bin -o sbom.json   # CycloneDX 1.6
 codevanta capabilities    samples\pe64_text.bin # capa-style rule matching
 codevanta stackstrings    samples\pe64_text.bin # FLOSS-style stack-built strings
@@ -533,11 +534,20 @@ same registry through five meta-tools instead (about 0.8k schema tokens):
 - `result_grep(result_id, pattern, regex, context_lines, max_matches)` — search one
 
 The gateway is loopback-only and never changes what a tool returns; it only
-bounds what enters the conversation. The flat 126-tool server remains the
+bounds what enters the conversation. The flat 127-tool server remains the
 default for clients that prefer it. Register the gateway with a coding agent
 via `codevanta setup --gateway` (same clients and scopes as the flat server).
 
-The server registers **126 MCP tools** across analysis, dynamic/debug,
+### Guided investigations (MCP prompts)
+
+Both the flat server and the gateway expose six prompts that script a whole
+analysis instead of a single tool call — `triage_binary`, `investigate_feature`,
+`diff_versions`, `audit_electron_app`, `trace_crash` and `prepare_rebuild`.
+Each one returns a step-by-step playbook that names the tool for every step,
+the bound to pass it, and what the result does and does not prove, so an agent
+follows the same observation/inference discipline the payloads carry.
+
+The server registers **127 MCP tools** across analysis, dynamic/debug,
 platform/mobile, web/JavaScript, firmware, formats, rebuild, and session lanes;
 [docs/mcp-tools.md](docs/mcp-tools.md) is the generated reference with every
 tool's parameters and description. `codevanta_analyze` mirrors the CLI flags
