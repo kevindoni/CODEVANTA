@@ -38,6 +38,10 @@ LOOP = bytes.fromhex("b801000000") + bytes.fromhex("48ffc8") + bytes.fromhex("75
 #: while-loop whose join sits at a higher address than its body (phis!).
 LOOP_JOIN = bytes.fromhex("b800000000eb0783c0019090909083f8057cf4c3")
 
+#: mov eax,1; cmp eax,2; jl other; inc ebx; jmp merge; other: dec ebx;
+#: nop; merge: ret -- a two-arm diamond reconverging at one merge block.
+IFELSE = bytes.fromhex("b80100000083f8027c04ffc3eb03ffcb90c3")
+
 #: `mov rbx, rax; mov ecx, 1; call +1; nop; mov rax, rbx; ret` -- clobbers.
 CALL_CLOBBER = bytes.fromhex("4889c3b901000000e801000000904889d8c3")
 
@@ -184,14 +188,31 @@ def test_loop_boundary_marker(tmp_path: Path) -> None:
     result = _emit(tmp_path / "loop.bin", LOOP)
     assert len(result.loop_markers) >= 1
     assert "LOOP BOUNDARY" in result.text
+    assert "while (" not in result.text  # unrecovered condition: honest fallback
 
 
 def test_loop_join_phi_rendered(tmp_path: Path) -> None:
-    """The high-addressed join's phis render with their merged arguments."""
+    """The high-addressed join renders as a while loop carrying its phis."""
     result = _emit(tmp_path / "join.bin", LOOP_JOIN)
-    assert "rax.2 = phi(rax.1 @ block 0, rax.3 @ block 1);" in result.text
     assert "FLAGS.1 = phi(FLAGS.0 @ block 0, FLAGS.3 @ block 1);" in result.text
-    assert "if ((int64_t)rax.2 < 5) { /* taken: signed */ }" in result.text
+    assert "rax.2 = phi(rax.1 @ block 0, rax.3 @ block 1);" in result.text
+    assert "while ((int64_t)rax.2 < 5) {" in result.text
+    assert "rax.3 = rax.2 + 1;" in result.text
+    assert "/* taken: signed */" not in result.text  # structured, not annotated
+
+
+def test_if_else_diamond_rendered(tmp_path: Path) -> None:
+    """A two-arm diamond reconverging at one merge renders if/else + phi.
+
+    `mov eax,1; cmp eax,2; jl other; inc ebx; jmp merge; other: dec ebx;
+    nop; merge: ret` -- both arms are linear chains, so the emitter opens
+    if/else and the merge block prints the phi merging both arm versions.
+    """
+    result = _emit(tmp_path / "ifelse.bin", IFELSE)
+    assert "if ((int32_t)rax.1 < 2) {" in result.text
+    assert "} else {" in result.text
+    assert "rbx.3 = phi(rbx.1 @ block 1, rbx.2 @ block 2);" in result.text
+    assert "/* ret */" in result.text
 
 
 def test_call_line_with_clobber_note(tmp_path: Path) -> None:

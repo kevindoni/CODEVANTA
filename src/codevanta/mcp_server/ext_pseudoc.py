@@ -27,13 +27,16 @@ TOOL_DESCRIPTION_PSEUDO_C = (
     "Emit readable pseudo-C text for one function region by lowering the "
     "typed SSA IR: every register definition prints as '<id> = <expr>; "
     "reusing the folded expressions (rax.2 = rax.1 + rbx.0;, xor "
-    "self-clears to 0, lea builds ptr(...)), a recovered cmp/jcc renders as "
-    "a bounded 'if (left == right) { /* taken */ }' line (signedness dropped "
-    "in v1), calls note their SSA argument registers and a clipped clobber "
-    "list, and loop boundaries / undefined reads stay honest comments. The "
-    "lowering is linear and unstructured by design -- no if/else joins, no "
-    "phi insertion. Deterministic, bounded by max_blocks/max_instructions "
-    "with truncation flags, medium confidence, offline; nothing is executed."
+    "self-clears to 0, lea builds ptr(...)). Control flow is rendered "
+    "structured where the CFG vocabulary allows -- single-latch while loops "
+    "from dominance back-edges and if/else diamonds whose arms reconverge at "
+    "one merge block -- with an honest linear fallback elsewhere: annotated "
+    "'if (left == right) { /* taken */ }' lines (signedness via casts), "
+    "calls note their SSA argument registers and a clipped clobber list, "
+    "phi joins print as 'id = phi(value @ block N, ...)' statements, and "
+    "loop boundaries / undefined reads stay honest comments. Deterministic, "
+    "bounded by max_blocks/max_instructions with truncation flags, medium "
+    "confidence, offline; nothing is executed."
 )
 
 
