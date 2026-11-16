@@ -617,8 +617,9 @@ def codevanta_frida_close(session_id: str) -> dict[str, Any]:
         raise AnalysisError(
             f"session {session_id} is already closed and its artifacts are gone"
         )
+    close_report: dict[str, Any] | None = None
     if session.handle is not None:
-        session.handle.close()
+        close_report = session.handle.close()
         session.handle = None
     removed: list[str] = []
     for artifact in (session.script_path, session.capture_path):
@@ -633,13 +634,25 @@ def codevanta_frida_close(session_id: str) -> dict[str, Any]:
                 session.warnings = (*session.warnings, f"could not remove {artifact}: {exc}")
     shutil.rmtree(session.work_dir, ignore_errors=True)
     session.state = STATE_CLOSED
-    return {
+    payload = {
         "session_id": session.session_id,
         "state": session.state,
         "removed": removed,
         "work_dir_removed": not session.work_dir.exists(),
         "message_count": session.message_count,
     }
+    if close_report is not None:
+        # The verified lifecycle half of close: what happened to the script,
+        # the attachment, and a still-paused spawned target -- reported, not
+        # swallowed. An attached target is never resumed by close.
+        payload["close"] = {
+            "unloaded": close_report.get("unloaded"),
+            "detached": close_report.get("detached"),
+            "resumed_spawn": close_report.get("resumed_spawn"),
+            **({"note": close_report["note"]} if close_report.get("note") else {}),
+            "warnings": list(close_report.get("warnings", ())),
+        }
+    return payload
 
 
 def codevanta_frida_sessions() -> dict[str, Any]:

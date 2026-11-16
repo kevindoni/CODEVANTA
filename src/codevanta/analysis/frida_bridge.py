@@ -580,6 +580,7 @@ class FridaSession:
         self._spawned_pid = spawned_pid
         self._messages: deque[FridaMessage] = deque(maxlen=MAX_MESSAGES)
         self._dropped = 0
+        self._close_report: dict[str, Any] | None = None
         self.target = target
         self.mode = mode
         self.device_id = device_id
@@ -657,21 +658,79 @@ class FridaSession:
             device.resume(self._spawned_pid)
         self.resumed = True
 
-    def close(self) -> None:
-        """Unload the script and detach, best-effort; idempotent and safe."""
-        if self.closed or self._session is None:
-            self.closed = True
-            return
-        if self._script is not None:
+    def close(self) -> dict[str, Any]:
+        """Unload the script, detach, then resume a still-paused spawn.
+
+        The order is the contract: scripts are unloaded first (so the target
+        stops being instrumented), the session is detached second, and -- for
+        a spawned target that never ran because the session ended before
+        :meth:`resume` -- the device is asked to resume it last, so close
+        cannot strand a paused process. An attached target is already
+        running and is never resumed through this operation.
+
+        Best-effort stays best-effort: every step's failure is recorded in
+        the returned report and in ``warnings`` rather than raised, because a
+        failing cleanup step must not block the next one. Idempotent: a
+        second close returns the same report.
+        """
+        if self.closed:
+            return self._close_report or {
+                "unloaded": None,
+                "detached": None,
+                "resumed_spawn": None,
+                "warnings": ["the session was already closed before a report existed"],
+            }
+        report: dict[str, Any] = {"unloaded": None, "detached": None, "resumed_spawn": None}
+        warnings: list[str] = []
+        if self._session is None:
+            # One-shot CLI wrapper: nothing is attached, nothing to resume.
+            report["resumed_spawn"] = False
+        else:
+            if self._script is not None:
+                try:
+                    self._script.unload()
+                    report["unloaded"] = True
+                except Exception as exc:  # noqa: BLE001 -- shutdown is best-effort
+                    report["unloaded"] = False
+                    warnings.append(f"script unload failed: {type(exc).__name__}: {exc}")
+            else:
+                report["unloaded"] = False
+                warnings.append("no script was loaded, so nothing was unloaded")
             try:
-                self._script.unload()
-            except Exception:  # noqa: BLE001 -- shutdown is best-effort
-                pass
-        try:
-            self._session.detach()
-        except Exception:  # noqa: BLE001 -- shutdown is best-effort
-            pass
+                self._session.detach()
+                report["detached"] = True
+            except Exception as exc:  # noqa: BLE001 -- shutdown is best-effort
+                report["detached"] = False
+                warnings.append(f"session detach failed: {type(exc).__name__}: {exc}")
+            if self._spawned_pid is not None and not self.resumed:
+                # The spawn never ran: leaving it paused would leak a frozen
+                # process, so close resumes it even though the session is over.
+                if self._device is not None:
+                    try:
+                        self._device.resume(self._spawned_pid)
+                        report["resumed_spawn"] = True
+                    except Exception as exc:  # noqa: BLE001 -- shutdown is best-effort
+                        report["resumed_spawn"] = False
+                        warnings.append(
+                            f"resuming the paused spawned pid {self._spawned_pid} failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                else:
+                    report["resumed_spawn"] = False
+                    warnings.append(
+                        f"spawned pid {self._spawned_pid} is still paused: no device "
+                        "handle remained to resume it"
+                    )
+            else:
+                report["resumed_spawn"] = False
+                if self._spawned_pid is None:
+                    report["note"] = (
+                        "attached target: already running, never resumed by close"
+                    )
+        report["warnings"] = warnings
         self.closed = True
+        self._close_report = report
+        return report
 
     def __enter__(self) -> FridaSession:
         return self

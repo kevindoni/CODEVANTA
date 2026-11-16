@@ -39,6 +39,20 @@ All notable changes to CODEVANTA are documented here. The format follows
   Frida logs. All 16 keep stable SHA-256 hashes across reruns; no REA
   mapping is claimed for the runtime lane yet.
 
+### Fixed
+
+- **The Frida close could strand a paused spawn**: the bridge's `close()`
+  unloaded the script and detached but never resumed a spawned target that
+  had not run yet, leaving a frozen process behind. Close now follows the
+  unload -> detach -> resume order, resumes a still-paused spawned target
+  through the device, never resumes an attached one, and returns a report
+  (`unloaded` / `detached` / `resumed_spawn` / warnings) that
+  `codevanta_frida_close` surfaces instead of swallowing step failures.
+- `capture_process` names how the process ended: a new `disposition` field
+  is `exited` on a self-exit and `terminated-after-timeout` on budget
+  expiry, and the timeout warning states the honest limit -- the child
+  itself is terminated, processes it spawned are not tracked or cleaned up.
+
 ### Changed
 
 - `package.json` inventories carry the dependency pins (bounded at 200,

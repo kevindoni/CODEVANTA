@@ -288,7 +288,8 @@ class ProcCapture:
     started_at: str
     finished_at: str
     working_directory: str | None
-    warnings: tuple[str, ...]
+    disposition: str = "exited"
+    warnings: tuple[str, ...] = ()
     evidence: Evidence = field(
         default_factory=lambda: Evidence(
             source=EVIDENCE_SOURCE,
@@ -312,6 +313,7 @@ class ProcCapture:
             "stdout_bytes": self.stdout_bytes,
             "stderr_bytes": self.stderr_bytes,
             "timed_out": self.timed_out,
+            "disposition": self.disposition,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "working_directory": self.working_directory,
@@ -422,6 +424,12 @@ def capture_process(
             f"the command exceeded its timeout of {checked_timeout:g} seconds and "
             "was terminated; exit code unknown, partial output kept",
         )
+        _warn(
+            warnings,
+            "the timeout terminated the child itself; processes the child spawned "
+            "are outside this capture and were not tracked or cleaned up",
+        )
+    disposition = "terminated-after-timeout" if timed_out else "exited"
 
     evidence = Evidence(
         source=EVIDENCE_SOURCE,
@@ -459,6 +467,7 @@ def capture_process(
         started_at=started.isoformat(),
         finished_at=finished.isoformat(),
         working_directory=checked_cwd,
+        disposition=disposition,
         warnings=tuple(warnings),
         evidence=evidence,
     )

@@ -165,6 +165,20 @@ def test_timeout_expired_is_an_honest_timed_out_capture() -> None:
     assert capture.evidence.extra["timed_out"] is True
 
 
+def test_disposition_names_who_ended_the_process() -> None:
+    """``exited`` on a self-exit, ``terminated-after-timeout`` on expiry."""
+    exited = capture_process("x", runner=_RecordingRunner(_FakeOutcome(0)))
+    assert exited.disposition == "exited"
+    assert exited.to_dict()["disposition"] == "exited"
+
+    timed_out = capture_process("slow-worker", timeout=5, runner=_TimeoutRunner())
+    assert timed_out.disposition == "terminated-after-timeout"
+    payload = timed_out.to_dict()
+    assert payload["disposition"] == "terminated-after-timeout"
+    # The honest limit: the timeout ends the child itself, not its children.
+    assert any("spawned" in w and "not tracked" in w for w in payload["warnings"])
+
+
 def test_input_bounds_are_typed_errors() -> None:
     """Every bound fires a typed error before the runner is ever called."""
 
