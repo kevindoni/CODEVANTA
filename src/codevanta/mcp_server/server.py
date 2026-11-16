@@ -72,7 +72,24 @@ from .ext_wininput import (
 UART_DEFAULT_PARITY = cast(Literal["none", "even", "odd"], _UART_DEFAULT_PARITY)
 
 SERVER_NAME = "CODEVANTA"
-SERVER_VERSION = "0.1.0"
+
+
+def _installed_version() -> str:
+    """Return the installed distribution version, falling back to pyproject.
+
+    The editable-install metadata can lag behind ``pyproject.toml`` (pip cached
+    an older build), so the literal is the last resort, not the source of truth.
+    """
+    try:
+        from importlib.metadata import version
+
+        return version("codevanta")
+    except Exception:  # pragma: no cover - metadata is optional at runtime
+        return "0.5.0"
+
+
+#: Reported to MCP clients in the initialize handshake.
+SERVER_VERSION = _installed_version()
 
 #: Transports the pinned ``mcp`` SDK can serve. ``MCPServer.run`` declares
 #: ``Literal["stdio", "sse", "streamable-http"]`` and raises ``ValueError`` for

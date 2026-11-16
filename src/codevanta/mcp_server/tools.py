@@ -647,7 +647,7 @@ def strings(path: str, min_length: int = 4, limit: int = 200) -> dict[str, Any]:
 
 def disasm(
     path: str,
-    address: int | None = None,
+    address: int | str | None = None,
     function: str | None = None,
     count: int = 50,
 ) -> dict[str, Any]:
@@ -656,6 +656,8 @@ def disasm(
         raise AnalysisError(f"count must be between 1 and {MAX_DISASSEMBLY_COUNT}")
     target = _validate_path(path)
     info = load_binary(target)
+    if address is not None:
+        address = _check_address(address)
     start = resolve_target(info, address, function)
     result = disassemble_region(target, info, start, count=count)
     return {
@@ -734,7 +736,7 @@ def xrefs(
 
 def cfg(
     path: str,
-    address: int | None = None,
+    address: int | str | None = None,
     function: str | None = None,
     max_instructions: int = 2000,
     max_blocks: int = 500,
@@ -748,6 +750,8 @@ def cfg(
         raise AnalysisError(f"max_blocks must be between 1 and {MAX_DISASSEMBLY_COUNT}")
     target = _validate_path(path)
     info = load_binary(target)
+    if address is not None:
+        address = _check_address(address)
     start = resolve_target(info, address, function)
     graph = build_cfg(
         target,
@@ -996,23 +1000,61 @@ def _check_threshold(name: str, value: float) -> float:
     return number
 
 
-def _check_address(address: int) -> int:
-    """Return ``address`` when it is a non-negative plain integer, else raise.
+def _check_address(address: int | str) -> int:
+    """Return ``address`` as an int when it is a non-negative address, else raise.
+
+    MCP clients normally send JSON integers, but a virtual address is often
+    written by hand as ``"0x140001000"``. Both forms are accepted, so the same
+    value reaches the analysis layer either way.
 
     Args:
-        address: Virtual address supplied by the caller.
+        address: Virtual address supplied by the caller, as an ``int`` or as
+            text (``0x``-prefixed hexadecimal, case-insensitive, or decimal).
 
     Returns:
-        ``address`` unchanged.
+        ``address`` as a non-negative ``int``.
 
     Raises:
-        AnalysisError: If ``address`` is not a non-boolean ``int`` or is negative.
+        AnalysisError: If ``address`` is a boolean, another non-integer type,
+            negative, or text that is neither ``0x`` hexadecimal nor decimal.
     """
-    if isinstance(address, bool) or not isinstance(address, int):
-        raise AnalysisError(f"address must be an integer, got {address!r}")
-    if address < 0:
-        raise AnalysisError(f"address must be non-negative, got {address}")
-    return address
+    return _coerce_address("address", address)
+
+
+def _coerce_address(name: str, address: int | str) -> int:
+    """Parse ``address`` for the argument named ``name`` into a non-negative int.
+
+    Args:
+        name: Argument name used in the error message.
+        address: Address as an ``int`` or as ``0x``-prefixed hex/decimal text.
+
+    Returns:
+        The address as a non-negative ``int``.
+
+    Raises:
+        AnalysisError: If ``address`` is a boolean, another non-integer type,
+            negative, or text that is neither ``0x`` hexadecimal nor decimal.
+    """
+    if isinstance(address, bool):
+        raise AnalysisError(f"{name} must be an integer, got {address!r}")
+    if isinstance(address, int):
+        if address < 0:
+            raise AnalysisError(f"{name} must be non-negative, got {address}")
+        return address
+    if isinstance(address, str):
+        text = address.strip()
+        if text.startswith("-"):
+            raise AnalysisError(f"{name} must be non-negative, got {address!r}")
+        try:
+            value = int(text, 16) if text.lower().startswith("0x") else int(text, 10)
+        except ValueError:
+            raise AnalysisError(
+                f"{name} must be an integer or a '0x'-prefixed hex string, got {address!r}"
+            ) from None
+        if value < 0:
+            raise AnalysisError(f"{name} must be non-negative, got {address!r}")
+        return value
+    raise AnalysisError(f"{name} must be an integer, got {address!r}")
 
 
 def diff(
@@ -1203,25 +1245,23 @@ def function_hash(
     return fingerprint.to_dict()
 
 
-def _check_side_address(side: str, address: int) -> int:
-    """Return ``address`` when it is a non-negative plain integer, else raise.
+def _check_side_address(side: str, address: int | str) -> int:
+    """Return ``address`` as a non-negative int, else raise.
 
     Args:
         side: Argument name (``address_a`` or ``address_b``) used in the error
             message, so a two-address tool names the offending side.
-        address: Virtual address supplied by the caller.
+        address: Virtual address supplied by the caller, as an ``int`` or as
+            text (``0x``-prefixed hexadecimal, case-insensitive, or decimal).
 
     Returns:
-        ``address`` unchanged.
+        ``address`` as a non-negative ``int``.
 
     Raises:
-        AnalysisError: If ``address`` is not a non-boolean ``int`` or is negative.
+        AnalysisError: If ``address`` is a boolean, another non-integer type,
+            negative, or text that is neither ``0x`` hexadecimal nor decimal.
     """
-    if isinstance(address, bool) or not isinstance(address, int):
-        raise AnalysisError(f"{side} must be an integer, got {address!r}")
-    if address < 0:
-        raise AnalysisError(f"{side} must be non-negative, got {address}")
-    return address
+    return _coerce_address(side, address)
 
 
 def similarity(
