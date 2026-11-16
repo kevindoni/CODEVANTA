@@ -3787,6 +3787,16 @@ def setup(
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Show the plan only")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Apply without confirmation")] = False,
     verify: Annotated[bool, typer.Option("--verify", help="Verify after applying")] = False,
+    gateway: Annotated[
+        bool,
+        typer.Option(
+            "--gateway",
+            help=(
+                "Register the token-efficient meta-tool server "
+                "(codevanta mcp serve --gateway) instead of the flat tool list"
+            ),
+        ),
+    ] = False,
     list_clients: Annotated[
         bool, typer.Option("--list", help="Show configuration status for every client and exit")
     ] = False,
@@ -3805,7 +3815,7 @@ def setup(
         console.print("[yellow]no coding agents detected[/]; pass --client claude|cursor|cline|vscode")
         raise typer.Exit(code=3)
     try:
-        plans = [adapter.plan(ctx, scope) for adapter in adapters]
+        plans = [adapter.plan(ctx, scope, gateway=gateway) for adapter in adapters]
     except SetupError as exc:
         console.print(f"[bold red]error:[/] {exc}")
         raise typer.Exit(code=2) from exc
@@ -3824,7 +3834,9 @@ def setup(
     else:
         console.print("[green]already configured[/]")
     if verify:
-        results = [verify_entry(adapter, ctx, scope) for adapter in adapters]
+        results = [
+            verify_entry(adapter, ctx, scope, gateway=gateway) for adapter in adapters
+        ]
         results.append(verify_tools())
         for result in results:
             marker = "[green]ok[/]" if result["ok"] else "[red]fail[/]"

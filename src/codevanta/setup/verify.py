@@ -11,7 +11,9 @@ from typing import Any
 from .clients import SERVER_KEY, ClientAdapter, SetupContext
 
 
-def verify_entry(adapter: ClientAdapter, ctx: SetupContext, scope: str) -> dict[str, Any]:
+def verify_entry(
+    adapter: ClientAdapter, ctx: SetupContext, scope: str, gateway: bool = False
+) -> dict[str, Any]:
     """Confirm that the client configuration contains the expected entry."""
     path = adapter.config_path(ctx, scope)
     if not path.exists():
@@ -22,7 +24,7 @@ def verify_entry(adapter: ClientAdapter, ctx: SetupContext, scope: str) -> dict[
         return {"ok": False, "path": str(path), "detail": f"invalid JSON: {exc.msg}"}
     servers = data.get(adapter.container_key) or {}
     entry = servers.get(SERVER_KEY) if isinstance(servers, dict) else None
-    ok = entry == adapter.build_entry()
+    ok = entry == adapter.build_entry(gateway=gateway)
     detail = "entry present" if ok else "entry missing or different"
     return {"ok": ok, "path": str(path), "detail": detail}
 

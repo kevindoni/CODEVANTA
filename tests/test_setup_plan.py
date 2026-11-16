@@ -52,6 +52,30 @@ def test_plan_is_idempotent(tmp_path: Path) -> None:
     assert second.changes[0].action == "noop"
 
 
+def test_gateway_plan_registers_the_meta_tool_server(tmp_path: Path) -> None:
+    ctx = _context(tmp_path)
+    apply_plan(CursorClient().plan(ctx, "user", gateway=True))
+    data = json.loads((ctx.home / ".cursor" / "mcp.json").read_text(encoding="utf-8"))
+    assert data["mcpServers"]["codevanta"]["args"] == ["mcp", "serve", "--gateway"]
+    # The gateway plan is idempotent on its own shape...
+    assert CursorClient().plan(ctx, "user", gateway=True).has_changes is False
+    # ...and switching modes is a replace, not a duplicate key.
+    flat = CursorClient().plan(ctx, "user")
+    assert flat.has_changes
+    apply_plan(flat)
+    data = json.loads((ctx.home / ".cursor" / "mcp.json").read_text(encoding="utf-8"))
+    assert data["mcpServers"]["codevanta"]["args"] == ["mcp", "serve"]
+
+
+def test_gateway_entry_reaches_every_adapter(tmp_path: Path) -> None:
+    adapters = [ClaudeCodeClient(), CursorClient(), ClineClient(), VsCodeClient()]
+    for adapter in adapters:
+        entry = adapter.build_entry(gateway=True)
+        assert entry["args"] == ["mcp", "serve", "--gateway"], adapter.name
+        assert entry["command"] == "codevanta", adapter.name
+        assert adapter.build_entry()["args"] == ["mcp", "serve"], adapter.name
+
+
 def test_plan_preserves_other_servers(tmp_path: Path) -> None:
     ctx = _context(tmp_path)
     path = ctx.home / ".cursor" / "mcp.json"

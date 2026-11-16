@@ -21,6 +21,15 @@ SERVER_COMMAND = "codevanta"
 SERVER_ARGS = ("mcp", "serve")
 
 
+def server_args(gateway: bool = False) -> tuple[str, ...]:
+    """Return the argv that launches the CODEVANTA MCP server.
+
+    ``gateway=True`` selects the token-efficient meta-tool server instead of
+    the flat tool list; the flag mirrors ``codevanta mcp serve --gateway``.
+    """
+    return (*SERVER_ARGS, "--gateway") if gateway else SERVER_ARGS
+
+
 @dataclass(frozen=True)
 class SetupContext:
     """Filesystem roots used to locate client configuration files."""
@@ -73,16 +82,18 @@ class ClientAdapter(ABC):
         """Return the configuration file for ``scope``."""
 
     @abstractmethod
-    def build_entry(self) -> dict[str, Any]:
+    def build_entry(self, gateway: bool = False) -> dict[str, Any]:
         """Return the MCP server entry for this client."""
 
-    def plan(self, ctx: SetupContext, scope: str) -> SetupPlan:
-        return self._plan(ctx, scope, remove=False)
+    def plan(self, ctx: SetupContext, scope: str, gateway: bool = False) -> SetupPlan:
+        return self._plan(ctx, scope, remove=False, gateway=gateway)
 
     def removal_plan(self, ctx: SetupContext, scope: str) -> SetupPlan:
         return self._plan(ctx, scope, remove=True)
 
-    def _plan(self, ctx: SetupContext, scope: str, remove: bool) -> SetupPlan:
+    def _plan(
+        self, ctx: SetupContext, scope: str, remove: bool, gateway: bool = False
+    ) -> SetupPlan:
         if scope not in ("user", "project"):
             raise SetupError(f"unknown scope {scope!r}; use 'user' or 'project'")
         if scope == "user" and not self.supports_user_scope:
@@ -113,7 +124,7 @@ class ClientAdapter(ABC):
             else:
                 notes.append("CODEVANTA is not registered here")
         else:
-            desired = self.build_entry()
+            desired = self.build_entry(gateway=gateway)
             if servers.get(SERVER_KEY) == desired:
                 notes.append("already configured")
             else:
@@ -149,8 +160,8 @@ class ClaudeCodeClient(ClientAdapter):
             return ctx.home / ".claude.json"
         return ctx.project_dir / ".mcp.json"
 
-    def build_entry(self) -> dict[str, Any]:
-        return {"command": SERVER_COMMAND, "args": list(SERVER_ARGS)}
+    def build_entry(self, gateway: bool = False) -> dict[str, Any]:
+        return {"command": SERVER_COMMAND, "args": list(server_args(gateway))}
 
 
 class CursorClient(ClientAdapter):
@@ -165,8 +176,8 @@ class CursorClient(ClientAdapter):
             return ctx.home / ".cursor" / "mcp.json"
         return ctx.project_dir / ".cursor" / "mcp.json"
 
-    def build_entry(self) -> dict[str, Any]:
-        return {"command": SERVER_COMMAND, "args": list(SERVER_ARGS)}
+    def build_entry(self, gateway: bool = False) -> dict[str, Any]:
+        return {"command": SERVER_COMMAND, "args": list(server_args(gateway))}
 
 
 class ClineClient(ClientAdapter):
@@ -190,10 +201,10 @@ class ClineClient(ClientAdapter):
             / "cline_mcp_settings.json"
         )
 
-    def build_entry(self) -> dict[str, Any]:
+    def build_entry(self, gateway: bool = False) -> dict[str, Any]:
         return {
             "command": SERVER_COMMAND,
-            "args": list(SERVER_ARGS),
+            "args": list(server_args(gateway)),
             "disabled": False,
             "autoApprove": [],
         }
@@ -212,8 +223,8 @@ class VsCodeClient(ClientAdapter):
             raise SetupError("VS Code support writes project-scope .vscode/mcp.json only")
         return ctx.project_dir / ".vscode" / "mcp.json"
 
-    def build_entry(self) -> dict[str, Any]:
-        return {"type": "stdio", "command": SERVER_COMMAND, "args": list(SERVER_ARGS)}
+    def build_entry(self, gateway: bool = False) -> dict[str, Any]:
+        return {"type": "stdio", "command": SERVER_COMMAND, "args": list(server_args(gateway))}
 
 
 CLIENTS: dict[str, type[ClientAdapter]] = {
@@ -267,6 +278,10 @@ def describe_clients(ctx: SetupContext) -> list[dict[str, Any]]:
                     servers = data.get(adapter.container_key) if isinstance(data, dict) else None
                     if isinstance(servers, dict) and servers.get(SERVER_KEY) == adapter.build_entry():
                         status = "registered"
+                    elif isinstance(servers, dict) and servers.get(SERVER_KEY) == adapter.build_entry(
+                        gateway=True
+                    ):
+                        status = "registered (gateway)"
                     elif isinstance(servers, dict) and SERVER_KEY in servers:
                         status = "different entry"
                     else:
