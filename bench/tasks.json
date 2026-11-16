@@ -1,7 +1,7 @@
 {
   "format": "codevanta-bench-tasks",
   "version": 1,
-  "description": "Twelve questions across three committed samples and four evidence types.",
+  "description": "Sixteen questions across three committed samples: four static evidence types plus an offline runtime lane (emulation, symbolic paths, trace replay).",
   "sample_dir": "samples",
   "tasks": [
     {
@@ -141,6 +141,52 @@
         "address": 4294967680
       },
       "required_keys": ["text", "backend", "language"]
+    },
+    {
+      "id": "pe64-emulate",
+      "sample": "pe64_text.bin",
+      "question": "What does the PE64 entry function return when emulated offline on a private CPU?",
+      "tool": "codevanta_emulate",
+      "args": {
+        "path": "{sample_dir}/pe64_text.bin",
+        "address": 5368713216
+      },
+      "required_keys": ["stopped_reason", "return_value", "instructions", "emulator"]
+    },
+    {
+      "id": "pe64-symbolic",
+      "sample": "pe64_text.bin",
+      "question": "Which paths through the PE64 entry function can a bounded symbolic exploration enumerate?",
+      "tool": "symbolic",
+      "args": {
+        "path": "{sample_dir}/pe64_text.bin",
+        "address": 5368713216,
+        "max_paths": 8
+      },
+      "required_keys": ["paths", "entries", "explorer", "complete"]
+    },
+    {
+      "id": "elf64-trace",
+      "sample": "elf64_text.bin",
+      "question": "Which functions does the recorded gdb trace of the ELF64 sample actually hit?",
+      "tool": "trace",
+      "args": {
+        "path": "{sample_dir}/elf64_text.bin",
+        "trace_path": "{sample_dir}/gdb_trace.log"
+      },
+      "required_keys": ["total_hits", "unique_addresses", "provider", "hits"]
+    },
+    {
+      "id": "elf64-frida-trace",
+      "sample": "elf64_text.bin",
+      "question": "Do the Frida-recorded hits for the ELF64 sample map onto recovered functions?",
+      "tool": "trace",
+      "args": {
+        "path": "{sample_dir}/elf64_text.bin",
+        "trace_path": "{sample_dir}/frida_trace.jsonl",
+        "provider": "frida"
+      },
+      "required_keys": ["total_hits", "unique_addresses", "provider", "hits"]
     }
   ]
 }

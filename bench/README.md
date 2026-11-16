@@ -5,10 +5,13 @@ costs to answer a question about a committed sample, and what it returns. It run
 in-process through `codevanta.mcp_server.tools` (no server, no subprocess, no
 model), so the numbers cover tool execution only.
 
-## The 12 tasks
+## The 16 tasks
 
-Three samples x four evidence types. `bench/tasks.json` holds the definitions;
-`{sample_dir}` is replaced with the sample directory at run time.
+Three samples x four evidence types, plus an offline runtime lane. 
+`bench/tasks.json` holds the definitions; `{sample_dir}` is replaced with the
+sample directory at run time.
+
+### Static lane (12)
 
 | Sample | Info | Functions | Relationships | Decompile |
 | --- | --- | --- | --- | --- |
@@ -16,7 +19,21 @@ Three samples x four evidence types. `bench/tasks.json` holds the definitions;
 | `elf64_text.bin` (ELF64 x86_64) | `elf64-info` | `elf64-functions` | `elf64-cfg` | `elf64-decompile` |
 | `macho64_text.bin` (Mach-O x86_64) | `macho64-info` | `macho64-functions` | `macho64-xrefs` | `macho64-decompile` |
 
-Each binary gets the same four questions:
+### Runtime lane (4, offline and deterministic)
+
+| Task | Tool | Question |
+| --- | --- | --- |
+| `pe64-emulate` | `codevanta_emulate` | What does the entry function return on a private emulated CPU? |
+| `pe64-symbolic` | `symbolic` | Which paths does a bounded symbolic exploration enumerate? |
+| `elf64-trace` | `trace` | Which functions does the committed gdb log actually hit? |
+| `elf64-frida-trace` | `trace` | Do the Frida-recorded hits map onto recovered functions? |
+
+The runtime lane replays recorded traces or runs on a private emulator; no
+process is launched, which is why the four tasks stay deterministic and
+hash-stable like the static ones. No REA mapping is claimed for this lane
+yet -- fill the column when a comparable offline engine is measured there.
+
+The static lane asks each binary the same four questions:
 
 1. **Metadata** (`binary_info`) - format, architecture, entry point, sections,
    hashes. Required keys: `format`, `architecture`, `entry_point`, `sha256`,

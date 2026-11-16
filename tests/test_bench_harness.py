@@ -24,8 +24,8 @@ harness = _load_harness()
 
 def test_benchmark_definition_has_twelve_tasks() -> None:
     tasks = harness.load_tasks(TASKS_FILE)
-    assert len(tasks) == 12
-    assert len({task["id"] for task in tasks}) == 12
+    assert len(tasks) == 16
+    assert len({task["id"] for task in tasks}) == 16
 
 
 def test_cheap_pe64_tasks_succeed_and_estimate_tokens() -> None:
