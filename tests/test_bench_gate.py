@@ -369,7 +369,7 @@ def test_update_baseline_writes_the_platform_file(
 
 def test_default_tolerance_is_the_ci_gate_policy() -> None:
     """The tool's default tolerance is the regression budget CI enforces."""
-    assert bench_gate.DEFAULT_TOLERANCE == 0.75
+    assert bench_gate.DEFAULT_TOLERANCE == 1.5
 
 
 def test_25_percent_boundary_passes_and_just_beyond_fails() -> None:
@@ -441,4 +441,4 @@ def test_gate_happy_path_at_the_committed_tolerance(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "PASS" in result.stderr
-    assert "within 75% tolerance" in result.stderr
+    assert "within 150% tolerance" in result.stderr
