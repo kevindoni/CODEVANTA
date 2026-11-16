@@ -276,6 +276,7 @@ from codevanta.mcp_server.ext_livesession import (
 from codevanta.mcp_server.ext_livesession import (
     codevanta_debug_status as codevanta_debug_status,  # noqa: F401
 )
+from codevanta.mcp_server.ext_machosym import codevanta_macho_symbols as codevanta_macho_symbols  # noqa: F401 -- lane-machosym
 from codevanta.mcp_server.ext_meta import (
     codevanta_metadata as codevanta_metadata,  # lane-meta: ONE MCP registration line
 )

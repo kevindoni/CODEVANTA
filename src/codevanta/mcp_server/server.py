@@ -46,6 +46,7 @@ from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_START as FRIDA_START_DESCRI
 from .ext_fridasession import TOOL_DESCRIPTION_FRIDA_STATUS as FRIDA_STATUS_DESCRIPTION
 from .ext_fs import TOOL_DESCRIPTION_FS_DIFF as FS_DIFF_DESCRIPTION
 from .ext_fs import TOOL_DESCRIPTION_FS_SNAPSHOT as FS_SNAPSHOT_DESCRIPTION
+from .ext_machosym import TOOL_DESCRIPTION_MACHO_SYMBOLS as MACHO_SYMBOLS_DESCRIPTION
 from .ext_netcapture import TOOL_DESCRIPTION_NET_CAPTURE as NET_CAPTURE_DESCRIPTION
 from .ext_netcapture import TOOL_DESCRIPTION_NET_INTERFACES as NET_INTERFACES_DESCRIPTION
 from .ext_rich import TOOL_DESCRIPTION_RICH as RICH_DESCRIPTION
@@ -2272,6 +2273,14 @@ def build_server() -> MCPServer:
     def codevanta_delayload(path: str) -> dict:
         try:
             return tools.codevanta_delayload(path)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    # lane-machosym: read-only LC_SYMTAB nlist_64 symbol table decoder.
+    @server.tool(description=MACHO_SYMBOLS_DESCRIPTION)
+    def codevanta_macho_symbols(path: str) -> dict:
+        try:
+            return tools.codevanta_macho_symbols(path)
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
