@@ -8,6 +8,12 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+### Changed
+
+## [0.6.0] - 2026-11-16
+
+### Added
+
 - **Persistent Ghidra program session**: the ghidra backend imports and
   auto-analyses a binary once per process and reuses the open program for
   later calls on the same bytes (keyed by resolved path, mtime and size), so
