@@ -54,6 +54,17 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Changed
 
+- The Ghidra backend drives the public Ghidra Java APIs
+  (``GhidraProject`` + ``FlatProgramAPI``) instead of the deprecated
+  ``pyghidra.open_program`` wrapper, and the analysis cache now crosses
+  processes: the project name embeds the file's size and mtime, so a later
+  CLI run on an unchanged binary reopens the analysed program instead of
+  importing again (the deprecated wrapper remains a silenced fallback for
+  older installations).
+- The angr symbolic bridge decodes registers on angr 10: bitvector values go
+  through ``state.solver.eval`` (the ``int()`` shortcut is kept for older
+  builds), and a symbolic register is reported as absent instead of guessed.
+
 ## [0.5.0] - 2026-11-16
 
 ### Added
