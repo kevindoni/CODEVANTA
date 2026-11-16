@@ -529,3 +529,108 @@ def test_ghidra_survives_addresses_above_31_bits() -> None:
     assert result.backend == "ghidra", result.warnings
     assert result.text.strip()
     assert "{" in result.text
+
+
+def test_program_session_reuses_one_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two calls on the same bytes import the program once (fake opener)."""
+    import codevanta.analysis.decompilers.ghidra_backend as gh
+
+    monkeypatch.delenv(gh.SESSION_ENV, raising=False)
+    sample = tmp_path / "a.bin"
+    sample.write_bytes(b"x")
+    opens: list[str] = []
+    api = object()
+
+    class _Ctx:
+        def __enter__(self) -> object:
+            return api
+
+        def __exit__(self, *args: object) -> bool:
+            return False
+
+    def opener(path: str, **kwargs: object) -> _Ctx:
+        opens.append(path)
+        return _Ctx()
+
+    gh.reset_program_session()
+    try:
+        first = gh._acquire_program(opener, sample)
+        first.close()
+        second = gh._acquire_program(opener, sample)
+        second.close()
+        assert len(opens) == 1
+        assert first.reused is False
+        assert second.reused is True
+        assert first.flat_api is second.flat_api
+
+        sample.write_bytes(b"changed")
+        third = gh._acquire_program(opener, sample)
+        third.close()
+        assert third.reused is False
+        assert len(opens) == 2
+    finally:
+        gh.reset_program_session()
+
+
+def test_program_session_kill_switch_opens_privately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``CODEVANTA_GHIDRA_SESSION=0`` restores one private program per call."""
+    import codevanta.analysis.decompilers.ghidra_backend as gh
+
+    monkeypatch.setenv(gh.SESSION_ENV, "0")
+    sample = tmp_path / "b.bin"
+    sample.write_bytes(b"y")
+    opens = []
+    exits: list[bool] = []
+
+    class _Ctx:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *args: object) -> bool:
+            exits.append(True)
+            return False
+
+    def opener(path: str, **kwargs: object) -> _Ctx:
+        opens.append(path)
+        return _Ctx()
+
+    gh.reset_program_session()
+    try:
+        for _ in range(2):
+            session = gh._acquire_program(opener, sample)
+            session.close()
+        assert len(opens) == 2
+        assert len(exits) == 2
+    finally:
+        gh.reset_program_session()
+
+
+def test_ghidra_session_survives_across_real_decompiles() -> None:
+    """A real second decompile reuses the imported program (JVM guarded)."""
+    pytest.importorskip("pyghidra", reason="pyghidra is not installed")
+    if not GHIDRA_AVAILABLE:
+        pytest.skip("GHIDRA_INSTALL_DIR does not point at a Ghidra installation")
+
+    import codevanta.analysis.decompilers.ghidra_backend as gh
+
+    sample = Path(__file__).resolve().parents[1] / "samples" / "pe64_text.bin"
+    gh.reset_program_session()
+    try:
+        opens_before = gh.session_opens
+        first = decompile_function(
+            sample, BinaryLoader().load(sample), 0x140001000, backend="ghidra"
+        )
+        second = decompile_function(
+            sample, BinaryLoader().load(sample), 0x14000101F, backend="ghidra"
+        )
+        assert first.evidence.extra["program_cached"] is False
+        assert second.evidence.extra["program_cached"] is True
+        # Exactly one import served both calls in this process.
+        assert gh.session_opens == opens_before + 1
+        assert first.backend == second.backend == "ghidra"
+    finally:
+        gh.reset_program_session()

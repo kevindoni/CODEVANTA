@@ -23,11 +23,14 @@ reported as a warning. Both budgets travel into the evidence record.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import importlib.metadata
 import importlib.util
 import os
 import tempfile
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +52,15 @@ from .base import (
     require_budget,
 )
 
-__all__ = ["GhidraBackend", "INSTALL_ENV", "INSTALL_HINT", "NAME", "PROJECTS_DIR_ENV"]
+__all__ = [
+    "GhidraBackend",
+    "INSTALL_ENV",
+    "INSTALL_HINT",
+    "NAME",
+    "PROJECTS_DIR_ENV",
+    "SESSION_ENV",
+    "reset_program_session",
+]
 
 #: Backend identifier.
 NAME = "ghidra"
@@ -107,6 +118,187 @@ def _project_location() -> Path:
             f"set {PROJECTS_DIR_ENV} to a writable path"
         ) from exc
     return location
+
+
+# ---------------------------------------------------------------------------
+# Persistent program session
+# ---------------------------------------------------------------------------
+
+#: Environment kill switch: set ``CODEVANTA_GHIDRA_SESSION=0`` to give every
+#: decompile call its own private import-and-analyse cycle again (the old
+#: behaviour). The session exists because importing and auto-analysing a
+#: binary dominates the cost of a decompile by orders of magnitude, while a
+#: long-running MCP server, GUI or benchmark process asks many questions
+#: about the same file.
+SESSION_ENV = "CODEVANTA_GHIDRA_SESSION"
+
+#: One Java program is shared across calls; JPype is safest when exactly one
+#: thread drives the decompiler at a time, so the session lock also serializes
+#: the decompile calls themselves.
+_SESSION_LOCK = threading.RLock()
+
+
+@dataclass(frozen=True)
+class _OpenProgram:
+    """A program that pyghidra has imported and analysed."""
+
+    key: tuple[str, int, int] | None
+    context: Any
+    flat_api: Any
+
+
+_session_program: _OpenProgram | None = None
+
+#: How many times a program was imported in this process. Exposed for tests
+#: and evidence: a session that works shows one open however many calls run.
+session_opens = 0
+
+
+class ProgramSession:
+    """Handle for one decompile call over a possibly shared program.
+
+    ``close`` releases the program only when this call owns it (the session is
+    disabled or the open failed to register); a shared program stays open for
+    the next call in the same process.
+    """
+
+    __slots__ = ("flat_api", "reused", "_own_context")
+
+    def __init__(
+        self,
+        flat_api: Any,
+        *,
+        reused: bool,
+        own_context: Any | None,
+    ) -> None:
+        self.flat_api = flat_api
+        self.reused = reused
+        self._own_context = own_context
+
+    def close(self) -> None:
+        """Release the program unless the session owns it."""
+        if self._own_context is None:
+            return
+        with contextlib.suppress(Exception):
+            self._own_context.__exit__(None, None, None)
+
+
+def _session_key(path: str | Path) -> tuple[str, int, int] | None:
+    """Return the identity of ``path`` for session reuse, or ``None``.
+
+    A program may only be reused while the file on disk is byte-for-byte the
+    one that was imported, so the key is the resolved path plus mtime and size.
+    A file that cannot be stat'ed never matches a cached program.
+    """
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return None
+    return (str(Path(path).resolve()), stat.st_mtime_ns, stat.st_size)
+
+
+def _open_context(opener: Any, path: str | Path) -> Any:
+    """Open a pyghidra program context, tolerating older keyword sets."""
+    try:
+        return opener(
+            str(path),
+            analyze=True,
+            project_location=_project_location(),
+            nested_project_location=False,
+        )
+    except TypeError:
+        # Older pyghidra builds without the project keyword set: fall back
+        # to the plain call rather than lose the backend entirely.
+        return opener(str(path))
+
+
+def _close_open_program(program: _OpenProgram) -> None:
+    """Close a cached program, swallowing shutdown-time failures."""
+    with contextlib.suppress(Exception):
+        program.context.__exit__(None, None, None)
+
+
+def _acquire_program(opener: Any, path: str | Path) -> ProgramSession:
+    """Return a :class:`ProgramSession` for ``path``.
+
+    With the session enabled (default), the imported program is cached under
+    ``_SESSION_LOCK`` and reused for later calls on the same bytes; a changed
+    file closes the old program first. With ``CODEVANTA_GHIDRA_SESSION=0`` the
+    caller gets a private program it must close itself.
+    """
+    global _session_program, session_opens
+    if os.environ.get(SESSION_ENV, "").strip() == "0":
+        context = _open_context(opener, path)
+        return ProgramSession(context.__enter__(), reused=False, own_context=context)
+    with _SESSION_LOCK:
+        key = _session_key(path)
+        if (
+            key is not None
+            and _session_program is not None
+            and _session_program.key == key
+        ):
+            return ProgramSession(_session_program.flat_api, reused=True, own_context=None)
+        if _session_program is not None:
+            _close_open_program(_session_program)
+            _session_program = None
+        context = _open_context(opener, path)
+        flat_api = context.__enter__()
+        session_opens += 1
+        _register_exit_hook()
+        if key is None:
+            # Unstatable file: open fine, but never hand it to a later call.
+            return ProgramSession(flat_api, reused=False, own_context=context)
+        _session_program = _OpenProgram(key=key, context=context, flat_api=flat_api)
+        return ProgramSession(flat_api, reused=False, own_context=None)
+
+
+def reset_program_session() -> None:
+    """Close and forget the cached program (tests, or after an env flip)."""
+    global _session_program
+    with _SESSION_LOCK:
+        if _session_program is not None:
+            _close_open_program(_session_program)
+            _session_program = None
+
+
+#: Seconds an exit hook waits for Ghidra to close the cached program.
+_SHUTDOWN_CLOSE_SECONDS = 5.0
+
+_exit_hook_registered = False
+
+
+def _register_exit_hook() -> None:
+    """Register the session close to run *before* Jpype's own exit hook.
+
+    atexit runs LIFO. pyghidra registers its shutdown handling when the JVM
+    starts (that is, inside the first ``open_program``), so a hook registered
+    at module import would run after it and deadlock against the JVM teardown
+    while the program is still open. Registering here -- right after a program
+    opens -- puts the close first, which is exactly the mid-run close that is
+    known to be safe. The hook itself is idempotent and cheap once closed.
+    """
+    global _exit_hook_registered
+    if _exit_hook_registered:
+        return
+    _exit_hook_registered = True
+    atexit.register(_shutdown_session)
+
+
+def _shutdown_session() -> None:  # pragma: no cover - interpreter exit hook
+    """Close the cached program before the JVM teardown, within a deadline.
+
+    If Ghidra does not flush the project in time the daemon thread (and only
+    the thread) is abandoned; the worst case is a stale project directory
+    under the system temp root rather than a hanging process.
+    """
+    if _session_program is None:
+        return
+
+    closer = threading.Thread(
+        target=reset_program_session, name="codevanta-ghidra-close", daemon=True
+    )
+    closer.start()
+    closer.join(timeout=_SHUTDOWN_CLOSE_SECONDS)
 
 
 def _unavailable(availability: BackendAvailability) -> AnalysisError:
@@ -236,27 +428,20 @@ class GhidraBackend:
             )
         timeout = _timeout_seconds(instruction_budget)
         _ensure_started(pyghidra)
+        session = _acquire_program(opener, path)
         try:
-            program_context = opener(
-                str(path),
-                analyze=True,
-                project_location=_project_location(),
-                nested_project_location=False,
-            )
-        except TypeError:
-            # Older pyghidra builds without the project keyword set: fall back
-            # to the plain call rather than lose the backend entirely.
-            program_context = opener(str(path))
-
-        try:
-            with program_context as flat_api:
-                text, block_count = _decompile_in_program(flat_api, address, timeout)
+            # One DecompInterface at a time on a shared program: the session
+            # lock also serializes concurrent callers (GUI threads, MCP).
+            with _SESSION_LOCK:
+                text, block_count = _decompile_in_program(session.flat_api, address, timeout)
         except AnalysisError:
             raise
         except Exception as exc:  # JPype surfaces Java failures as generic errors
             raise AnalysisError(
                 f"ghidra could not decompile 0x{address:x}: {type(exc).__name__}: {exc}"
             ) from exc
+        finally:
+            session.close()
 
         warnings: list[str] = []
         if not text.strip():
@@ -280,7 +465,9 @@ class GhidraBackend:
                 f"ghidra decompiled the function at 0x{address:x} ({block_count} block(s)) "
                 f"headlessly through pyghidra with a {timeout}s timeout projected from "
                 f"max_instructions={instruction_budget}; Ghidra has no instruction or block "
-                f"budget, so max_blocks={block_budget} is checked afterwards only"
+                f"budget, so max_blocks={block_budget} is checked afterwards only; the "
+                f"program was {'reused from' if session.reused else 'imported for'} this "
+                "call by the persistent session"
             ),
             extra={
                 "backend": self.name,
@@ -289,6 +476,7 @@ class GhidraBackend:
                 "max_instructions": instruction_budget,
                 "max_blocks": block_budget,
                 "block_count": block_count,
+                "program_cached": session.reused,
             },
         )
         return BackendResult(
