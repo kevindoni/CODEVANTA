@@ -338,7 +338,7 @@ codevanta plugins run     metrics samples\elf64_text.bin
 # JavaScript / Electron applications (static, offline, no Node required)
 codevanta js analyze      path\to\app           # directory or .asar archive
 codevanta js analyze      app.asar --json       # modules, imports, IPC boundaries
-codevanta js audit        path\to\app           # security anti-patterns (EA-001..EA-042)
+codevanta js audit        path\to\app           # 11 rules (EA-001..EA-005, EA-010, EA-011, EA-020, EA-031, EA-040, EA-042)
 codevanta sbom            path\to\app samples\pe64_text.bin -o sbom.json   # CycloneDX 1.6
 codevanta capabilities    samples\pe64_text.bin # capa-style rule matching
 codevanta stackstrings    samples\pe64_text.bin # FLOSS-style stack-built strings
@@ -348,6 +348,14 @@ codevanta yara            file.bin --rules rules.yar                   # YARA su
 codevanta replay-fixture  capture.har -o fixture.json                  # replay environment
 codevanta pdb             app.pdb               # MSF walk or PE CodeView ref
 ```
+
+`codevanta js audit` implements 11 Electron security rules: EA-001–EA-005
+(unsafe `webPreferences` flags), EA-010 (no Content-Security-Policy), EA-011
+(`script-src` allows `unsafe-eval`/`unsafe-inline`), EA-020 (`child_process`
+with a non-literal command), EA-031 (caller-chosen IPC channel through
+`contextBridge`), EA-040 (non-literal `shell.openExternal` target) and EA-042
+(remote URL loaded from the main process). See
+[docs/electron-audit.md](docs/electron-audit.md) for the full rule table.
 
 `diff --semantic` prints one dim
 `semantic pair 0x401000 -> 0x401010 (<name>): similarity 1.0000` line per pair
@@ -499,6 +507,7 @@ codevanta setup --client vscode --scope project --project .
 codevanta uninstall --client cursor
 codevanta mcp serve                              # run the server over stdio
 codevanta mcp serve --transport sse --port 8000  # HTTP transports are opt-in
+codevanta mcp serve --gateway                    # five meta-tools, ~0.8k schema tokens
 ```
 
 Supported clients: `claude` (Claude Code), `cursor`, `cline` (VS Code
@@ -508,20 +517,30 @@ Safety model: every run prints the exact file changes and a diff first; nothing
 is written without `--yes` (or an interactive confirmation); existing configs
 are backed up as `*.codevanta.bak`; re-running the same command is a no-op.
 
-MCP tools: `codevanta_info`, `codevanta_functions`,
-`codevanta_strings`, `codevanta_disasm`, `codevanta_analyze`,
-`codevanta_xrefs`, `codevanta_cfg`, `codevanta_callgraph`, `codevanta_diff`,
-`codevanta_jump_table`, `codevanta_function_hash`, `codevanta_similarity`,
-`codevanta_struct`, `codevanta_entropy`, `codevanta_decompile`,
-`codevanta_dwarf`, `codevanta_vtable`, `codevanta_trace`,
-`codevanta_symbolic`, `codevanta_dataflow`, `codevanta_javascript`,
-`codevanta_electron_audit`, `codevanta_sbom`, `codevanta_capabilities`,
-`codevanta_stackstrings`, `codevanta_gosymbols`, `codevanta_yara`,
-`codevanta_triage`, `codevanta_replay_fixture`, `codevanta_pdb`,
-`codevanta_session_save`, `codevanta_session_list`.
-`codevanta_analyze` mirrors
-the CLI flags (`include_xrefs` / `include_cfg` / `include_callgraph`, default off)
-so a single call can carry the phase 2 sections when an agent prefers one payload.
+### Token-efficient gateway
+
+Loading every tool schema at connect time costs the client roughly 26k input
+tokens before any analysis runs. `codevanta mcp serve --gateway` publishes the
+same registry through five meta-tools instead (about 0.8k schema tokens):
+
+- `search(query, limit, offset)` — compact tool discovery, no full schemas
+- `schema(tool)` — one compact input schema on demand
+- `call(tool, arguments, max_tokens)` — run a tool; replies over the budget
+  (default 1500 tokens) are stored under `%USERPROFILE%\.codevanta\mcp_results`
+  and replaced by a preview plus a `result_id`
+- `result_read(result_id, offset_tokens, max_tokens, path)` — page a stored reply
+- `result_grep(result_id, pattern, regex, context_lines, max_matches)` — search one
+
+The gateway is loopback-only and never changes what a tool returns; it only
+bounds what enters the conversation. The flat 126-tool server remains the
+default for clients that prefer it.
+
+The server registers **126 MCP tools** across analysis, dynamic/debug,
+platform/mobile, web/JavaScript, firmware, formats, rebuild, and session lanes;
+[docs/mcp-tools.md](docs/mcp-tools.md) is the generated reference with every
+tool's parameters and description. `codevanta_analyze` mirrors the CLI flags
+(`include_xrefs` / `include_cfg` / `include_callgraph`, default off) so a single
+call can carry the phase 2 sections when an agent prefers one payload.
 
 `codevanta_symbolic` (`path`, `address`, `max_paths`, `max_steps`) and
 `codevanta_dataflow` (`path`, `address`, `max_instructions`, `max_blocks`)
