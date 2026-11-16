@@ -8,6 +8,36 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+### Changed
+
+## [0.4.0] - 2026-11-16
+
+### Added
+
+- **Decompiler v2 foundations (increments 1-3)**: a typed SSA IR over the
+  recursive CFG (`codevanta.analysis.ir_ssa`, MCP `codevanta_ssa`) with
+  versioned registers, a FLAGS pseudo-register, Win64/Win32 call argument +
+  volatile-clobber modelling, loop boundaries as honest phi-required markers,
+  optional type hints, arithmetic expression folding (`rax.2 = rax.1 + 0x10`,
+  `xor rcx, rcx` -> `0`, `lea` -> `ptr(...)`, mov-chain collapse) and
+  cmp/jcc condition recovery; then deterministic readable pseudo-C emission
+  (`codevanta.analysis.pseudo_c`, MCP `codevanta_pseudo_c`): `<id> = <expr>;`
+  statements, bounded `if (left == right) { /* taken */ }` lines (signedness
+  deferred to a later increment, the raw cmp text kept), call lines with
+  clipped clobber notes, loop/undef markers, all under MAX_LINES /
+  MAX_LINE_CHARS budgets with honest truncation flags. Read-only, offline;
+  nothing is executed.
+- **Win32 input automation lane** (MCP `codevanta_win_click`,
+  `codevanta_win_type`, `codevanta_win_key`, `codevanta_win_visual_regression`):
+  bounded mouse/keyboard automation plus a pixel-comparison regression check
+  for a target window.
+- **More read-only static-analysis lanes**: Mach-O symbol tables
+  (`codevanta_macho_symbols`), DEX header/string/type/method tables
+  (`codevanta_dex`), Apple bplist00 decoder (`codevanta_bplist`), PE
+  rich-header compiler fingerprint (`codevanta_rich`), PE delay-load
+  directory (`codevanta_delayload`), remote-node auth plumbing
+  (`codevanta_remote_auth`), and real extracted icon embedding in the UI
+  preview (`codevanta_ui_preview` data-URI PNGs).
 - **Capability domain profile lane** (`profile_capabilities`, MCP
   `codevanta_capability_profile`): the second, deliberately coarse detector
   next to the capa-style rule engine - eight fixed domains (network, crypto,
@@ -82,8 +112,13 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Changed
 
-- MCP server registers **73 tools** (from 55 at v0.3.0); the dashboard
+- MCP server registers **126 tools** (from 55 at v0.3.0); the dashboard
   grows to **25 routes** (from 20).
+- **Benchmark gate slack 0.25 -> 2.5**: the microsecond-scale sample
+  benchmarks on shared ubuntu-latest vCPUs measured a systematic ~2.2-2.8x
+  slowdown versus the recording VM across consecutive PRs; the wider default
+  absorbs that machine lottery (the gate still re-measures a failing row
+  once before failing) while still failing real >3.5x algorithmic slowdowns.
 
 ## [0.3.0] - 2026-11-14
 
