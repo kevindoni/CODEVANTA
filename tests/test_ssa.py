@@ -245,7 +245,7 @@ def test_loop_boundary_marks_phi_required(loop: SSAFunction) -> None:
     assert stats["truncated_blocks"] is False
     assert stats["truncated_instructions"] is False
     assert stats["truncated_values"] is False
-    assert any("increment 1 limitation" in warning for warning in fn.warnings)
+    assert any("merge through phi values" in warning for warning in fn.warnings)
 
 
 def test_value_budget_truncates_with_warning(tmp_path: Path) -> None:
@@ -309,7 +309,7 @@ def test_default_budgets_are_the_module_constants(tmp_path: Path) -> None:
     assert DEFAULT_MAX_INSTRUCTIONS == 2_000
     assert isinstance(fn, SSAFunction)
     assert fn.evidence.source == "ir.ssa"
-    assert fn.evidence.method == "cfg-straight-line-ssa"
+    assert fn.evidence.method == "cfg-dominance-ssa"
     assert fn.evidence.confidence.value == "medium"
 
 
@@ -320,7 +320,7 @@ def test_mcp_wrapper_returns_json_payload(tmp_path: Path) -> None:
 
     assert payload["address"] == "0x401000"
     assert payload["evidence"]["source"] == "ir.ssa"
-    assert payload["evidence"]["method"] == "cfg-straight-line-ssa"
+    assert payload["evidence"]["method"] == "cfg-dominance-ssa"
     assert payload["evidence"]["confidence"] == "medium"
     assert payload["block_count"] == len(payload["blocks"])
     assert payload["stats"]["value_count"] == len(payload["values"])
@@ -406,6 +406,49 @@ def test_folded_expr_is_json_safe_and_deterministic(tmp_path: Path) -> None:
     assert "rax.1 + rbx.0" in payload
     second = _ssa(tmp_path / "d2.bin", bytes.fromhex("4889c04801d84889c3"))
     assert json.dumps(second.to_dict()) == payload
+
+
+# ---- increment 6: dominance-ordered rename + phi functions -------------------
+
+#: entry -> jmp cond; body (add eax,1; nops) -> cond (cmp; jl body; ret):
+#: a while-loop whose join/header block sits at a higher address than the
+#: body -- the exact shape the address-ordered walk used to get wrong.
+LOOP_JOIN = bytes.fromhex("b800000000eb0783c0019090909083f8057cf4c3")
+
+
+def test_join_block_gets_phi_merging_reaching_versions(tmp_path: Path) -> None:
+    """The multi-pred join defines phis; loop body and header read through them.
+
+    Renaming in dominator order visits the header before the body, so the
+    header's cmp reads the phi (plus a phi'd FLAGS), and the body's add
+    chains past the phi for the next iteration -- exactly what the
+    address-ordered walk could not express.
+    """
+    fn = _ssa(tmp_path / "join.bin", LOOP_JOIN)
+    body = fn.blocks[1]
+    cond = fn.blocks[2]
+    assert body.loop_boundary is True  # jl jumps back into the body
+    assert [phi.register for phi in cond.phis] == ["FLAGS", "rax"]
+    rax_phi = cond.phis[1]
+    assert rax_phi.id == "rax.2"
+    assert rax_phi.args == ((0, "rax.1"), (1, "rax.3"))
+    flags_phi = cond.phis[0]
+    assert flags_phi.args == ((0, "FLAGS.0"), (1, "FLAGS.3"))
+    cmp_insn = cond.instructions[0]
+    assert cmp_insn.reads == ("rax.2",)  # the join reads the rax phi
+    assert cmp_insn.writes[0] == "FLAGS.2"  # fresh FLAGS past the phi (counter)
+    assert cond.instructions[1].reads == ("FLAGS.2",)  # jl reads the cmp result
+    add = body.instructions[0]
+    assert add.reads == ("rax.2",)  # the body reads the phi too
+    assert add.writes[0] == "rax.3"  # and chains past it for the next iteration
+
+
+def test_single_path_blocks_have_no_phis(tmp_path: Path) -> None:
+    """Chains and self-loops (one distinct predecessor each) define no phis."""
+    fn = _ssa(tmp_path / "nophi.bin", LOOP)
+    assert all(block.phis == () for block in fn.blocks)
+    fn = _ssa(tmp_path / "nophi2.bin", CALL_CLOBBER)
+    assert all(block.phis == () for block in fn.blocks)
 
 
 

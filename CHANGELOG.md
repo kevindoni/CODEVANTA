@@ -8,6 +8,17 @@ All notable changes to CODEVANTA are documented here. The format follows
 
 ### Added
 
+- **Phi functions via dominance-ordered rename (SSA increment 6)**: reachable
+  blocks now rename in dominator-tree pre-order; every multi-predecessor join
+  at a dominance frontier defines `phi` values merging the versions each
+  reachable predecessor reaches (`rax.2 = phi(rax.1 @ block 0, rax.3 @ block
+  1)`), so loop bodies and forward joins read the merged value instead of
+  whatever address order said -- including a phi'd FLAGS for comparisons at
+  loop headers. Unreachable blocks rename linearly from entry state with an
+  honest warning; the SSA payload gains per-block `phis`, and the pseudo-C
+  emitter renders joins as `id = phi(...)` statements. Evidence method
+  renamed `cfg-straight-line-ssa` -> `cfg-dominance-ssa`.
+
 ### Changed
 
 - The pseudo-C emitter's `if` lines now carry the comparison's true C

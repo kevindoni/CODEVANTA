@@ -1,4 +1,4 @@
-"""Typed SSA intermediate representation over the CFG (decompiler v2, increments 1-2).
+"""Typed SSA intermediate representation over the CFG (decompiler v2, increments 1-6).
 
 This module is one *decompiler-v2 foundation* step between the CFG (phase 2)
 and the future pseudo-C lowering: it re-walks the blocks a recursive CFG
@@ -28,14 +28,14 @@ Implemented semantics (increment 1 -- deliberately narrow):
    with fresh ``"clobber"`` versions. Non-volatile registers (``rbx, rbp,
    rdi, rsi, r12-r15``) keep their version across the call. Implicit stack
    pointer updates are not modelled.
-4. **Loop boundaries (honest limit).** When a branch targets a block at or
-   before the current block (a back-edge), the target block is marked
-   ``loop_boundary`` and gets a ``phi_required`` set naming every register
-   locally live-in there. **No phi functions are constructed**: reads inside a
-   loop body still resolve to the single straight-line version and a forward
-   control-flow join reads whatever the walked order says. The loop boundary
-   notes plus the MEDIUM-confidence evidence state exactly where that is
-   unsound; a later increment replaces this with a dominance-ordered walk.
+4. **Dominance-ordered rename with phi functions (increment 6).** Reachable
+   blocks are renamed in dominator-tree pre-order; at every dominance
+   frontier of a multi-predecessor join, phi values merge the versions
+   reaching each predecessor, so loop bodies and forward joins read the
+   merged value instead of whatever the address order said. Branches that
+   target a block at or before the current block still mark the target
+   ``loop_boundary`` with its ``phi_required`` live-in hint. Unreachable
+   blocks are renamed linearly afterwards from entry state, with a warning.
 5. **Types (optional).** A definition's ``type_hint`` uses the vocabulary of
    :mod:`codevanta.analysis.type_propagation`: the written alias's width
    (``mov eax, ...`` -> ``uint32_t``), ``lea`` -> the pointer type, and the
@@ -96,6 +96,7 @@ __all__ = [
     "SSABlock",
     "SSAFunction",
     "SSAInstruction",
+    "SSAPhiValue",
     "SSAValue",
     "abi_name",
     "abi_volatile_registers",
@@ -128,7 +129,7 @@ DEFAULT_MAX_INSTRUCTIONS = 2_000
 FLAGS_REGISTER = "FLAGS"
 
 _SOURCE = "ir.ssa"
-_METHOD = "cfg-straight-line-ssa"
+_METHOD = "cfg-dominance-ssa"
 
 # ---------------------------------------------------------------------------
 # bounded register and mnemonic tables (x86 / x64 only, increment 1)
@@ -383,14 +384,15 @@ def _immediate_value(token: str) -> int | None:
 
 @dataclass(frozen=True)
 class SSAValue:
-    """One SSA-named value: a definition, an undef, a clobber or an argument.
+    """One SSA-named value: a definition, a phi, an undef, a clobber or an argument.
 
     Attributes:
         id: Stable name ``"<register>.<version>"``, e.g. ``"rax.3"``. Version
             ``0`` is the incoming/undefined value.
-        kind: ``"def"`` (instruction write), ``"undef"`` (read before any
-            definition in walked order), ``"clobber"`` (call side effect) or
-            ``"arg"`` (ABI argument register at function entry).
+        kind: ``"def"`` (instruction write), ``"phi"`` (dominance-frontier
+            merge, increment 6), ``"undef"`` (read before any definition in
+            walked order), ``"clobber"`` (call side effect) or ``"arg"`` (ABI
+            argument register at function entry).
         type_hint: Optional C type from :mod:`codevanta.analysis.type_propagation`,
             ``None`` when nothing types the definition.
         expr: Bounded symbolic expression the definition folds to (increment 2),
@@ -465,6 +467,33 @@ class SSAInstruction:
 
 
 @dataclass(frozen=True)
+class SSAPhiValue:
+    """One phi function at a dominance frontier (increment 6).
+
+    Attributes:
+        id: The SSA value id the phi defines (``"rax.2"``).
+        register: Canonical register the phi merges.
+        args: ``(predecessor_block_index, value_id)`` for every reachable
+            predecessor, sorted by block index -- the versions the join
+            merges.
+    """
+
+    id: str
+    register: str
+    args: tuple[tuple[int, str], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the phi for the JSON report."""
+        return {
+            "id": self.id,
+            "register": self.register,
+            "args": [
+                [pred_index, value_id] for pred_index, value_id in self.args
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class SSABlock:
     """One CFG block converted to SSA instructions.
 
@@ -473,8 +502,9 @@ class SSABlock:
         start: Virtual address of the first instruction.
         instructions: The block's SSA instructions in address order.
         loop_boundary: ``True`` when some branch jumps back into this block.
-        phi_required: Registers locally live-in at the loop head; a later
-            increment must place phi functions for them.
+        phi_required: Registers locally live-in at the loop head; kept as a
+            live-in hint alongside the real phi functions (increment 6).
+        phis: Phi values this join block defines, register-sorted.
     """
 
     index: int
@@ -482,6 +512,7 @@ class SSABlock:
     instructions: tuple[SSAInstruction, ...]
     loop_boundary: bool = False
     phi_required: tuple[str, ...] = ()
+    phis: tuple[SSAPhiValue, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the block for the JSON report."""
@@ -492,6 +523,7 @@ class SSABlock:
             "instructions": [instruction.to_dict() for instruction in self.instructions],
             "loop_boundary": self.loop_boundary,
             "phi_required": list(self.phi_required),
+            "phis": [phi.to_dict() for phi in self.phis],
         }
 
 
@@ -621,6 +653,9 @@ class _SSABuilder:
         self.loop_count = 0
         self._loop_flags: dict[int, bool] = {}
         self._phi_required: dict[int, tuple[str, ...]] = {}
+        self._def_stacks: dict[str, list[int]] = {}
+        self._block_push_stack: list[str] = []
+        self._block_scope_depth = 0
 
     # -- value table -------------------------------------------------------
 
@@ -655,32 +690,56 @@ class _SSABuilder:
             def_insn_index=insn_index,
             expr=expr,
         )
+        self._def_stacks.setdefault(canonical, []).append(version)
+        if self._block_scope_depth > 0:
+            self._block_push_stack.append(canonical)
         return value_id
 
     def _seed_incoming(self, canonical: str, kind: str, type_hint: str | None) -> None:
-        """Reserve version 0 of ``canonical`` (undef or incoming argument)."""
-        self._versions[canonical] = 0
-        self._values[f"{canonical}.0"] = _ValueRecord(
-            id=f"{canonical}.0",
-            kind=kind,
-            type_hint=type_hint,
-            def_block=None,
-            def_insn_index=None,
+        """Record version 0 of ``canonical`` (undef or incoming argument)."""
+        value_id = f"{canonical}.0"
+        self._values.setdefault(
+            value_id,
+            _ValueRecord(
+                id=value_id,
+                kind=kind,
+                type_hint=type_hint,
+                def_block=None,
+                def_insn_index=None,
+            ),
         )
 
     def _current_version(self, canonical: str) -> str:
         """Resolve a read of ``canonical`` to its current SSA value id.
 
-        A register never defined in the walked order resolves to its lazily
-        created version-0 value: ``"arg"`` for ABI argument registers (the
-        caller defined them), ``"undef"`` for everything else.
+        With stack-based renaming (increment 6) the current version is the
+        top of the register's definition stack -- dominance order decides it,
+        not address order. An empty stack resolves to the lazily recorded
+        version-0 value: ``"arg"`` for ABI argument registers (the caller
+        defined them), ``"undef"`` for everything else.
         """
-        if canonical not in self._versions:
+        stack = self._def_stacks.get(canonical)
+        if stack:
+            return f"{canonical}.{stack[-1]}"
+        zero_id = f"{canonical}.0"
+        if zero_id not in self._values:
             if canonical in self._arguments:
-                self._seed_incoming(canonical, "arg", self._arg_hints.get(canonical))
+                self._values[zero_id] = _ValueRecord(
+                    id=zero_id,
+                    kind="arg",
+                    type_hint=self._arg_hints.get(canonical),
+                    def_block=None,
+                    def_insn_index=None,
+                )
             else:
-                self._seed_incoming(canonical, "undef", None)
-        return f"{canonical}.{self._versions[canonical]}"
+                self._values[zero_id] = _ValueRecord(
+                    id=zero_id,
+                    kind="undef",
+                    type_hint=None,
+                    def_block=None,
+                    def_insn_index=None,
+                )
+        return zero_id
 
     def _record_use(self, value_id: str, block_index: int, insn_index: int) -> None:
         record = self._values[value_id]
@@ -755,7 +814,8 @@ class _SSABuilder:
         for part in parts:
             for canonical in _register_mentions(part, self._aliases):
                 if canonical not in ids:
-                    version = self._versions.get(canonical, 0)
+                    stack = self._def_stacks.get(canonical)
+                    version = stack[-1] if stack else 0
                     ids[canonical] = f"{canonical}.{version}"
         return ids
 
@@ -930,33 +990,74 @@ class _SSABuilder:
     # -- driver -------------------------------------------------------------
 
     def run(self) -> tuple[list[SSABlock], dict[str, _ValueRecord]]:
-        """Walk the CFG blocks in deterministic order and build the SSA."""
+        """Rename reachable blocks in dominator order; linearly the rest."""
         cfg_blocks = list(self._cfg.blocks)
         order = sorted(range(len(cfg_blocks)), key=lambda i: cfg_blocks[i].start)
         self._seed_arguments()
         block_starts = {cfg_blocks[index].start: index for index in order}
-        raw_blocks = [cfg_blocks[index].instructions for index in order]
+        raw_by_index = {index: cfg_blocks[index].instructions for index in order}
 
-        converted: list[list[SSAInstruction]] = [[] for _ in order]
+        successors = self._cfg_edges(order, cfg_blocks, block_starts)
+        entry, reachable, preds, idom, children = self._dominance(order, successors)
+        unreachable = [index for index in order if index not in reachable]
+        if unreachable:
+            self._warn(
+                f"{len(unreachable)} unreachable block(s) renamed linearly after "
+                f"the dominance walk (entry = block {entry}); their reads resolve "
+                "from entry state, never from unreachable definitions"
+            )
+
+        frontiers = self._frontiers(order, reachable, preds, idom)
+        definitions = self._definition_sites(reachable, raw_by_index)
+        phi_sites = self._place_phis(definitions, frontiers)
+        phi_ids: dict[tuple[int, str], str] = {}
+        phi_args: dict[tuple[int, str], dict[int, str]] = {
+            (block_index, register): {}
+            for block_index, registers in phi_sites.items()
+            for register in registers
+        }
+
+        converted: dict[int, list[SSAInstruction]] = {index: [] for index in order}
         total = 0
         stop = False
-        for position, block_index in enumerate(order):
-            if stop or position >= self._max_blocks:
-                if not stop:
+        processed = 0
+
+        def rename(block_index: int) -> None:
+            """Rename one block, then its dominator-tree children."""
+            nonlocal total, stop, processed
+            if stop:
+                return
+            if processed >= self._max_blocks:
+                if not self.truncated_blocks:
                     self.truncated_blocks = True
                     self._warn(
                         f"block budget max_blocks={self._max_blocks} reached; "
-                        f"{len(order) - position} CFG block(s) left out of the SSA view"
+                        "further reachable blocks were left out of the SSA view"
                     )
-                break
+                return
+            processed += 1
             self._pending_condition = None  # comparisons never cross block edges
-            for local_index, payload in enumerate(raw_blocks[position]):
-                if total >= self._max_instructions:
-                    self.truncated_instructions = True
-                    self._warn(
-                        f"instruction budget max_instructions={self._max_instructions} "
-                        "reached; SSA construction stopped before the end of the CFG"
+            self._block_scope_depth += 1
+            phi_pushes: list[str] = []
+            try:
+                for register in phi_sites.get(block_index, ()):
+                    value_id = self._new_phi_value(register, block_index)
+                    phi_ids[(block_index, register)] = value_id
+                    self._def_stacks.setdefault(register, []).append(
+                        int(value_id.rsplit(".", 1)[1])
                     )
+                    phi_pushes.append(register)
+            except _BudgetStopError:
+                stop = True
+            for local_index, payload in enumerate(raw_by_index[block_index]):
+                if stop or total >= self._max_instructions:
+                    if total >= self._max_instructions:
+                        self.truncated_instructions = True
+                        self._warn(
+                            f"instruction budget max_instructions="
+                            f"{self._max_instructions} reached; SSA construction "
+                            "stopped before the end of the CFG"
+                        )
                     stop = True
                     break
                 address = _payload_address(payload)
@@ -973,24 +1074,263 @@ class _SSABuilder:
                 if instruction is None:  # value budget hit inside _convert
                     stop = True
                     break
-                converted[position].append(instruction)
+                converted[block_index].append(instruction)
                 total += 1
                 self._note_loop_edge(
                     mnemonic, operands, address, block_index, block_starts,
-                    raw_blocks[position],
+                    raw_by_index[block_index],
                 )
+            own_pushes = self._block_push_stack[:]
+            self._block_push_stack.clear()
+            for successor in sorted(successors.get(block_index, ())):
+                for register in phi_sites.get(successor, ()):
+                    phi_args[(successor, register)][block_index] = (
+                        self._current_version(register)
+                    )
+            for child in children.get(block_index, []):
+                rename(child)
+            for register in reversed(phi_pushes):
+                self._def_stacks[register].pop()
+            for register in reversed(own_pushes):
+                self._def_stacks[register].pop()
+            self._block_scope_depth -= 1
 
+        rename(entry)
+
+        for block_index in unreachable:
+            if stop or processed >= self._max_blocks:
+                if not self.truncated_blocks:
+                    self.truncated_blocks = True
+                    self._warn(
+                        f"block budget max_blocks={self._max_blocks} reached; "
+                        "further blocks were left out of the SSA view"
+                    )
+                break
+            processed += 1
+            self._pending_condition = None
+            self._block_scope_depth += 1
+            for local_index, payload in enumerate(raw_by_index[block_index]):
+                if stop or total >= self._max_instructions:
+                    if total >= self._max_instructions:
+                        self.truncated_instructions = True
+                        self._warn(
+                            f"instruction budget max_instructions="
+                            f"{self._max_instructions} reached; SSA construction "
+                            "stopped before the end of the CFG"
+                        )
+                    stop = True
+                    break
+                address = _payload_address(payload)
+                self._cursor = address
+                mnemonic = (payload.get("mnemonic") or "").strip().lower()
+                operands = payload.get("operands") or ""
+                instruction = self._convert(
+                    mnemonic,
+                    _split_operands(operands),
+                    payload,
+                    block_index,
+                    local_index,
+                )
+                if instruction is None:
+                    stop = True
+                    break
+                converted[block_index].append(instruction)
+                total += 1
+            for register in reversed(self._block_push_stack):
+                self._def_stacks[register].pop()
+            self._block_push_stack.clear()
+            self._block_scope_depth -= 1
+
+        phis_by_block: dict[int, list[SSAPhiValue]] = {}
+        for (block_index, register), pred_map in phi_args.items():
+            phis_by_block.setdefault(block_index, []).append(
+                SSAPhiValue(
+                    id=phi_ids[(block_index, register)],
+                    register=register,
+                    args=tuple(sorted(pred_map.items())),
+                )
+            )
         ssa_blocks = [
             SSABlock(
                 index=block_index,
                 start=cfg_blocks[block_index].start,
-                instructions=tuple(converted[position]),
+                instructions=tuple(converted[block_index]),
                 loop_boundary=self._loop_flags.get(block_index, False),
                 phi_required=self._phi_required.get(block_index, ()),
+                phis=tuple(
+                    sorted(
+                        phis_by_block.get(block_index, []),
+                        key=lambda phi: phi.register,
+                    )
+                ),
             )
-            for position, block_index in enumerate(order)
+            for block_index in order
         ]
         return ssa_blocks, self._values
+
+    def _cfg_edges(
+        self,
+        order: list[int],
+        cfg_blocks: list[Any],
+        block_starts: dict[int, int],
+    ) -> dict[int, tuple[int, ...]]:
+        """``index -> sorted successor indexes`` from direct branches + falls."""
+        successors: dict[int, set[int]] = {index: set() for index in order}
+        for position, index in enumerate(order):
+            instructions = cfg_blocks[index].instructions
+            for payload in instructions:
+                mnemonic = (payload.get("mnemonic") or "").strip().lower()
+                if not mnemonic.startswith("j"):
+                    continue
+                target = _direct_target(payload.get("operands") or "")
+                target_index = (
+                    block_starts.get(target) if target is not None else None
+                )
+                if target_index is not None:
+                    successors[index].add(target_index)
+            if position + 1 >= len(order):
+                continue
+            last = ""
+            if instructions:
+                last = (instructions[-1].get("mnemonic") or "").strip().lower()
+            if last in {"jmp", "ret", "hlt", "ud2"}:
+                continue
+            successors[index].add(order[position + 1])
+        return {
+            index: tuple(sorted(targets)) for index, targets in successors.items()
+        }
+
+    def _dominance(
+        self, order: list[int], successors: dict[int, tuple[int, ...]]
+    ) -> tuple[int, set[int], dict[int, set[int]], dict[int, int], dict[int, list[int]]]:
+        """Entry, reachable set, preds, immediate dominators, dom-tree children."""
+        entry = order[0]
+        reachable = {entry}
+        pending = [entry]
+        while pending:
+            block_index = pending.pop()
+            for successor in successors.get(block_index, ()):
+                if successor not in reachable:
+                    reachable.add(successor)
+                    pending.append(successor)
+        preds: dict[int, set[int]] = {index: set() for index in reachable}
+        for block_index in reachable:
+            for successor in successors.get(block_index, ()):
+                if successor in reachable:
+                    preds[successor].add(block_index)
+        dom = {index: set(reachable) for index in reachable}
+        dom[entry] = {entry}
+        changed = True
+        while changed:
+            changed = False
+            for block_index in order:
+                if block_index not in reachable or block_index == entry:
+                    continue
+                pred_doms = [dom[p] for p in preds[block_index] if p in dom]
+                if not pred_doms:
+                    continue
+                new_dom = set.intersection(*pred_doms) | {block_index}
+                if new_dom != dom[block_index]:
+                    dom[block_index] = new_dom
+                    changed = True
+        idom: dict[int, int] = {}
+        for block_index in reachable:
+            if block_index == entry:
+                continue
+            strict = dom[block_index] - {block_index}
+            idom[block_index] = max(strict, key=lambda d: len(dom[d]))
+        position_of = {index: position for position, index in enumerate(order)}
+        children: dict[int, list[int]] = {}
+        for block_index in sorted(reachable, key=lambda i: position_of[i]):
+            parent = idom.get(block_index)
+            if parent is not None:
+                children.setdefault(parent, []).append(block_index)
+        return entry, reachable, preds, idom, children
+
+    def _frontiers(
+        self,
+        order: list[int],
+        reachable: set[int],
+        preds: dict[int, set[int]],
+        idom: dict[int, int],
+    ) -> dict[int, set[int]]:
+        """Dominance frontiers via the idom walk per multi-predecessor join."""
+        position_of = {index: position for position, index in enumerate(order)}
+        frontiers: dict[int, set[int]] = {}
+        for block_index in sorted(reachable, key=lambda i: position_of[i]):
+            if len(preds[block_index]) < 2:
+                continue
+            for predecessor in preds[block_index]:
+                runner = predecessor
+                while runner != idom.get(block_index) and runner is not None:
+                    frontiers.setdefault(runner, set()).add(block_index)
+                    runner = idom.get(runner)
+        return frontiers
+
+    def _definition_sites(
+        self, reachable: set[int], raw_by_index: dict[int, list[dict[str, Any]]]
+    ) -> dict[str, set[int]]:
+        """Registers defined per reachable block (mirrors _convert's writes)."""
+        definitions: dict[str, set[int]] = {}
+        for block_index, instructions in raw_by_index.items():
+            if block_index not in reachable:
+                continue
+            for payload in instructions:
+                mnemonic = (payload.get("mnemonic") or "").strip().lower()
+                parts = _split_operands(payload.get("operands") or "")
+                if mnemonic in _CALL_MNEMONICS:
+                    registers = list(abi_volatile_registers(self._bitness))
+                    registers.append(FLAGS_REGISTER)
+                else:
+                    registers = [
+                        hit[0] for hit in self._register_writes(mnemonic, parts)
+                    ]
+                    if mnemonic in _FLAGS_WRITERS:
+                        registers.append(FLAGS_REGISTER)
+                for canonical in registers:
+                    definitions.setdefault(canonical, set()).add(block_index)
+        return definitions
+
+    def _place_phis(
+        self,
+        definitions: dict[str, set[int]],
+        frontiers: dict[int, set[int]],
+    ) -> dict[int, list[str]]:
+        """Cytron worklist: phi sites per block, registers in sorted order."""
+        sites: dict[int, list[str]] = {}
+        for register in sorted(definitions):
+            work = sorted(definitions[register])
+            placed: set[int] = set()
+            while work:
+                block_index = work.pop()
+                for frontier in sorted(frontiers.get(block_index, ())):
+                    if frontier not in placed:
+                        placed.add(frontier)
+                        sites.setdefault(frontier, []).append(register)
+                        if frontier not in definitions[register]:
+                            work.append(frontier)
+        return sites
+
+    def _new_phi_value(self, canonical: str, block_index: int) -> str:
+        """Create the phi value a join block defines (no stack push here)."""
+        if len(self._values) >= self._max_values:
+            self.truncated_values = True
+            self._warn(
+                f"value budget max_values={self._max_values} reached at "
+                f"0x{self._cursor:x}; SSA construction stopped early"
+            )
+            raise _BudgetStopError
+        version = self._versions.get(canonical, 0) + 1
+        value_id = f"{canonical}.{version}"
+        self._versions[canonical] = version
+        self._values[value_id] = _ValueRecord(
+            id=value_id,
+            kind="phi",
+            type_hint=None,
+            def_block=block_index,
+            def_insn_index=None,
+        )
+        return value_id
 
     def _seed_arguments(self) -> None:
         """Reserve the ABI argument registers' version 0 with inferred types."""
@@ -1111,9 +1451,8 @@ class _SSABuilder:
             self._phi_required[target_index] = tuple(sorted(live))
         self._warn(
             f"loop back-edge from 0x{address:x} into block {target_index} "
-            f"(0x{target:x}): loop boundary recorded, phi functions are not "
-            "constructed (increment 1 limitation); reads inside the loop body "
-            "still resolve to the straight-line version"
+            f"(0x{target:x}): loop boundary recorded; reaching versions merge "
+            "through phi values at dominance-frontier joins (increment 6)"
         )
 
     def _live_in_registers(self, instructions: list[dict[str, Any]]) -> set[str]:
@@ -1225,10 +1564,12 @@ def build_ssa(
         confidence=Confidence.MEDIUM,
         address=address,
         detail=(
-            f"straight-line SSA over {len(blocks)} CFG block(s): reads resolve to the "
-            "latest definition in walked order, calls clobber the ABI-volatile "
-            "registers, loop back-edges are recorded as boundaries with phi-required "
-            "markers but no phi functions are constructed (increment 1 limitation); "
+            f"dominance-ordered SSA over {len(blocks)} CFG block(s): reads resolve "
+            "to the top of the per-register definition stack in dominator order, "
+            "multi-predecessor joins define phi values merging the versions each "
+            "reachable predecessor reaches, calls clobber the ABI-volatile "
+            "registers, loop back-edges still mark loop boundaries with their "
+            "live-in hints, unreachable blocks rename linearly from entry state; "
             "nothing is executed"
         ),
     )
