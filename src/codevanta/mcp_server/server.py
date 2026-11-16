@@ -2094,9 +2094,15 @@ def build_server() -> MCPServer:
             raise ToolError(str(exc)) from exc
 
     @server.tool(description=UIRES_PREVIEW_DESCRIPTION)
-    def codevanta_ui_preview(path: str, output_directory: str) -> dict:
+    def codevanta_ui_preview(
+        path: str,
+        output_directory: str,
+        assets_manifest_path: str | None = None,
+    ) -> dict:
         try:
-            return tools.codevanta_ui_preview(path, output_directory)
+            return tools.codevanta_ui_preview(
+                path, output_directory, assets_manifest_path=assets_manifest_path
+            )
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
