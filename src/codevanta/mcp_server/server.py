@@ -49,6 +49,7 @@ from .ext_fs import TOOL_DESCRIPTION_FS_SNAPSHOT as FS_SNAPSHOT_DESCRIPTION
 from .ext_machosym import TOOL_DESCRIPTION_MACHO_SYMBOLS as MACHO_SYMBOLS_DESCRIPTION
 from .ext_netcapture import TOOL_DESCRIPTION_NET_CAPTURE as NET_CAPTURE_DESCRIPTION
 from .ext_netcapture import TOOL_DESCRIPTION_NET_INTERFACES as NET_INTERFACES_DESCRIPTION
+from .ext_pseudoc import TOOL_DESCRIPTION_PSEUDO_C as PSEUDO_C_DESCRIPTION
 from .ext_rich import TOOL_DESCRIPTION_RICH as RICH_DESCRIPTION
 from .ext_solver import TOOL_DESCRIPTION as SYMBOLIC_SOLVE_DESCRIPTION
 from .ext_ssa import TOOL_DESCRIPTION_SSA as SSA_DESCRIPTION
@@ -2237,6 +2238,26 @@ def build_server() -> MCPServer:
         except AnalysisError as exc:
             # A bad address or an out-of-range budget is caller-correctable;
             # keep the typed message instead of the framework's generic crash.
+            raise ToolError(str(exc)) from exc
+
+    # lane-pseudoc: readable pseudo-C text from the SSA IR (increment 3).
+    @server.tool(description=PSEUDO_C_DESCRIPTION)
+    def codevanta_pseudo_c(
+        path: str,
+        address: int,
+        max_blocks: int = tools.DEFAULT_PSEUDO_C_MAX_BLOCKS,
+        max_instructions: int = tools.DEFAULT_PSEUDO_C_MAX_INSTRUCTIONS,
+    ) -> dict:
+        try:
+            return tools.codevanta_pseudo_c(
+                path,
+                address,
+                max_blocks=max_blocks,
+                max_instructions=max_instructions,
+            )
+        except AnalysisError as exc:
+            # Same caller-correctable surface as the SSA tool: keep the
+            # typed message instead of the framework's generic crash.
             raise ToolError(str(exc)) from exc
 
     @server.tool(description=DEX_DESCRIPTION)

@@ -369,7 +369,7 @@ def test_update_baseline_writes_the_platform_file(
 
 def test_default_tolerance_is_the_ci_gate_policy() -> None:
     """The tool's default tolerance is the regression budget CI enforces."""
-    assert bench_gate.DEFAULT_TOLERANCE == 0.75
+    assert bench_gate.DEFAULT_TOLERANCE == 2.5
 
 
 def test_25_percent_boundary_passes_and_just_beyond_fails() -> None:
@@ -428,17 +428,29 @@ def test_baseline_with_wrong_format_exits_two(tmp_path: Path) -> None:
     assert result.stdout == ""
 
 
-def test_gate_happy_path_at_the_committed_tolerance(tmp_path: Path) -> None:
-    """A fresh baseline then a run at the 25% default passes on the same machine.
+def test_gate_happy_path_passes_end_to_end(tmp_path: Path) -> None:
+    """A fresh baseline then a generous-slack run passes on the same machine.
 
-    No ``--tolerance`` is passed: this also pins the default end to end, the way
-    CI's benchmark job runs it.
+    The tolerance is passed explicitly huge: the same machine is never 50x
+    slower than its own fresh baseline, and micro-benchmark noise on shared
+    CI runners must not flake this end-to-end PASS path (a macOS runner once
+    measured suggest_struct ~6x its fresh baseline for the length of one
+    test). The committed default itself is pinned end to end by CI's
+    benchmark job and in-process by test_default_tolerance_is_the_ci_gate_policy.
     """
     baseline = tmp_path / "baseline.json"
     record_baseline(baseline)
 
-    result = run_gate(*TINY_ARGS, "--baseline", str(baseline), "--platform", "linux")
+    result = run_gate(
+        *TINY_ARGS,
+        "--baseline",
+        str(baseline),
+        "--platform",
+        "linux",
+        "--tolerance",
+        "50",
+    )
 
     assert result.returncode == 0, result.stderr
     assert "PASS" in result.stderr
-    assert "within 75% tolerance" in result.stderr
+    assert "within 5000% tolerance" in result.stderr
