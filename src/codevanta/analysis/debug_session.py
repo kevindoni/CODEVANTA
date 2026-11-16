@@ -1128,18 +1128,22 @@ class DebugSession:
     @classmethod
     def launch(
         cls,
-        target: str | Path,
+        target: str | Path | None = None,
         *,
         timeout: float = DEFAULT_TIMEOUT,
         transport: MITransport | None = None,
     ) -> DebugSession:
-        """Launch gdb on ``target`` and wait for its first MI prompt.
+        """Launch gdb, optionally on ``target``, and wait for its MI prompt.
 
         Args:
             target: The program to debug; handed to gdb as its last argument.
-                Validity is gdb's to report: a file it cannot load answers an
-                MI error at the first ``-exec-*``, which surfaces as the same
-                typed :class:`AnalysisError` as any other refusal.
+                ``None`` (or omitted) starts a bare interactive session with
+                no inferior yet -- the caller loads a file later through MI,
+                the way a persistent debugging lane works. Validity is gdb's
+                to report: a file it cannot load answers an MI error at the
+                first ``-exec-*``, which surfaces as the same typed
+                :class:`AnalysisError` as any other refusal. An explicitly
+                empty string is rejected.
             timeout: Per-command wall-clock budget in seconds (handshake
                 included).
             transport: Injectable replacement for the live process; ``None``
@@ -1147,12 +1151,15 @@ class DebugSession:
 
         Raises:
             AnalysisError: gdb is not on PATH, the process could not spawn,
-                the target is empty, or the handshake missed its budget.
+                the target is the empty string, or the handshake missed its
+                budget.
         """
         checked_timeout = _require_timeout(timeout)
-        resolved_target = str(target)
-        if not resolved_target.strip():
-            raise AnalysisError("debug target must be a non-empty program path")
+        resolved_target: str | None = None
+        if target is not None:
+            resolved_target = str(target)
+            if not resolved_target.strip():
+                raise AnalysisError("debug target must be a non-empty program path")
         if transport is None:
             _require_gdb()
             transport = GdbMiProcess(list(_MI_ARGV_PREFIX), target=resolved_target)
@@ -1200,6 +1207,41 @@ class DebugSession:
         if result.result_class == "error":
             raise _mi_error(result, command)
         return _payload_dict(result)
+
+    def console(self, command: str) -> dict[str, Any]:
+        """Send one raw MI command and return every record it produced.
+
+        Unlike :meth:`execute` this is a console lane, not a capability: the
+        caller drives gdb directly (``-file-exec-file``, ``-break-insert``,
+        ``-exec-run`` ...) and receives the full transcript -- result record
+        plus the stream and async records around it -- serialized as JSON.
+        An MI ``^error`` is *returned*, not raised, because the console's job
+        is to report what gdb said; only a missing result record or a missed
+        deadline is a transport failure worth an exception.
+
+        Raises:
+            AnalysisError: The command is empty or contains a newline, gdb
+                never answered with a result record, or the deadline passed.
+        """
+        if not isinstance(command, str) or not command.strip():
+            raise AnalysisError("console command must be a non-empty string")
+        if "\n" in command or "\r" in command:
+            raise AnalysisError("console command must be a single line")
+        records = self._execute_raw(command.strip())
+        result = next((record for record in records if record.kind == "result"), None)
+        if result is None:
+            raise AnalysisError(
+                f"gdb never answered {command!r} within {self._timeout:g} seconds "
+                "(no result record before the prompt)"
+            )
+        return {
+            "command": command.strip(),
+            "result_class": result.result_class,
+            # A bare ``^done`` carries no comma payload; the console lane
+            # reports an empty dict instead of calling it malformed.
+            "payload": result.payload if isinstance(result.payload, dict) else {},
+            "records": [record.to_dict() for record in records],
+        }
 
     def _exec_wait_stop(self, command: str) -> StopResult:
         """Run an ``-exec-*`` command and build its stop result.

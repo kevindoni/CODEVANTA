@@ -280,6 +280,39 @@ from codevanta.mcp_server.ext_machosym import codevanta_macho_symbols as codevan
 from codevanta.mcp_server.ext_meta import (
     codevanta_metadata as codevanta_metadata,  # lane-meta: ONE MCP registration line
 )
+from codevanta.mcp_server.ext_misession import (
+    DEFAULT_TIMEOUT as DEFAULT_MI_TIMEOUT,  # noqa: F401 -- lane-misessions
+)
+from codevanta.mcp_server.ext_misession import (
+    TOOL_DESCRIPTION_MI_CLOSE as TOOL_DESCRIPTION_MI_CLOSE,  # noqa: F401
+)
+from codevanta.mcp_server.ext_misession import (
+    TOOL_DESCRIPTION_MI_CONSOLE as TOOL_DESCRIPTION_MI_CONSOLE,  # noqa: F401
+)
+from codevanta.mcp_server.ext_misession import (
+    TOOL_DESCRIPTION_MI_SESSIONS as TOOL_DESCRIPTION_MI_SESSIONS,  # noqa: F401
+)
+from codevanta.mcp_server.ext_misession import (
+    TOOL_DESCRIPTION_MI_START as TOOL_DESCRIPTION_MI_START,  # noqa: F401
+)
+from codevanta.mcp_server.ext_misession import (
+    TOOL_DESCRIPTION_MI_STATUS as TOOL_DESCRIPTION_MI_STATUS,  # noqa: F401
+)
+from codevanta.mcp_server.ext_misession import (
+    codevanta_mi_close as codevanta_mi_close,  # noqa: F401
+)
+from codevanta.mcp_server.ext_misession import (
+    codevanta_mi_console as codevanta_mi_console,  # noqa: F401
+)
+from codevanta.mcp_server.ext_misession import (
+    codevanta_mi_sessions as codevanta_mi_sessions,  # noqa: F401
+)
+from codevanta.mcp_server.ext_misession import (
+    codevanta_mi_start as codevanta_mi_start,  # noqa: F401
+)
+from codevanta.mcp_server.ext_misession import (
+    codevanta_mi_status as codevanta_mi_status,  # noqa: F401
+)
 from codevanta.mcp_server.ext_mobile import codevanta_adb as codevanta_adb
 from codevanta.mcp_server.ext_nav import codevanta_nav, codevanta_nav_providers  # noqa: F401 -- registration of the ext_nav MCP tools
 from codevanta.mcp_server.ext_netcapture import (  # lane-net: ONE MCP registration import line

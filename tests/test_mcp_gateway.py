@@ -45,7 +45,7 @@ def test_gateway_exposes_a_small_registry_and_leaves_the_source_alone() -> None:
 
     # The flat registry is untouched: clients that want all schemas still get them.
     source = asyncio.run(build_server().list_tools())
-    assert len(source) == 127
+    assert len(source) == 132
 
 
 def test_search_returns_compact_rows_and_honors_query_and_limit() -> None:

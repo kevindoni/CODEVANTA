@@ -1985,6 +1985,44 @@ def build_server() -> MCPServer:
         except AnalysisError as exc:
             raise ToolError(str(exc)) from exc
 
+    @server.tool(description=tools.TOOL_DESCRIPTION_MI_START)
+    def codevanta_mi_start(
+        target: str | None = None,
+        timeout: float = tools.DEFAULT_MI_TIMEOUT,
+    ) -> dict:
+        try:
+            return tools.codevanta_mi_start(target, timeout=timeout)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_MI_CONSOLE)
+    def codevanta_mi_console(session_id: str, command: str) -> dict:
+        try:
+            return tools.codevanta_mi_console(session_id, command)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_MI_STATUS)
+    def codevanta_mi_status(session_id: str) -> dict:
+        try:
+            return tools.codevanta_mi_status(session_id)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_MI_CLOSE)
+    def codevanta_mi_close(session_id: str) -> dict:
+        try:
+            return tools.codevanta_mi_close(session_id)
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(description=tools.TOOL_DESCRIPTION_MI_SESSIONS)
+    def codevanta_mi_sessions() -> dict:
+        try:
+            return tools.codevanta_mi_sessions()
+        except AnalysisError as exc:
+            raise ToolError(str(exc)) from exc
+
     @server.tool(description=tools.TOOL_DESCRIPTION_STATUS)
     def codevanta_debug_status(session_id: str) -> dict:
         try:
