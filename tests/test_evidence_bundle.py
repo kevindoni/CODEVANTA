@@ -504,6 +504,8 @@ def test_written_file_has_a_stable_key_order(bundle: Bundle, tmp_path: Path) -> 
     assert list(document) == ["entries", "manifest"]
     assert list(document["manifest"]) == [
         "algorithm",
+        "chain_algorithm",
+        "chain_head",
         "created_at",
         "entries_sha256",
         "entry_count",
@@ -513,6 +515,7 @@ def test_written_file_has_a_stable_key_order(bundle: Bundle, tmp_path: Path) -> 
     ]
     assert list(document["entries"]["strings"]) == [
         "bytes",
+        "chain_sha256",
         "media_type",
         "payload",
         "sha256",

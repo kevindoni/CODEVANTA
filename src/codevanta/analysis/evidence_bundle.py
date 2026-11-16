@@ -225,6 +225,87 @@ def entries_digest(entries: Mapping[str, Mapping[str, Any]]) -> str:
     return _sha256_hex(canonical_json(table).encode("utf-8"))
 
 
+#: Name of the linked-digest chain algorithm recorded in the manifest.
+CHAIN_ALGORITHM = "sha256-linked-v1"
+
+
+def chain_entries(entries: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
+    """Link every entry digest into its predecessor, name order.
+
+    Each row's ``chain_sha256`` is ``sha256(prev_hex + "|" + name + "|" +
+    sha256 + "|" + str(bytes))`` over the entries sorted by name, starting
+    from the empty string. The manifest records the final link as
+    ``chain_head``. Unlike :func:`entries_digest` -- which only says *that*
+    the table changed -- the chain also pins the row *order* and lets a
+    verifier name the first entry where the chain breaks, which is the
+    evidence-side half of a tamper-evident log.
+
+    Args:
+        entries: Mapping of entry name to a record carrying ``sha256`` and
+            ``bytes`` (``media_type`` is not part of the link).
+
+    Returns:
+        Mapping of entry name to its link digest, in name order.
+
+    Raises:
+        AnalysisError: When a record is missing or carries malformed metadata.
+    """
+    links: dict[str, str] = {}
+    previous = ""
+    for name in sorted(entries):
+        record = entries[name]
+        digest = record.get("sha256")
+        size = record.get("bytes")
+        if not isinstance(digest, str) or not isinstance(size, int) or isinstance(size, bool):
+            raise AnalysisError(f"entry {name!r} has malformed digest metadata")
+        link = hashlib.sha256(
+            f"{previous}|{name}|{digest}|{size}".encode()
+        ).hexdigest()
+        links[name] = link
+        previous = link
+    return links
+
+
+def verify_chain(
+    entries: Mapping[str, Mapping[str, Any]], expected_head: str
+) -> list[str]:
+    """Recompute a chain and report where it diverges from ``expected_head``.
+
+    Args:
+        entries: The recorded entry table, including each row's
+            ``chain_sha256`` when the bundle carries one.
+        expected_head: The manifest's ``chain_head``.
+
+    Returns:
+        Problems naming the first divergent entry, or an empty list when the
+        whole chain -- including every recorded link -- matches.
+    """
+    problems: list[str] = []
+    previous = ""
+    for name in sorted(entries):
+        record = entries[name]
+        digest = record.get("sha256")
+        size = record.get("bytes")
+        if not isinstance(digest, str) or not isinstance(size, int) or isinstance(size, bool):
+            problems.append(f"entry {name!r} has malformed digest metadata")
+            break
+        link = hashlib.sha256(
+            f"{previous}|{name}|{digest}|{size}".encode()
+        ).hexdigest()
+        recorded = record.get("chain_sha256")
+        if recorded is not None and recorded != link:
+            problems.append(
+                f"entry {name!r} chain link mismatch: recorded {recorded}, computed {link}"
+            )
+            break
+        previous = link
+    if not problems and previous != expected_head:
+        problems.append(
+            f"chain head mismatch: manifest records {expected_head}, computed {previous}"
+        )
+    return problems
+
+
 def hash_subject(subject_path: str | Path) -> str:
     """Stream ``subject_path`` through SHA-256 and return the hex digest.
 
@@ -286,10 +367,12 @@ class BundleManifest:
     entry_count: int
     entries_sha256: str
     algorithm: str = DEFAULT_ALGORITHM
+    chain_head: str | None = None
+    chain_algorithm: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise the manifest as a JSON-safe dict."""
-        return {
+        payload: dict[str, Any] = {
             "algorithm": self.algorithm,
             "created_at": self.created_at,
             "entries_sha256": self.entries_sha256,
@@ -298,6 +381,10 @@ class BundleManifest:
             "subject_sha256": self.subject_sha256,
             "tool_version": self.tool_version,
         }
+        if self.chain_head is not None:
+            payload["chain_head"] = self.chain_head
+            payload["chain_algorithm"] = self.chain_algorithm or CHAIN_ALGORITHM
+        return payload
 
 
 @dataclass(frozen=True)
@@ -398,7 +485,7 @@ class _ParsedDocument:
 def _entry_metadata(
     name: str, record: Mapping[str, Any], problems: list[str]
 ) -> dict[str, Any] | None:
-    """Extract ``{"sha256", "bytes", "media_type"}``, or report why not."""
+    """Extract ``{"sha256", "bytes", "media_type"[, "chain_sha256"]}``."""
     digest = record.get("sha256")
     if not isinstance(digest, str) or _SHA256_HEX.fullmatch(digest) is None:
         problems.append(f"entry {name!r}: sha256 is missing or malformed ({digest!r})")
@@ -411,7 +498,11 @@ def _entry_metadata(
     if not isinstance(media_type, str) or not media_type:
         problems.append(f"entry {name!r}: media_type is missing or malformed ({media_type!r})")
         return None
-    return {"sha256": digest, "bytes": size, "media_type": media_type}
+    metadata: dict[str, Any] = {"sha256": digest, "bytes": size, "media_type": media_type}
+    link = record.get("chain_sha256")
+    if isinstance(link, str) and _SHA256_HEX.fullmatch(link) is not None:
+        metadata["chain_sha256"] = link
+    return metadata
 
 
 def _parse_manifest(raw: Any, problems: list[str]) -> BundleManifest:
@@ -450,6 +541,17 @@ def _parse_manifest(raw: Any, problems: list[str]) -> BundleManifest:
     elif algorithm not in SUPPORTED_ALGORITHMS:
         problems.append(f"manifest: unsupported algorithm {algorithm!r}")
 
+    chain_head = raw.get("chain_head")
+    if chain_head is not None and (not isinstance(chain_head, str) or len(chain_head) != 64):
+        problems.append(f"manifest: chain_head is malformed ({chain_head!r})")
+        chain_head = None
+    chain_algorithm = raw.get("chain_algorithm")
+    if chain_algorithm is not None and (
+        not isinstance(chain_algorithm, str) or not chain_algorithm
+    ):
+        problems.append(f"manifest: chain_algorithm is malformed ({chain_algorithm!r})")
+        chain_algorithm = None
+
     return BundleManifest(
         created_at=fields["created_at"],
         tool_version=fields["tool_version"],
@@ -458,6 +560,8 @@ def _parse_manifest(raw: Any, problems: list[str]) -> BundleManifest:
         entry_count=count,
         entries_sha256=fields["entries_sha256"],
         algorithm=algorithm,
+        chain_head=chain_head,
+        chain_algorithm=chain_algorithm,
     )
 
 
@@ -582,7 +686,24 @@ def build_bundle(
         subject_sha256=subject_sha256,
         entry_count=len(entries),
         entries_sha256=entries_digest(entries),
+        chain_head=None,
+        chain_algorithm=None,
     )
+    if entries:
+        links = chain_entries(entries)
+        for name, link in links.items():
+            entries[name]["chain_sha256"] = link
+        head_name = sorted(links)[-1]
+        manifest = BundleManifest(
+            created_at=manifest.created_at,
+            tool_version=manifest.tool_version,
+            subject=manifest.subject,
+            subject_sha256=manifest.subject_sha256,
+            entry_count=manifest.entry_count,
+            entries_sha256=manifest.entries_sha256,
+            chain_head=links[head_name],
+            chain_algorithm=CHAIN_ALGORITHM,
+        )
     return Bundle(manifest=manifest, entries=entries, _payload_texts=payload_texts)
 
 def verify_bundle(
@@ -658,6 +779,9 @@ def verify_bundle(
             f"manifest: entries_sha256 mismatch "
             f"(expected {parsed.manifest.entries_sha256}, actual {actual_entries})"
         )
+
+    if parsed.manifest.chain_head is not None:
+        problems.extend(verify_chain(parsed.entries, parsed.manifest.chain_head))
 
     if subject_path is not None:
         actual_subject = hash_subject(subject_path)

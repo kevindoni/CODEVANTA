@@ -544,8 +544,12 @@ def test_evidence_bundle_json_prints_the_document(tmp_path: Path) -> None:
         "subject_sha256",
         "entries_sha256",
         "entry_count",
+        "chain_head",
+        "chain_algorithm",
     }
     assert document["manifest"]["algorithm"] == "sha256"
+    assert document["manifest"]["chain_algorithm"] == "sha256-linked-v1"
+    assert len(document["manifest"]["chain_head"]) == 64
     assert document["entries"]["meta"]["payload"] == {"answer": 42}
 
 
