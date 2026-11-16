@@ -320,6 +320,18 @@ from codevanta.mcp_server.ext_proccapture import (
     codevanta_proc_status as codevanta_proc_status,  # noqa: F401
 )
 from codevanta.mcp_server.ext_providers import codevanta_providers as codevanta_providers
+from codevanta.mcp_server.ext_pseudoc import (  # lane-pseudoc: ONE MCP registration line
+    DEFAULT_MAX_BLOCKS as DEFAULT_PSEUDO_C_MAX_BLOCKS,  # noqa: F401 -- server wrapper default
+)
+from codevanta.mcp_server.ext_pseudoc import (
+    DEFAULT_MAX_INSTRUCTIONS as DEFAULT_PSEUDO_C_MAX_INSTRUCTIONS,  # noqa: F401 -- server wrapper default
+)
+from codevanta.mcp_server.ext_pseudoc import (
+    TOOL_DESCRIPTION_PSEUDO_C as TOOL_DESCRIPTION_PSEUDO_C,  # noqa: F401 -- server wrapper
+)
+from codevanta.mcp_server.ext_pseudoc import (
+    codevanta_pseudo_c as codevanta_pseudo_c,  # noqa: F401 -- lane-pseudoc
+)
 from codevanta.mcp_server.ext_rebuild import (  # lane-rebuild: ONE MCP registration line
     codevanta_rebuild,  # noqa: F401
     codevanta_rebuild_build,  # noqa: F401
