@@ -1261,8 +1261,8 @@ class _SSABuilder:
             if len(preds[block_index]) < 2:
                 continue
             for predecessor in preds[block_index]:
-                runner = predecessor
-                while runner != idom.get(block_index) and runner is not None:
+                runner: int | None = predecessor
+                while runner is not None and runner != idom.get(block_index):
                     frontiers.setdefault(runner, set()).add(block_index)
                     runner = idom.get(runner)
         return frontiers
