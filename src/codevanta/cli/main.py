@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
@@ -146,6 +145,7 @@ from codevanta.analysis.type_recovery import (
 from codevanta.analysis.vtables import find_vtables
 from codevanta.analysis.xrefs import DEFAULT_MAX_BYTES, find_xrefs
 from codevanta.cli.bridges import bridges_apps
+from codevanta.cli.console import make_console
 from codevanta.cli.containers import app as containers_app
 from codevanta.cli.crash import app as crash_app
 from codevanta.cli.depth import apk_app as apk_app
@@ -197,7 +197,7 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
-console = Console()
+console = make_console()
 
 
 def _load(path: Path) -> BinaryInfo:
@@ -3658,6 +3658,16 @@ def mcp_serve(
         bool,
         typer.Option("--allow-remote", help="Permit a non-loopback bind address"),
     ] = False,
+    gateway: Annotated[
+        bool,
+        typer.Option(
+            "--gateway",
+            help=(
+                "Serve five token-efficient meta-tools (search/schema/call/"
+                "result_read/result_grep) instead of every tool schema"
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Serve CODEVANTA tools to coding agents over MCP (stdio or HTTP)."""
     try:
@@ -3666,7 +3676,14 @@ def mcp_serve(
         console.print(f"[bold red]error:[/] MCP support needs the 'mcp' package: {exc}")
         raise typer.Exit(code=2) from exc
     try:
-        run_server(transport=transport, host=host, port=port, allow_remote=allow_remote)
+        if gateway:
+            from codevanta.mcp_server.gateway import serve_gateway
+
+            if allow_remote:
+                _fail("the gateway serves loopback only; drop --allow-remote", 2)
+            serve_gateway(transport=transport, port=port)
+        else:
+            run_server(transport=transport, host=host, port=port, allow_remote=allow_remote)
     except (AnalysisError, ValueError) as exc:
         _fail(str(exc), 2)
     except OSError as exc:
@@ -4929,7 +4946,7 @@ def doctor() -> None:
     and the rebuild root directory. Mirrors ``craft-anything-cli doctor``."""
     from codevanta.cli.rebuild import _default_root
 
-    console = Console()
+    console = make_console()
     console.print("[bold]CODEVANTA doctor[/]\n")
 
     ok = True
