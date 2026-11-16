@@ -237,9 +237,8 @@ jobs:
         run: python -m pytest tests/test_fuzz_parsers.py -q
 
   benchmark:
-    name: benchmark (informational)
+    name: benchmark
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -247,9 +246,66 @@ jobs:
           python-version: "3.13"
       - name: Install
         run: python -m pip install -e ".[dev]"
-      # Timings are machine-dependent: this job reports drift, it does not gate.
-      - name: Benchmark against the committed baseline (wide tolerance)
-        run: python scripts/bench_gate.py --repeat 1 --tolerance 3.0
+      # One-off for this PR: record the linux reference numbers on THIS runner
+      # class, so the committed baseline matches the machine the gate runs on.
+      # These two steps are removed once bench/baseline.linux.json holds them.
+      - name: Record linux baseline on this runner class
+        run: python scripts/bench_gate.py --update-baseline --repeat 15
+      - uses: actions/upload-artifact@v7
+        with:
+          name: baseline-linux
+          path: bench/baseline.linux.json
+      # Real gate: 25% is the committed default (see bench_gate.py); --repeat 1
+      # is raised to the baseline's repeat so both sides are a best-of-15.
+      - name: Benchmark gate (25% tolerance)
+        run: |
+          set -o pipefail
+          python scripts/bench_gate.py --repeat 1 --json | tee bench-gate.json
+      - name: Job summary (measured vs allowed)
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if not summary_path:
+              raise SystemExit(0)
+          try:
+              with open("bench-gate.json", encoding="utf-8") as fh:
+                  report = json.load(fh)
+          except (OSError, ValueError):
+              with open(summary_path, "a", encoding="utf-8") as fh:
+                  fh.write(
+                      "## Benchmark gate\n\nNo report was produced: the gate could not "
+                      "evaluate (missing or unusable baseline?).\n"
+                  )
+              raise SystemExit(0) from None
+          tolerance = float(report["tolerance"])
+          factor = 1 + tolerance
+          lines = [
+              f"## Benchmark gate: {'PASS' if report['passed'] else 'FAIL'}",
+              "",
+              f"Platform `{report['platform']}` against `{report['baseline']}`, "
+              f"tolerance {tolerance:.0%} (allowed = baseline x {factor:.2f}).",
+              "",
+              "| benchmark | baseline ms | allowed ms | measured ms | delta | status |",
+              "| --- | --- | --- | --- | --- | --- |",
+          ]
+          for row in report["results"]:
+              base = row["baseline_ms"]
+              current = row["current_ms"]
+              allowed = "-" if base is None else f"{base * factor:.3f}"
+              measured = "-" if current is None else f"{current:.3f}"
+              delta = "-" if row["delta_pct"] is None else f"{row['delta_pct']:+.1f}%"
+              base_cell = "-" if base is None else f"{base:.3f}"
+              lines.append(
+                  f"| {row['benchmark']} | {base_cell} | {allowed} | {measured} | {delta} "
+                  f"| {row['status']} |"
+              )
+          with open(summary_path, "a", encoding="utf-8") as fh:
+              fh.write("\n".join(lines) + "\n")
+          PY
       - name: Benchmark gate tests
         run: python -m pytest tests/test_bench_gate.py -q
 

@@ -15,8 +15,9 @@ benchmarks -- by importing bench.py's measurement helpers, never by copying them
 Tolerance
 ---------
 A row fails when ``current_ms > baseline_ms * (1 + --tolerance)``. With the
-default ``--tolerance 0.5`` a benchmark may be up to 50% slower before it counts
-as a regression. The comparison uses the unrounded measurements; only the table
+default ``--tolerance 0.25`` a benchmark may be up to 25% slower before it counts
+as a regression -- the budget CI's ``benchmark`` job enforces on every pull
+request. The comparison uses the unrounded measurements; only the table
 and the JSON show 3 decimals. A row that is *missing* from the baseline also
 fails: a benchmark with no reference cannot be gated, and letting it slide would
 quietly disarm the gate for exactly the code that was just added.
@@ -52,6 +53,12 @@ numbers of one reference machine and ``--tolerance`` is what absorbs the
 difference between that machine and yours. Re-record the baseline where CI runs
 rather than on a laptop on battery, and treat a *consistent* 2x shift as "the
 baseline is stale" (re-record it deliberately) rather than as a per-PR failure.
+That is also why this gate is meant to run in CI only: the ``benchmark`` job in
+``.github/workflows/ci.yml`` executes on the same runner class the committed
+baseline was recorded on (``ubuntu-latest`` for ``bench/baseline.linux.json``),
+so the milliseconds stay comparable and ``--tolerance`` only has to absorb
+run-to-run noise between two machines of that class. Gating a checkout against
+a baseline from a different machine class measures the machines, not the code.
 The sub-millisecond rows (``discover_functions``) are timer noise as much as
 work, so read their delta as suggestive, not as a verdict.
 
@@ -70,9 +77,9 @@ Every run line names the platform, and the ``--json`` report carries it as the
 ``platform`` key, so a red build can be traced to the file that judged it.
 ``--update-baseline`` writes the resolved platform's file only -- record the
 linux numbers on a linux runner with ``python scripts/bench_gate.py
---update-baseline``, not by hand-editing ``bench/baseline.linux.json``, which
-currently holds Windows-timed numbers and is consulted only by the
-informational CI benchmark job.
+--update-baseline``, not by hand-editing ``bench/baseline.linux.json``: the CI
+``benchmark`` job gates on that file, so it must hold numbers timed where the
+gate runs.
 
 Exit status
 -----------
@@ -122,8 +129,12 @@ DEFAULT_SAMPLE_PATHS: tuple[str, ...] = ("samples/pe64_text.bin", "samples/elf64
 #: file per platform: ``baseline.<label>.json`` -- see the "Platforms" section.
 BASELINE_DIR = "bench"
 
-#: Relative slack: 0.5 means "up to 50% slower than the baseline still passes".
-DEFAULT_TOLERANCE = 0.5
+#: Relative slack: 0.25 means "up to 25% slower than the baseline still passes".
+#: This is the regression budget CI's ``benchmark`` job enforces: wide enough to
+#: absorb run-to-run noise between same-class runners (the baseline must have
+#: been recorded on one -- see "Why a committed baseline is machine-dependent"
+#: below), narrow enough to catch real slowdowns.
+DEFAULT_TOLERANCE = 0.25
 
 #: Every platform label ``--platform`` accepts, including the fallback.
 PLATFORMS: tuple[str, ...] = ("windows", "linux", "macos", "unknown")
@@ -511,6 +522,20 @@ def announce(warnings: Sequence[str]) -> None:
         print(f"bench_gate: warning: {warning}", file=sys.stderr)
 
 
+def describe_failure(verdict: Verdict, tolerance: float) -> str:
+    """Return one failing verdict as "name: measured vs allowed", in milliseconds.
+
+    ``allowed`` is the number the gate actually enforced -- the baseline scaled
+    by the tolerance -- so a red build shows both sides of the broken promise.
+    """
+    if verdict.current_ms is None:
+        return f"{verdict.key}: not measured"
+    if verdict.baseline_ms is None:
+        return f"{verdict.key}: measured {verdict.current_ms:.3f}ms, no baseline entry"
+    allowed = verdict.baseline_ms * (1.0 + tolerance)
+    return f"{verdict.key}: measured {verdict.current_ms:.3f}ms > allowed {allowed:.3f}ms"
+
+
 def summarise(verdicts: Sequence[Verdict], tolerance: float, platform: str) -> str:
     """Return the one-line pass/fail summary meant for stderr."""
     failed = [verdict for verdict in verdicts if verdict.failed]
@@ -519,7 +544,7 @@ def summarise(verdicts: Sequence[Verdict], tolerance: float, platform: str) -> s
             f"bench_gate: PASS {len(verdicts)}/{len(verdicts)} within {tolerance:.0%} tolerance "
             f"(platform {platform})"
         )
-    names = ", ".join(verdict.key for verdict in failed)
+    names = ", ".join(describe_failure(verdict, tolerance) for verdict in failed)
     return (
         f"bench_gate: FAIL {len(failed)}/{len(verdicts)} beyond {tolerance:.0%} tolerance: "
         f"{names} (platform {platform})"
@@ -618,7 +643,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TOLERANCE,
         metavar="F",
         help=(
-            "relative slack; 0.5 means up to 50%% slower than the baseline still passes "
+            "relative slack; 0.25 means up to 25%% slower than the baseline still passes; "
+            "record the baseline on the same runner class CI gates on "
             f"(default: {DEFAULT_TOLERANCE})"
         ),
     )
