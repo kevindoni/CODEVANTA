@@ -8,8 +8,9 @@ prints one pseudo-C statement per definition, reusing the increment-2 folded
 ``if (...) { /* taken: signed */ }`` lines whose operands are cast to the
 jump's signedness at the SSA type-hint width (or the canonical register's
 width when untyped; immediates stay uncased); calls render their SSA argument
-registers and a bounded clobber note; loop-boundary blocks and undefined
-reads are flagged as honest comments, never guessed away.
+registers and a bounded clobber note; phi joins render as
+``id = phi(value @ block N, ...)`` statements; loop-boundary blocks and
+undefined reads are flagged as honest comments, never guessed away.
 
 Deliberate v1 limits (stated in the evidence detail): the output is *linear*
 -- no structured if/else joins, no phi insertion, no loop reconstruction --
@@ -287,6 +288,12 @@ def emit_pseudo_c(fn: SSAFunction) -> PseudoCResult:
                 header += ": phi required for " + ", ".join(block.phi_required)
         header += " */"
         lines.append(_clip(header))
+        for phi in block.phis:
+            rendered = ", ".join(
+                f"{value_id} @ block {pred_index}"
+                for pred_index, value_id in phi.args
+            )
+            lines.append(_clip(f"{phi.id} = phi({rendered});"))
         for instruction in block.instructions:
             if len(lines) >= MAX_LINES:
                 truncated = True
@@ -387,9 +394,9 @@ def emit_pseudo_c(fn: SSAFunction) -> PseudoCResult:
             "bounded if-lines whose operands are cast to the jump's "
             "signedness at hint-or-register width (immediates and equality "
             "jumps stay uncased; the raw cmp text stays in the SSA), calls "
-            "note their SSA arguments and clipped clobbers, "
-            "loop boundaries and undefined reads stay honest comments; "
-            "nothing is executed"
+            "note their SSA arguments and clipped clobbers, phi joins render "
+            "their merged arguments, loop boundaries and undefined reads stay "
+            "honest comments; nothing is executed"
         ),
     )
     return PseudoCResult(

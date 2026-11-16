@@ -34,6 +34,10 @@ CONDITION = bytes.fromhex("4839d874029090")
 #: `mov eax, 1; dec rax; jne 0x401000; ret` -- one back-edge loop.
 LOOP = bytes.fromhex("b801000000") + bytes.fromhex("48ffc8") + bytes.fromhex("75f6") + b"\xc3"
 
+#: entry -> jmp cond; body (add eax,1) -> cond (cmp; jl body; ret) -- a
+#: while-loop whose join sits at a higher address than its body (phis!).
+LOOP_JOIN = bytes.fromhex("b800000000eb0783c0019090909083f8057cf4c3")
+
 #: `mov rbx, rax; mov ecx, 1; call +1; nop; mov rax, rbx; ret` -- clobbers.
 CALL_CLOBBER = bytes.fromhex("4889c3b901000000e801000000904889d8c3")
 
@@ -180,6 +184,14 @@ def test_loop_boundary_marker(tmp_path: Path) -> None:
     result = _emit(tmp_path / "loop.bin", LOOP)
     assert len(result.loop_markers) >= 1
     assert "LOOP BOUNDARY" in result.text
+
+
+def test_loop_join_phi_rendered(tmp_path: Path) -> None:
+    """The high-addressed join's phis render with their merged arguments."""
+    result = _emit(tmp_path / "join.bin", LOOP_JOIN)
+    assert "rax.2 = phi(rax.1 @ block 0, rax.3 @ block 1);" in result.text
+    assert "FLAGS.1 = phi(FLAGS.0 @ block 0, FLAGS.3 @ block 1);" in result.text
+    assert "if ((int64_t)rax.2 < 5) { /* taken: signed */ }" in result.text
 
 
 def test_call_line_with_clobber_note(tmp_path: Path) -> None:
