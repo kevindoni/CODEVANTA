@@ -1652,6 +1652,30 @@ def _count_path_instructions(
     return total
 
 
+def _concrete_register(state: Any, name: str) -> int | None:
+    """Return register ``name`` of an angr state as an int, when it is concrete.
+
+    ``state.regs.rax`` is a bitvector: older angr builds let ``int()`` decode a
+    concrete one directly, while current builds need ``state.solver.eval``. A
+    symbolic value has no single int and is reported as absent rather than
+    guessed.
+    """
+    value = getattr(state.regs, name, None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    solver = getattr(state, "solver", None)
+    if solver is None:
+        return None
+    try:
+        return int(solver.eval(value))
+    except Exception:  # a symbolic or errored value is not a finding
+        return None
+
+
 def _angr_entry(
     index: int,
     state: Any,
@@ -1665,10 +1689,9 @@ def _angr_entry(
     """Build one :class:`Entry` from an angr found state."""
     registers: dict[str, int] = {}
     for name in names:
-        try:
-            registers[name] = int(getattr(state.regs, name))
-        except Exception:  # pragma: no cover - angr owns the register vocabulary
-            continue
+        value = _concrete_register(state, name)
+        if value is not None:
+            registers[name] = value
     blocks = tuple(int(block) for block in getattr(state.history, "bbl_addrs", ()))
     return Entry(
         index=index,

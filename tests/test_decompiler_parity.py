@@ -161,16 +161,24 @@ def test_warnings_no_longer_claim_angr_was_skipped(sample: tuple[Path, BinaryInf
     assert not any("unavailable" in warning for warning in result.warnings)
 
 
-def test_auto_prefers_angr_over_the_native_fallback(sample: tuple[Path, BinaryInfo]) -> None:
+def test_auto_prefers_an_external_decompiler_over_native(
+    sample: tuple[Path, BinaryInfo],
+) -> None:
     path, info = sample
     result = decompile_function(path, info, TEXT_VA)  # backend defaults to "auto"
 
-    assert result.backend == "angr"
+    # The CI parity job installs angr only, so auto lands on angr there; a
+    # developer machine with Ghidra installed routes to the stronger backend
+    # first. Either way the native fallback must not have answered.
+    expected = "ghidra" if GHIDRA_INSTALL_DIR else "angr"
+    assert result.backend == expected
     assert result.backend != "native"
     assert result.language == "c"
     assert result.text.strip()
-    # Ghidra may legitimately be reported as skipped here; angr may not.
-    assert not any("'angr'" in warning and "unavailable" in warning for warning in result.warnings)
+    # The backend that answered may never be reported as skipped.
+    assert not any(
+        f"'{expected}'" in warning and "unavailable" in warning for warning in result.warnings
+    )
 
 
 # --------------------------------------------------------------------------- #
