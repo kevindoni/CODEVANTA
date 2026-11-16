@@ -28,8 +28,11 @@ import contextlib
 import importlib.metadata
 import importlib.util
 import os
+import re
 import tempfile
 import threading
+import uuid
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -197,19 +200,105 @@ def _session_key(path: str | Path) -> tuple[str, int, int] | None:
     return (str(Path(path).resolve()), stat.st_mtime_ns, stat.st_size)
 
 
-def _open_context(opener: Any, path: str | Path) -> Any:
-    """Open a pyghidra program context, tolerating older keyword sets."""
+def _open_context(pyghidra: Any, path: str | Path) -> Any:
+    """Return a context manager yielding a ``FlatProgramAPI`` for ``path``.
+
+    Prefers the modern public Ghidra Java APIs (``GhidraProject`` +
+    ``FlatProgramAPI``); the deprecated ``pyghidra.open_program`` wrapper is
+    only a fallback for older installations, with its warning silenced so a
+    deprecation never leaks into analysis output.
+    """
+    if _modern_api_available():
+        return _modern_program_context(path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        try:
+            return pyghidra.open_program(
+                str(path),
+                analyze=True,
+                project_location=_project_location(),
+                nested_project_location=False,
+            )
+        except TypeError:
+            # Older pyghidra builds without the project keyword set: fall back
+            # to the plain call rather than lose the backend entirely.
+            return pyghidra.open_program(str(path))
+
+
+_MODERN_API: bool | None = None
+
+
+def _modern_api_available() -> bool:
+    """Report whether the non-deprecated Ghidra entry points are importable."""
+    global _MODERN_API
+    if _MODERN_API is None:
+        try:
+            from ghidra.app.script import GhidraScriptUtil  # noqa: F401
+            from ghidra.base.project import GhidraProject  # noqa: F401
+            from ghidra.framework.model import ProjectLocator  # noqa: F401
+            from ghidra.program.flatapi import FlatProgramAPI  # noqa: F401
+            from ghidra.program.util import GhidraProgramUtilities  # noqa: F401
+
+            _MODERN_API = True
+        except Exception:
+            _MODERN_API = False
+    return _MODERN_API
+
+
+@contextlib.contextmanager
+def _modern_program_context(path: str | Path) -> Any:
+    """Import (or reuse) ``path`` in a project and yield a ``FlatProgramAPI``.
+
+    Mirrors what pyghidra's deprecated ``open_program`` does, on public APIs
+    only. The project name embeds the file's size and mtime, so an unchanged
+    binary opened by a *later process* reuses the analysed program instead of
+    importing again, while a changed file lands in a fresh project; stale
+    projects simply age out of the system temp root.
+    """
+    from ghidra.app.script import GhidraScriptUtil
+    from ghidra.base.project import GhidraProject
+    from ghidra.framework.model import ProjectLocator
+    from ghidra.program.flatapi import FlatProgramAPI
+    from ghidra.program.util import GhidraProgramUtilities
+
+    location = _project_location()
+    key = _session_key(path)
+    fingerprint = f"{key[1]:x}{key[2]:x}" if key is not None else uuid.uuid4().hex
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", Path(path).stem)[:64] or "binary"
+    project_name = f"{stem}.{fingerprint}"
+    program_name = Path(path).name
+
+    if ProjectLocator(location, project_name).exists():
+        project = GhidraProject.openProject(location, project_name, True)
+    else:
+        location.mkdir(parents=True, exist_ok=True)
+        project = GhidraProject.createProject(location, project_name, False)
+    program = None
     try:
-        return opener(
-            str(path),
-            analyze=True,
-            project_location=_project_location(),
-            nested_project_location=False,
-        )
-    except TypeError:
-        # Older pyghidra builds without the project keyword set: fall back
-        # to the plain call rather than lose the backend entirely.
-        return opener(str(path))
+        if project.getRootFolder().getFile(program_name):
+            program = project.openProgram("/", program_name, True)
+        if program is None:
+            program = project.importProgram(Path(path))
+            if program is None:
+                raise AnalysisError(
+                    f"ghidra failed to import {path!s}; the loader rejected the file"
+                )
+            project.saveAs(program, "/", program_name, True)
+        GhidraScriptUtil.acquireBundleHostReference()
+        try:
+            flat_api = FlatProgramAPI(program)
+            if GhidraProgramUtilities.shouldAskToAnalyze(program):
+                flat_api.analyzeAll(program)
+                GhidraProgramUtilities.markProgramAnalyzed(program)
+        finally:
+            GhidraScriptUtil.releaseBundleHostReference()
+        yield flat_api
+    finally:
+        if program is not None:
+            with contextlib.suppress(Exception):
+                project.save(program)
+        with contextlib.suppress(Exception):
+            project.close()
 
 
 def _close_open_program(program: _OpenProgram) -> None:
@@ -221,14 +310,16 @@ def _close_open_program(program: _OpenProgram) -> None:
 def _acquire_program(opener: Any, path: str | Path) -> ProgramSession:
     """Return a :class:`ProgramSession` for ``path``.
 
-    With the session enabled (default), the imported program is cached under
-    ``_SESSION_LOCK`` and reused for later calls on the same bytes; a changed
-    file closes the old program first. With ``CODEVANTA_GHIDRA_SESSION=0`` the
-    caller gets a private program it must close itself.
+    ``opener`` is a callable ``path -> context manager`` whose ``__enter__``
+    yields a ``FlatProgramAPI``. With the session enabled (default), the
+    imported program is cached under ``_SESSION_LOCK`` and reused for later
+    calls on the same bytes; a changed file closes the old program first.
+    With ``CODEVANTA_GHIDRA_SESSION=0`` the caller gets a private program it
+    must close itself.
     """
     global _session_program, session_opens
     if os.environ.get(SESSION_ENV, "").strip() == "0":
-        context = _open_context(opener, path)
+        context = opener(path)
         return ProgramSession(context.__enter__(), reused=False, own_context=context)
     with _SESSION_LOCK:
         key = _session_key(path)
@@ -241,7 +332,7 @@ def _acquire_program(opener: Any, path: str | Path) -> ProgramSession:
         if _session_program is not None:
             _close_open_program(_session_program)
             _session_program = None
-        context = _open_context(opener, path)
+        context = opener(path)
         flat_api = context.__enter__()
         session_opens += 1
         _register_exit_hook()
@@ -428,7 +519,7 @@ class GhidraBackend:
             )
         timeout = _timeout_seconds(instruction_budget)
         _ensure_started(pyghidra)
-        session = _acquire_program(opener, path)
+        session = _acquire_program(lambda target: _open_context(pyghidra, target), path)
         try:
             # One DecompInterface at a time on a shared program: the session
             # lock also serializes concurrent callers (GUI threads, MCP).
