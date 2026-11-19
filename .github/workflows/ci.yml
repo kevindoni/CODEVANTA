@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 
 on:
   push:
@@ -152,7 +152,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Set up JDK 21 (pyghidra starts Ghidra's JVM inside CPython)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
