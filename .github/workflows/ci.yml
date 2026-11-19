@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 
 on:
   push:
@@ -157,7 +157,7 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Restore the cached Ghidra release (~570 MB, so caching matters)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ghidra-cache
           key: ghidra-${{ env.GHIDRA_ASSET }}
